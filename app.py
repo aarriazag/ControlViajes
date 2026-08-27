@@ -70,10 +70,15 @@ if 'marchamos' not in st.session_state:
     st.session_state.marchamos = set()
 
 # ==========================================
-# 2. CONTROL DE ACCESO (PERFILES)
+# 2. CONTROL DE ACCESO Y CONFIGURACIÓN (SIDEBAR)
 # ==========================================
 st.sidebar.markdown("<h2 style='color:#007A33; font-weight:bold;'>RANSA</h2>", unsafe_allow_html=True)
-st.sidebar.title("🔐 Control de Acceso")
+st.sidebar.title("🔐 Configuración Inicial")
+
+# Selección fija del Cliente (Se queda guardado para digitación masiva)
+cliente_activo = st.sidebar.selectbox("🎯 CLIENTE ACTIVO", list(st.session_state.db["clientes"].keys()))
+
+st.sidebar.markdown("---")
 usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.db["usuarios"].keys()))
 perfil_activo = st.session_state.db["usuarios"][usuario_activo]
 st.sidebar.info(f"**Perfil:** {perfil_activo}")
@@ -82,11 +87,12 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("⛽ Parámetros Económicos")
 precio_diesel_semana = st.sidebar.number_input("Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
 
-# Encabezado Principal Corporativo Actualizado (Camión en lugar de Corazón)
+# Encabezado Principal Corporativo
 st.markdown("<h1 style='color: #007A33;'>🚚 Ransa · Sistema Integral de Gestión Logística (TMS)</h1>", unsafe_allow_html=True)
+st.markdown(f"### Operando Cliente: <span style='color:#007A33;'>{cliente_activo}</span>", unsafe_allow_html=True)
 st.markdown("---")
 
-# Creación e indexación correcta de pestañas
+# Creación de pestañas
 tab1, tab2, tab3 = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel"])
 
 # ==========================================
@@ -124,69 +130,71 @@ with tab1:
         with col_pil: piloto_final = st.selectbox("Piloto", st.session_state.db["pilotos"], index=st.session_state.db["pilotos"].index(pil_pred) if pil_pred in st.session_state.db["pilotos"] else 0)
         with col_aux: auxiliar_final = st.selectbox("Auxiliar de Carga", st.session_state.db["auxiliares"], index=st.session_state.db["auxiliares"].index(aux_pred) if aux_pred in st.session_state.db["auxiliares"] else 0)
         
-        st.subheader("2. Seguridad (Marchamos de Control)")
-        cm1, cm2 = st.columns(2)
-        m_ida = cm1.text_input("No. Marchamo de Ida (Único)")
-        m_regreso = cm2.text_input("No. Marchamo de Regreso (Última Tienda)")
+        st.subheader("2. Destinos y Control de Marchamos")
         
-        st.subheader("3. Asignación de Cliente y Destinos Aislados")
-        cliente_sel = st.selectbox("Seleccione el Cliente del Viaje", [""] + list(st.session_state.db["clientes"].keys()))
-        
-        destinos_viaje = []
-        if cliente_sel:
-            if f'num_dest_{id_viaje}' not in st.session_state:
-                st.session_state[f'num_dest_{id_viaje}'] = 1
-                
-            if st.button("➕ Añadir Destino Adicional"):
-                st.session_state[f'num_dest_{id_viaje}'] += 1
-                st.rerun()
-                
-            tiendas_cliente = st.session_state.db["clientes"][cliente_sel]
+        if f'num_dest_{id_viaje}' not in st.session_state:
+            st.session_state[f'num_dest_{id_viaje}'] = 1
             
-            for i in range(st.session_state[f'num_dest_{id_viaje}']):
-                st.markdown(f"**Destino #{i+1}**")
-                d1, d2, d3, d4, d5 = st.columns()
+        if st.button("➕ Añadir Destino Adicional"):
+            st.session_state[f'num_dest_{id_viaje}'] += 1
+            st.rerun()
+            
+        tiendas_cliente = st.session_state.db["clientes"][cliente_activo]
+        destinos_viaje = []
+        total_destinos = st.session_state[f'num_dest_{id_viaje}']
+        
+        # Iteración optimizada para el digitador
+        for i in range(total_destinos):
+            st.markdown(f"📍 **Destino #{i+1}**")
+            d1, d2, d3, d4 = st.columns([2, 2, 2, 3])
+            d5, d6, d7 = st.columns([3, 3, 3])
+            
+            with d1:
+                tienda = d1.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{id_viaje}_{i}")
+                km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
+                gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
+                st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
+            with d2: 
+                m_ida_tienda = d2.text_input("🔒 Marchamo IDA (Único)", key=f"mida_{id_viaje}_{i}")
+            with d3:
+                # El marchamo de regreso solo se habilita para la ÚLTIMA tienda de la lista
+                es_ultimo = (i == total_destinos - 1)
+                m_reg_tienda = d3.text_input("🔄 Marchamo REGRESO", key=f"mreg_{id_viaje}_{i}", disabled=not es_ultimo, placeholder="Solo última tienda" if not es_ultimo else "")
+            with d4: 
+                peds = d4.text_input("No. Pedidos (Separados por coma)", key=f"p_{id_viaje}_{i}", placeholder="Ej: P01, P02")
                 
-                with d1:
-                    tienda = d1.selectbox("Destino / Tienda", [""] + list(tiendas_cliente.keys()), key=f"t_{id_viaje}_{i}")
-                    km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
-                    gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
-                    st.caption(f"Distancia: {km_t} KM | Consumo Base: {gal_t} Gal")
-                with d2: peds = d2.text_input("No. Pedidos (Separados por coma)", key=f"p_{id_viaje}_{i}", placeholder="P001, P002")
-                with d3: roles = d3.number_input("Roles", min_value=0, step=1, key=f"r_{id_viaje}_{i}")
-                with d4: tarimas = d4.number_input("Tarimas", min_value=0, step=1, key=f"tar_{id_viaje}_{i}")
-                with d5: cajas = d5.number_input("Cajas (WMS/Manual)", min_value=0, step=1, key=f"c_{id_viaje}_{i}")
-                
-                if tienda:
-                    destinos_viaje.append({
-                        "tienda": tienda, "km": km_t, "galones_base": gal_t,
-                        "pedidos": peds, "roles": roles, "tarimas": tarimas, "cajas": cajas
-                    })
+            with d5: roles = d5.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{id_viaje}_{i}")
+            with d6: tarimas = d6.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{id_viaje}_{i}")
+            with d7: cajas = d7.number_input("Cajas Manual / WMS", min_value=0, step=1, key=f"c_{id_viaje}_{i}")
+            
+            if tienda:
+                destinos_viaje.append({
+                    "tienda": tienda, "km": km_t, "galones_base": gal_t, "pedidos": peds,
+                    "marchamo_ida": m_ida_tienda, "marchamo_regreso": m_reg_tienda if es_ultimo else "N/A",
+                    "roles": roles, "tarimas": tarimas, "cajas": cajas
+                })
+            st.markdown("---")
+            
+        if st.button("💾 Guardar Viaje y Generar Hoja de Control"):
+            # Validaciones de la regla de negocio
+            errores_marchamo = False
+            marchamos_vacios = False
+            
+            for dest in destinos_viaje:
+                if not dest["marchamo_ida"]:
+                    marchamos_vacios = True
+                if dest["marchamo_ida"] in st.session_state.marchamos:
+                    errores_marchamo = True
                     
-        st.markdown("---")
-        if st.button("💾 Validar, Guardar Emisión e Imprimir"):
-            if not placa or not m_ida or not m_regreso or not cliente_sel or len(destinos_viaje) == 0:
-                st.error("❌ Faltan campos obligatorios o destinos por llenar.")
-            elif m_ida in st.session_state.marchamos:
-                st.error(f"❌ El Marchamo de Ida '{m_ida}' ya fue utilizado en otro viaje del sistema.")
+            if not placa or len(destinos_viaje) == 0:
+                st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
+            elif marchamos_vacios:
+                st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
+            elif errores_marchamo:
+                st.error("❌ Error: Uno o más Marchamos de Ida digitados ya fueron utilizados en viajes anteriores.")
+            elif total_destinos > 0 and not destinos_viaje[-1]["marchamo_regreso"]:
+                st.error("❌ Error: El Marchamo de Regreso es obligatorio en la última tienda para cerrar el circuito.")
             else:
+                # Guardar en base de datos el viaje con sus destinos indexados
                 nuevo_viaje = {
                     "id_viaje": id_viaje, "usuario_creador": usuario_activo, "fecha_creacion": fecha_hoy, "hora_creacion": hora_hoy,
-                    "placa": placa, "transportista": t_pred, "tipo_camion": cap_pred, "piloto": piloto_final, "auxiliar": auxiliar_final,
-                    "marchamo_ida": m_ida, "marchamo_regreso": m_regreso, "cliente": cliente_sel, "destinos": destinos_viaje,
-                    "estado": "En Ruta", "usuario_liquida": None, "fecha_liquida": None, "retornos": {}
-                }
-                st.session_state.viajes.append(nuevo_viaje)
-                st.session_state.marchamos.add(m_ida)
-                st.success(f"✅ Viaje #{id_viaje} guardado con éxito. Estado: EN RUTA.")
-                
-                # --- SISTEMA DE CONSTRUCCIÓN HTML SEGURO ---
-                st.markdown("### 🖨️ Documento de Control de Salida Listo para Impresión")
-                
-                html_filas = ""
-                for d in destinos_viaje:
-                    html_filas += "<tr>"
-                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['tienda']} ({d['km']} KM)</td>"
-                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['pedidos']}</td>"
-                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['roles']}</td>"
-                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['tarimas']}</td>"
