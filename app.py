@@ -92,7 +92,7 @@ tabs = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "�
 # ==========================================
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
-with tabs[0]:
+with tabs:
     if perfil_activo in ["Administrador", "Operador"]:
         st.header("Generación de Hoja de Control de Viaje")
         
@@ -180,11 +180,13 @@ with tabs[0]:
                 st.session_state.marchamos.add(m_ida)
                 st.success(f"✅ Viaje #{id_viaje} guardado con éxito. Estado: EN RUTA.")
                 
-                # --- HOJA CORREGIDA SIN ANIDACIONES PELIGROSAS ---
-                st.markdown("### 🖨... Documento de Control de Salida Listo para Impresión")
+                # --- NUEVO SISTEMA DE CONSTRUCCIÓN HTML COMPLETAMENTE SEGURO ---
+                st.markdown("### 🖨️ Documento de Control de Salida Listo para Impresión")
                 
                 html_filas = ""
                 for d in destinos_viaje:
-                    html_filas += f"<tr><td style='border:1px solid #000; padding:6px;'>{d['tienda']} ({d['km']} KM)</td><td style='border:1px solid #000; padding:6px;'>{d['pedidos']}</td><td style='border:1px solid #000; padding:6px;'>{d['roles']}</td><td style='border:1px solid #000; padding:6px;'>{d['tarimas']}</td><td style='border:1px solid #000; padding:6px;'>{d['cajas']}</td><td style='border:1px solid #000; padding:6px; height:35px;'></td></tr>"
-                
-                html_print = f"""
+                    html_filas += "<tr>"
+                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['tienda']} ({d['km']} KM)</td>"
+                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['pedidos']}</td>"
+                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['roles']}</td>"
+                    html_filas += f"<td style='border:1px solid #000; padding:6px;'>{d['tarimas']}</td>"
