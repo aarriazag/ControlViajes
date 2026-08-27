@@ -180,13 +180,11 @@ with tabs[0]:
                 st.session_state.marchamos.add(m_ida)
                 st.success(f"✅ Viaje #{id_viaje} guardado con éxito. Estado: EN RUTA.")
                 
-                # --- HOJA CORREGIDA Y LIMPIA PARA IMPRESIÓN ---
-                st.markdown("### 🖨️ Documento de Control de Salida Listo para Impresión")
+                # --- HOJA CORREGIDA SIN ANIDACIONES PELIGROSAS ---
+                st.markdown("### 🖨... Documento de Control de Salida Listo para Impresión")
+                
+                html_filas = ""
+                for d in destinos_viaje:
+                    html_filas += f"<tr><td style='border:1px solid #000; padding:6px;'>{d['tienda']} ({d['km']} KM)</td><td style='border:1px solid #000; padding:6px;'>{d['pedidos']}</td><td style='border:1px solid #000; padding:6px;'>{d['roles']}</td><td style='border:1px solid #000; padding:6px;'>{d['tarimas']}</td><td style='border:1px solid #000; padding:6px;'>{d['cajas']}</td><td style='border:1px solid #000; padding:6px; height:35px;'></td></tr>"
+                
                 html_print = f"""
-                <div style="border:3px solid #007A33; padding:15px; font-family:Arial, sans-serif; background-color:#fff; color:#000;">
-                    <div style="text-align:center;">
-                        <h2 style="color:#007A33; margin:0;">RANSA Logística</h2>
-                        <h3 style="margin:5px 0;">HOJA DE CONTROL Y DESPACHO - VIAJE #{id_viaje}</h3>
-                        <p><b>Cliente:</b> {cliente_sel} | <b>Estado:</b> EN RUTA</p>
-                    </div>
-                    <hr style="border-top: 1px solid #007A33;">
