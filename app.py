@@ -157,7 +157,6 @@ with tab1:
             with d2: 
                 m_ida_tienda = d2.text_input("🔒 Marchamo IDA (Único)", key=f"mida_{id_viaje}_{i}")
             with d3:
-                # El marchamo de regreso solo se habilita para la ÚLTIMA tienda de la lista
                 es_ultimo = (i == total_destinos - 1)
                 m_reg_tienda = d3.text_input("🔄 Marchamo REGRESO", key=f"mreg_{id_viaje}_{i}", disabled=not es_ultimo, placeholder="Solo última tienda" if not es_ultimo else "")
             with d4: 
@@ -169,14 +168,19 @@ with tab1:
             
             if tienda:
                 destinos_viaje.append({
-                    "tienda": tienda, "km": km_t, "galones_base": gal_t, "pedidos": peds,
-                    "marchamo_ida": m_ida_tienda, "marchamo_regreso": m_reg_tienda if es_ultimo else "N/A",
-                    "roles": roles, "tarimas": tarimas, "cajas": cajas
+                    "tienda": tienda, 
+                    "km": km_t, 
+                    "galones_base": gal_t, 
+                    "pedidos": peds,
+                    "marchamo_ida": m_ida_tienda, 
+                    "marchamo_regreso": m_reg_tienda if es_ultimo else "N/A",
+                    "roles": roles, 
+                    "tarimas": tarimas, 
+                    "cajas": cajas
                 })
             st.markdown("---")
             
         if st.button("💾 Guardar Viaje y Generar Hoja de Control"):
-            # Validaciones de la regla de negocio
             errores_marchamo = False
             marchamos_vacios = False
             
@@ -195,6 +199,8 @@ with tab1:
             elif total_destinos > 0 and not destinos_viaje[-1]["marchamo_regreso"]:
                 st.error("❌ Error: El Marchamo de Regreso es obligatorio en la última tienda para cerrar el circuito.")
             else:
-                # Guardar en base de datos el viaje con sus destinos indexados
-                nuevo_viaje = {
-                    "id_viaje": id_viaje, "usuario_creador": usuario_activo, "fecha_creacion": fecha_hoy, "hora_creacion": hora_hoy,
+                # Modificado a estructura limpia y directa sin saltos de línea conflictivos
+                nuevo_viaje = {}
+                nuevo_viaje["id_viaje"] = id_viaje
+                nuevo_viaje["usuario_creador"] = usuario_activo
+                nuevo_viaje["fecha_creacion"] = fecha_hoy
