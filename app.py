@@ -82,17 +82,17 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("⛽ Parámetros Económicos")
 precio_diesel_semana = st.sidebar.number_input("Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
 
-# Encabezado Principal Corporativo
-st.markdown("<h1 style='color: #007A33;'>💚 Ransa · Sistema Integral de Gestión Logística (TMS)</h1>", unsafe_allow_html=True)
+# Encabezado Principal Corporativo Actualizado (Camión en lugar de Corazón)
+st.markdown("<h1 style='color: #007A33;'>🚚 Ransa · Sistema Integral de Gestión Logística (TMS)</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
-# Pestañas de Navegación
-tabs = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel"])
+# Creación e indexación correcta de pestañas
+tab1, tab2, tab3 = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel"])
 
 # ==========================================
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
-with tabs:
+with tab1:
     if perfil_activo in ["Administrador", "Operador"]:
         st.header("Generación de Hoja de Control de Viaje")
         
@@ -180,7 +180,7 @@ with tabs:
                 st.session_state.marchamos.add(m_ida)
                 st.success(f"✅ Viaje #{id_viaje} guardado con éxito. Estado: EN RUTA.")
                 
-                # --- NUEVO SISTEMA DE CONSTRUCCIÓN HTML COMPLETAMENTE SEGURO ---
+                # --- SISTEMA DE CONSTRUCCIÓN HTML SEGURO ---
                 st.markdown("### 🖨️ Documento de Control de Salida Listo para Impresión")
                 
                 html_filas = ""
