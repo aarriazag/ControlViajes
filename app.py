@@ -2,8 +2,35 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 
-# Configuración de la página web
-st.set_page_config(page_title="TMS - Control Logístico Avanzado", layout="wide", page_icon="🚛")
+# Configuración de la página web con estilo e identidad corporativa
+st.set_page_config(page_title="Ransa - Gestión Logística de Viajes", layout="wide", page_icon="🚚")
+
+# --- ESTILOS VISUALES RANSA (VERDE Y BLANCO) ---
+st.markdown("""
+    <style>
+        /* Color del botón principal */
+        div.stButton > button:first-child {
+            background-color: #007A33 !important;
+            color: white !important;
+            border-radius: 6px !important;
+            border: none !important;
+            font-weight: bold !important;
+        }
+        div.stButton > button:first-child:hover {
+            background-color: #005C25 !important;
+            color: white !important;
+        }
+        /* Color de las pestañas activas */
+        button[data-baseweb="tab"] {
+            font-size: 16px !important;
+            font-weight: bold !important;
+        }
+        button[aria-selected="true"] {
+            color: #007A33 !important;
+            border-bottom-color: #007A33 !important;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 # ==========================================
 # 1. BASE DE DATOS INICIAL (CATÁLOGOS MAESTROS)
@@ -45,21 +72,21 @@ if 'marchamos' not in st.session_state:
 # ==========================================
 # 2. CONTROL DE ACCESO (PERFILES)
 # ==========================================
+st.sidebar.markdown("<h2 style='color:#007A33; font-weight:bold;'>RANSA</h2>", unsafe_allow_html=True)
 st.sidebar.title("🔐 Control de Acceso")
 usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.db["usuarios"].keys()))
 perfil_activo = st.session_state.db["usuarios"][usuario_activo]
 st.sidebar.info(f"**Perfil:** {perfil_activo}")
 
-# Variable global para el precio del diésel simulado de la semana
 st.sidebar.markdown("---")
 st.sidebar.subheader("⛽ Parámetros Económicos")
 precio_diesel_semana = st.sidebar.number_input("Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
 
-# Título Principal
-st.title("🚛 Sistema Integral de Gestión Logística (TMS)")
+# Encabezado Principal Corporativo
+st.markdown("<h1 style='color: #007A33;'>💚 Ransa · Sistema Integral de Gestión Logística (TMS)</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
-# Pestañas de Navegación según el flujo solicitado
+# Pestañas de Navegación
 tabs = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel"])
 
 # ==========================================
@@ -69,7 +96,6 @@ with tabs[0]:
     if perfil_activo in ["Administrador", "Operador"]:
         st.header("Generación de Hoja de Control de Viaje")
         
-        # Correlativo automático y metadatos
         id_viaje = len(st.session_state.viajes) + 1
         fecha_hoy = datetime.now().strftime("%Y-%m-%d")
         hora_hoy = datetime.now().strftime("%H:%M:%S")
@@ -85,7 +111,6 @@ with tabs[0]:
         with col_p:
             placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.db["camiones"].keys()))
             
-        # Lógica automatizada pero editable
         t_pred, cap_pred, pil_pred, aux_pred = "", "", "", ""
         if placa:
             datos_c = st.session_state.db["camiones"][placa]
@@ -109,7 +134,6 @@ with tabs[0]:
         
         destinos_viaje = []
         if cliente_sel:
-            # Si hay cliente seleccionado, habilita agregar destinos dinámicos exclusivos de ese cliente
             if f'num_dest_{id_viaje}' not in st.session_state:
                 st.session_state[f'num_dest_{id_viaje}'] = 1
                 
@@ -121,7 +145,7 @@ with tabs[0]:
             
             for i in range(st.session_state[f'num_dest_{id_viaje}']):
                 st.markdown(f"**Destino #{i+1}**")
-                d1, d2, d3, d4, d5 = st.columns([2, 2, 1, 1, 1])
+                d1, d2, d3, d4, d5 = st.columns()
                 
                 with d1:
                     tienda = d1.selectbox("Destino / Tienda", [""] + list(tiendas_cliente.keys()), key=f"t_{id_viaje}_{i}")
@@ -146,7 +170,6 @@ with tabs[0]:
             elif m_ida in st.session_state.marchamos:
                 st.error(f"❌ El Marchamo de Ida '{m_ida}' ya fue utilizado en otro viaje del sistema.")
             else:
-                # Guardar registro maestro del viaje
                 nuevo_viaje = {
                     "id_viaje": id_viaje, "usuario_creador": usuario_activo, "fecha_creacion": fecha_hoy, "hora_creacion": hora_hoy,
                     "placa": placa, "transportista": t_pred, "tipo_camion": cap_pred, "piloto": piloto_final, "auxiliar": auxiliar_final,
@@ -157,22 +180,13 @@ with tabs[0]:
                 st.session_state.marchamos.add(m_ida)
                 st.success(f"✅ Viaje #{id_viaje} guardado con éxito. Estado: EN RUTA.")
                 
-                # Renderizar Hoja Física Consolidada para impresión directa
+                # --- HOJA CORREGIDA Y LIMPIA PARA IMPRESIÓN ---
                 st.markdown("### 🖨️ Documento de Control de Salida Listo para Impresión")
                 html_print = f"""
-                <div style="border:2px dashed #000; padding:15px; font-family:Courier, monospace; background-color:#fff; color:#000;">
-                    <h3 style="text-align:center; margin:0;">HOJA DE CONTROL Y DESPACHO - VIAJE #{id_viaje}</h3>
-                    <p style="text-align:center; margin:5px;"><b>Cliente:</b> {cliente_sel} | <b>Estado:</b> EN RUTA</p>
-                    <hr>
-                    <b>Despachador:</b> {usuario_activo} | <b>Fecha:</b> {fecha_hoy} | <b>Hora:</b> {hora_hoy}<br>
-                    <b>Placa:</b> {placa} ({cap_pred}) | <b>Transportista:</b> {t_pred}<br>
-                    <b>Piloto:</b> {piloto_final} | <b>Auxiliar:</b> {auxiliar_final}<br>
-                    <b>Marchamos -> Ida:</b> {m_ida} | <b>Regreso Requerido:</b> {m_regreso}
-                    <hr>
-                    <h4>MANIFIESTO DE CARGA POR TIENDA</h4>
-                    <table style="width:100%; border-collapse:collapse; border:1px solid #000; font-size:12px;">
-                        <thead>
-                            <tr style="background-color:#eee;">
-                                <th style="border:1px solid #000; padding:4px;">Destino</th>
-                                <th style="border:1px solid #000; padding:4px;">Pedidos</th>
-                                <th style="border:1px solid #000; padding:4px;">Rol</th>
+                <div style="border:3px solid #007A33; padding:15px; font-family:Arial, sans-serif; background-color:#fff; color:#000;">
+                    <div style="text-align:center;">
+                        <h2 style="color:#007A33; margin:0;">RANSA Logística</h2>
+                        <h3 style="margin:5px 0;">HOJA DE CONTROL Y DESPACHO - VIAJE #{id_viaje}</h3>
+                        <p><b>Cliente:</b> {cliente_sel} | <b>Estado:</b> EN RUTA</p>
+                    </div>
+                    <hr style="border-top: 1px solid #007A33;">
