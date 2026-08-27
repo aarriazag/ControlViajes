@@ -146,8 +146,8 @@ with tab1:
         # Iteración optimizada para el digitador
         for i in range(total_destinos):
             st.markdown(f"📍 **Destino #{i+1}**")
-            d1, d2, d3, d4 = st.columns([2, 2, 2, 3])
-            d5, d6, d7 = st.columns([3, 3, 3])
+            d1, d2, d3, d4 = st.columns(4)
+            d5, d6, d7 = st.columns(3)
             
             with d1:
                 tienda = d1.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{id_viaje}_{i}")
