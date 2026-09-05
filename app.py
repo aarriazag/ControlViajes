@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
+from contextlib import closing
 
 # Configuración de la página web con estilo e identidad corporativa
 st.set_page_config(page_title="Ransa - Gestión Logística de Viajes", layout="wide", page_icon="🚚")
@@ -8,7 +11,6 @@ st.set_page_config(page_title="Ransa - Gestión Logística de Viajes", layout="w
 # --- ESTILOS VISUALES RANSA (VERDE Y BLANCO) ---
 st.markdown("""
     <style>
-        /* Color del botón principal */
         div.stButton > button:first-child {
             background-color: #007A33 !important;
             color: white !important;
@@ -20,7 +22,6 @@ st.markdown("""
             background-color: #005C25 !important;
             color: white !important;
         }
-        /* Color de las pestañas activas */
         button[data-baseweb="tab"] {
             font-size: 16px !important;
             font-weight: bold !important;
@@ -33,10 +34,163 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. BASE DE DATOS INICIAL (CATÁLOGOS MAESTROS)
+# CAPA DE BASE DE DATOS (Postgres / Supabase)
+# Reemplaza session_state y SQLite: los datos viven en Supabase, así que
+# sobreviven a reinicios del servidor y se comparten entre todos los usuarios
+# (despachador y liquidador ven la misma información en tiempo real).
+#
+# Config necesaria en .streamlit/secrets.toml (nunca subir este archivo a GitHub):
+#   [postgres]
+#   host = "db.xxxxxxxxxxxx.supabase.co"
+#   port = 5432
+#   dbname = "postgres"
+#   user = "postgres"
+#   password = "..."
 # ==========================================
-if 'db' not in st.session_state:
-    st.session_state.db = {
+
+def get_conn():
+    cfg = st.secrets["postgres"]
+    return psycopg2.connect(
+        host=cfg["host"], port=cfg["port"], dbname=cfg["dbname"],
+        user=cfg["user"], password=cfg["password"]
+    )
+
+
+def init_db():
+    """Crea las tablas si no existen todavía. Se puede correr las veces que sea:
+    no borra ni duplica nada si las tablas ya están creadas."""
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS contadores (
+                cliente TEXT PRIMARY KEY,
+                ultimo_correlativo INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS viajes (
+                id SERIAL PRIMARY KEY,
+                id_viaje TEXT UNIQUE NOT NULL,
+                cliente TEXT NOT NULL,
+                placa TEXT NOT NULL,
+                transportista TEXT,
+                piloto TEXT,
+                auxiliar TEXT,
+                usuario_creador TEXT,
+                fecha_creacion TEXT,
+                hora_creacion TEXT,
+                estado TEXT DEFAULT 'Pendiente de Liquidar'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS destinos (
+                id SERIAL PRIMARY KEY,
+                viaje_id INTEGER NOT NULL REFERENCES viajes(id),
+                orden INTEGER,
+                tienda TEXT,
+                km REAL,
+                galones_base REAL,
+                pedidos TEXT,
+                marchamo_ida TEXT UNIQUE NOT NULL,
+                marchamo_regreso TEXT,
+                roles INTEGER DEFAULT 0,
+                tarimas INTEGER DEFAULT 0,
+                cajas INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+
+
+init_db()
+
+
+def marchamo_ya_usado(marchamo, cur):
+    cur.execute("SELECT 1 FROM destinos WHERE marchamo_ida = %s", (marchamo,))
+    return cur.fetchone() is not None
+
+
+def peek_siguiente_correlativo(cliente):
+    """Solo para mostrar una vista previa en pantalla; NO reserva el número."""
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT ultimo_correlativo FROM contadores WHERE cliente = %s", (cliente,))
+        row = cur.fetchone()
+        numero = (row[0] if row else 0) + 1
+    prefijo = "".join([w[0] for w in cliente.split()]).upper()[:4]
+    return f"{prefijo}-{numero:04d}"
+
+
+def siguiente_correlativo(cliente, cur):
+    """Incrementa de forma atómica el contador del cliente y devuelve el No. de Viaje.
+    Al estar dentro de la misma transacción que el INSERT del viaje, Postgres bloquea
+    la fila del contador hasta que se confirme, así que dos digitadores guardando al
+    mismo tiempo NUNCA reciben el mismo número."""
+    cur.execute(
+        "INSERT INTO contadores (cliente, ultimo_correlativo) VALUES (%s, 0) "
+        "ON CONFLICT (cliente) DO NOTHING", (cliente,)
+    )
+    cur.execute(
+        "UPDATE contadores SET ultimo_correlativo = ultimo_correlativo + 1 "
+        "WHERE cliente = %s RETURNING ultimo_correlativo", (cliente,)
+    )
+    numero = cur.fetchone()[0]
+    prefijo = "".join([w[0] for w in cliente.split()]).upper()[:4]
+    return f"{prefijo}-{numero:04d}"
+
+
+def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje):
+    """Guarda el viaje y sus destinos en una sola transacción.
+    Devuelve (True, id_viaje) si funcionó, o (False, mensaje_error) si no."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                # Revalidar marchamos DENTRO de la transacción (evita condiciones de
+                # carrera entre dos digitadores guardando al mismo tiempo)
+                for dest in destinos_viaje:
+                    if marchamo_ya_usado(dest["marchamo_ida"], cur):
+                        conn.rollback()
+                        return False, f"El marchamo '{dest['marchamo_ida']}' ya fue usado en otro viaje."
+
+                id_viaje_str = siguiente_correlativo(cliente, cur)
+                fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+                hora_hoy = datetime.now().strftime("%H:%M:%S")
+
+                cur.execute(
+                    "INSERT INTO viajes (id_viaje, cliente, placa, transportista, piloto, auxiliar, "
+                    "usuario_creador, fecha_creacion, hora_creacion) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "RETURNING id",
+                    (id_viaje_str, cliente, placa, transportista, piloto, auxiliar, usuario, fecha_hoy, hora_hoy)
+                )
+                viaje_id = cur.fetchone()[0]
+
+                for i, dest in enumerate(destinos_viaje):
+                    cur.execute(
+                        "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
+                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
+                         dest["marchamo_ida"], dest["marchamo_regreso"] or None,
+                         dest["roles"], dest["tarimas"], dest["cajas"])
+                    )
+            conn.commit()
+            return True, id_viaje_str
+        except psycopg2.IntegrityError as e:
+            conn.rollback()
+            return False, f"Error de integridad (probablemente un marchamo duplicado): {e}"
+
+
+def obtener_viajes_recientes(limite=10):
+    with closing(get_conn()) as conn:
+        return pd.read_sql_query(
+            "SELECT id_viaje, cliente, placa, piloto, fecha_creacion, hora_creacion, estado "
+            "FROM viajes ORDER BY id DESC LIMIT %s", conn, params=(limite,)
+        )
+
+
+# ==========================================
+# CATÁLOGOS MAESTROS (por ahora en memoria; candidatos a moverse a
+# tablas propias más adelante si se necesita editarlos desde la app)
+# ==========================================
+if 'catalogos' not in st.session_state:
+    st.session_state.catalogos = {
         "usuarios": {
             "Admin_Logistica": "Administrador",
             "Op_Salidas": "Operador",
@@ -63,36 +217,45 @@ if 'db' not in st.session_state:
         "auxiliares": ["Carlos López", "Pedro Gómez", "José Hernández", "Ramiro Ruiz"]
     }
 
-if 'viajes' not in st.session_state:
-    st.session_state.viajes = []
-
-if 'marchamos' not in st.session_state:
-    st.session_state.marchamos = set()
+# Contador de "corridas" del formulario: se incrementa después de guardar un
+# viaje para que los widgets nazcan con keys nuevas (así el formulario queda
+# limpio para el siguiente viaje, en vez de arrastrar lo digitado antes).
+if 'form_run' not in st.session_state:
+    st.session_state.form_run = 0
+if 'num_destinos' not in st.session_state:
+    st.session_state.num_destinos = 1
 
 # ==========================================
-# 2. CONTROL DE ACCESO Y CONFIGURACIÓN (SIDEBAR)
+# SIDEBAR
 # ==========================================
 st.sidebar.markdown("<h2 style='color:#007A33; font-weight:bold;'>RANSA</h2>", unsafe_allow_html=True)
 st.sidebar.title("🔐 Configuración Inicial")
 
-# Selección fija del Cliente (Se queda guardado para digitación masiva)
-cliente_activo = st.sidebar.selectbox("🎯 CLIENTE ACTIVO", list(st.session_state.db["clientes"].keys()))
+cliente_activo = st.sidebar.selectbox("🎯 CLIENTE ACTIVO", list(st.session_state.catalogos["clientes"].keys()))
 
 st.sidebar.markdown("---")
-usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.db["usuarios"].keys()))
-perfil_activo = st.session_state.db["usuarios"][usuario_activo]
+try:
+    with closing(get_conn()):
+        pass
+    st.sidebar.success("🟢 Conectado a la base de datos")
+except Exception as e:
+    st.sidebar.error(f"🔴 Sin conexión a la base de datos: {e}")
+    st.stop()
+
+st.sidebar.markdown("---")
+usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.catalogos["usuarios"].keys()))
+perfil_activo = st.session_state.catalogos["usuarios"][usuario_activo]
 st.sidebar.info(f"**Perfil:** {perfil_activo}")
+st.sidebar.caption("⚠️ Esto es una simulación de usuario, no un login real. Falta agregar autenticación con contraseña antes de usarlo en producción con varios digitadores.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⛽ Parámetros Económicos")
 precio_diesel_semana = st.sidebar.number_input("Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
 
-# Encabezado Principal Corporativo
 st.markdown("<h1 style='color: #007A33;'>🚚 Ransa · Sistema Integral de Gestión Logística (TMS)</h1>", unsafe_allow_html=True)
 st.markdown(f"### Operando Cliente: <span style='color:#007A33;'>{cliente_activo}</span>", unsafe_allow_html=True)
 st.markdown("---")
 
-# Creación de pestañas
 tab1, tab2, tab3 = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel"])
 
 # ==========================================
@@ -101,106 +264,141 @@ tab1, tab2, tab3 = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquida
 with tab1:
     if perfil_activo in ["Administrador", "Operador"]:
         st.header("Generación de Hoja de Control de Viaje")
-        
-        id_viaje = len(st.session_state.viajes) + 1
-        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-        hora_hoy = datetime.now().strftime("%H:%M:%S")
-        
+
+        run = st.session_state.form_run  # sufijo de las keys del formulario actual
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("No. Viaje Correlativo", f"#{id_viaje}")
-        c2.text_input("Fecha de Creación", value=fecha_hoy, disabled=True, key="f_crea")
-        c3.text_input("Hora de Creación", value=hora_hoy, disabled=True, key="h_crea")
-        
+        c1.metric("No. Viaje (vista previa)", peek_siguiente_correlativo(cliente_activo))
+        c2.text_input("Fecha de Creación", value=datetime.now().strftime("%Y-%m-%d"), disabled=True, key=f"f_crea_{run}")
+        c3.text_input("Hora de Creación", value=datetime.now().strftime("%H:%M:%S"), disabled=True, key=f"h_crea_{run}")
+        st.caption("El No. de Viaje definitivo se asigna al guardar, para evitar que dos digitadores reciban el mismo número.")
+
         st.subheader("1. Selección de Transporte")
         col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
-        
+
         with col_p:
-            placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.db["camiones"].keys()))
-            
+            placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.catalogos["camiones"].keys()), key=f"placa_{run}")
+
         t_pred, cap_pred, pil_pred, aux_pred = "", "", "", ""
         if placa:
-            datos_c = st.session_state.db["camiones"][placa]
+            datos_c = st.session_state.catalogos["camiones"][placa]
             t_pred = datos_c["transportista"]
             cap_pred = datos_c["tipo"]
             pil_pred = datos_c["piloto"]
             aux_pred = datos_c["auxiliar"]
-            
-        with col_t: st.text_input("Transportista", value=t_pred, disabled=True)
-        with col_cap: st.text_input("Capacidad Camión", value=cap_pred, disabled=True)
-        with col_pil: piloto_final = st.selectbox("Piloto", st.session_state.db["pilotos"], index=st.session_state.db["pilotos"].index(pil_pred) if pil_pred in st.session_state.db["pilotos"] else 0)
-        with col_aux: auxiliar_final = st.selectbox("Auxiliar de Carga", st.session_state.db["auxiliares"], index=st.session_state.db["auxiliares"].index(aux_pred) if aux_pred in st.session_state.db["auxiliares"] else 0)
-        
+
+        with col_t:
+            st.text_input("Transportista", value=t_pred, disabled=True, key=f"transp_{run}")
+        with col_cap:
+            st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
+        with col_pil:
+            pilotos = st.session_state.catalogos["pilotos"]
+            piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
+        with col_aux:
+            auxiliares = st.session_state.catalogos["auxiliares"]
+            auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
+
         st.subheader("2. Destinos y Control de Marchamos")
-        
-        if f'num_dest_{id_viaje}' not in st.session_state:
-            st.session_state[f'num_dest_{id_viaje}'] = 1
-            
+
         if st.button("➕ Añadir Destino Adicional"):
-            st.session_state[f'num_dest_{id_viaje}'] += 1
+            st.session_state.num_destinos += 1
             st.rerun()
-            
-        tiendas_cliente = st.session_state.db["clientes"][cliente_activo]
+
+        tiendas_cliente = st.session_state.catalogos["clientes"][cliente_activo]
         destinos_viaje = []
-        total_destinos = st.session_state[f'num_dest_{id_viaje}']
-        
-        # Iteración optimizada para el digitador
+        total_destinos = st.session_state.num_destinos
+        tiendas_usadas_en_form = set()
+
         for i in range(total_destinos):
-            st.markdown(f"📍 **Destino #{i+1}**")
+            st.markdown(f"📍 **Destino #{i + 1}**")
             d1, d2, d3, d4 = st.columns(4)
             d5, d6, d7 = st.columns(3)
-            
+
             with d1:
-                tienda = d1.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{id_viaje}_{i}")
+                tienda = d1.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
                 km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
                 gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
                 st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
-            with d2: 
-                m_ida_tienda = d2.text_input("🔒 Marchamo IDA (Único)", key=f"mida_{id_viaje}_{i}")
+            with d2:
+                m_ida_tienda = d2.text_input("🔒 Marchamo IDA (Único)", key=f"mida_{run}_{i}")
             with d3:
                 es_ultimo = (i == total_destinos - 1)
-                m_reg_tienda = d3.text_input("🔄 Marchamo REGRESO", key=f"mreg_{id_viaje}_{i}", disabled=not es_ultimo, placeholder="Solo última tienda" if not es_ultimo else "")
-            with d4: 
-                peds = d4.text_input("No. Pedidos (Separados por coma)", key=f"p_{id_viaje}_{i}", placeholder="Ej: P01, P02")
-                
-            with d5: roles = d5.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{id_viaje}_{i}")
-            with d6: tarimas = d6.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{id_viaje}_{i}")
-            with d7: cajas = d7.number_input("Cajas Manual / WMS", min_value=0, step=1, key=f"c_{id_viaje}_{i}")
-            
+                m_reg_tienda = d3.text_input("🔄 Marchamo REGRESO", key=f"mreg_{run}_{i}", disabled=not es_ultimo,
+                                              placeholder="Solo última tienda" if not es_ultimo else "")
+            with d4:
+                peds = d4.text_input("No. Pedidos (Separados por coma)", key=f"p_{run}_{i}", placeholder="Ej: P01, P02")
+
+            with d5:
+                roles = d5.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{run}_{i}")
+            with d6:
+                tarimas = d6.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{run}_{i}")
+            with d7:
+                cajas = d7.number_input("Cajas Manual / WMS", min_value=0, step=1, key=f"c_{run}_{i}")
+
             if tienda:
+                if tienda in tiendas_usadas_en_form:
+                    st.warning(f"⚠️ La tienda '{tienda}' ya está agregada como otro destino de este mismo viaje.")
+                tiendas_usadas_en_form.add(tienda)
                 destinos_viaje.append({
-                    "tienda": tienda, 
-                    "km": km_t, 
-                    "galones_base": gal_t, 
+                    "tienda": tienda,
+                    "km": km_t,
+                    "galones_base": gal_t,
                     "pedidos": peds,
-                    "marchamo_ida": m_ida_tienda, 
-                    "marchamo_regreso": m_reg_tienda if es_ultimo else "N/A",
-                    "roles": roles, 
-                    "tarimas": tarimas, 
+                    "marchamo_ida": m_ida_tienda.strip(),
+                    "marchamo_regreso": m_reg_tienda.strip() if es_ultimo else "",
+                    "roles": roles,
+                    "tarimas": tarimas,
                     "cajas": cajas
                 })
             st.markdown("---")
-            
+
         if st.button("💾 Guardar Viaje y Generar Hoja de Control"):
-            errores_marchamo = False
-            marchamos_vacios = False
-            
-            for dest in destinos_viaje:
-                if not dest["marchamo_ida"]:
-                    marchamos_vacios = True
-                if dest["marchamo_ida"] in st.session_state.marchamos:
-                    errores_marchamo = True
-                    
+            marchamos_vacios = any(not d["marchamo_ida"] for d in destinos_viaje)
+            marchamos_repetidos_en_form = len([d["marchamo_ida"] for d in destinos_viaje]) != len(
+                set(d["marchamo_ida"] for d in destinos_viaje)
+            )
+
             if not placa or len(destinos_viaje) == 0:
                 st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
             elif marchamos_vacios:
                 st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
-            elif errores_marchamo:
-                st.error("❌ Error: Uno o más Marchamos de Ida digitados ya fueron utilizados en viajes anteriores.")
+            elif marchamos_repetidos_en_form:
+                st.error("❌ Error: Hay marchamos de ida repetidos dentro de este mismo viaje.")
             elif total_destinos > 0 and not destinos_viaje[-1]["marchamo_regreso"]:
                 st.error("❌ Error: El Marchamo de Regreso es obligatorio en la última tienda para cerrar el circuito.")
             else:
-                # Modificado a estructura limpia y directa sin saltos de línea conflictivos
-                nuevo_viaje = {}
-                nuevo_viaje["id_viaje"] = id_viaje
-                nuevo_viaje["usuario_creador"] = usuario_activo
-                nuevo_viaje["fecha_creacion"] = fecha_hoy
+                ok, resultado = guardar_viaje(
+                    cliente=cliente_activo,
+                    placa=placa,
+                    transportista=t_pred,
+                    piloto=piloto_final,
+                    auxiliar=auxiliar_final,
+                    usuario=usuario_activo,
+                    destinos_viaje=destinos_viaje
+                )
+                if ok:
+                    st.success(f"✅ Viaje {resultado} guardado correctamente.")
+                    st.session_state.num_destinos = 1
+                    st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
+                    st.rerun()
+                else:
+                    st.error(f"❌ Error: {resultado}")
+
+        st.markdown("### 🕒 Últimos viajes registrados")
+        st.dataframe(obtener_viajes_recientes(), use_container_width=True)
+    else:
+        st.info("Tu perfil no tiene permisos para despachar viajes.")
+
+# ==========================================
+# MÓDULO 2: LIQUIDACIONES (pendiente de construir)
+# ==========================================
+with tab2:
+    st.info("Módulo de liquidaciones en construcción: búsqueda por No. de Viaje o Marchamo, "
+            "confirmación de retorno de pacas/roles/tarimas, y cambio de estado del viaje.")
+
+# ==========================================
+# MÓDULO 3: REPORTES (pendiente de construir)
+# ==========================================
+with tab3:
+    st.info("Módulo de reportes en construcción: impacto de diésel por viaje/tienda usando el "
+            "precio configurado en la barra lateral.")
