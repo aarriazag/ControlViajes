@@ -522,7 +522,12 @@ cd_origen_fijo = st.session_state["cd_origen_fijo"]
 
 st.sidebar.success(f"Cliente: **{cliente_activo}**")
 st.sidebar.success(f"CD Origen: **{cd_origen_fijo}**")
-st.sidebar.caption("Para cambiar cualquiera de estos, cierra esta pestaña y vuelve a entrar.")
+if st.sidebar.button("🚪 Cambiar Cliente / CD"):
+    st.session_state["config_bloqueada"] = False
+    del st.session_state["cliente_activo_fijo"]
+    del st.session_state["cd_origen_fijo"]
+    st.rerun()
+st.sidebar.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
 
 st.sidebar.markdown("---")
 usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.catalogos["usuarios"].keys()))
