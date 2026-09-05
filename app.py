@@ -97,6 +97,13 @@ def init_db():
                 cajas INTEGER DEFAULT 0
             )
         """)
+        # Columnas de liquidación (se agregan solas si no existen; no afecta datos ya guardados)
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS roles_devueltos INTEGER")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS tarimas_devueltas INTEGER")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS pacas_carton_devueltas INTEGER")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS usuario_liquido TEXT")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS fecha_liquidacion TEXT")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS hora_liquidacion TEXT")
         conn.commit()
 
 
@@ -183,6 +190,51 @@ def obtener_viajes_recientes(limite=10):
             "SELECT id_viaje, cliente, placa, piloto, fecha_creacion, hora_creacion, estado "
             "FROM viajes ORDER BY id DESC LIMIT %s", conn, params=(limite,)
         )
+
+
+def buscar_viaje_para_liquidar(valor_busqueda):
+    """Busca un viaje por No. de Viaje, Marchamo de Ida (de cualquiera de sus destinos), o Placa.
+    Devuelve (viaje, destinos) o (None, []) si no encuentra nada."""
+    valor = valor_busqueda.strip()
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT v.* FROM viajes v
+            WHERE v.id_viaje = %s OR v.placa = %s
+               OR EXISTS (SELECT 1 FROM destinos d WHERE d.viaje_id = v.id AND d.marchamo_ida = %s)
+            ORDER BY v.id DESC LIMIT 1
+        """, (valor, valor, valor))
+        viaje = cur.fetchone()
+        if not viaje:
+            return None, []
+        cur.execute("SELECT * FROM destinos WHERE viaje_id = %s ORDER BY orden", (viaje["id"],))
+        destinos = cur.fetchall()
+        return viaje, destinos
+
+
+def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
+    """Registra lo que el camión trajo de regreso por cada destino y marca el viaje como Liquidado.
+    destinos_actualizados: lista de dicts con id, roles_devueltos, tarimas_devueltas, pacas_carton_devueltas."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                for d in destinos_actualizados:
+                    cur.execute(
+                        "UPDATE destinos SET roles_devueltos=%s, tarimas_devueltas=%s, "
+                        "pacas_carton_devueltas=%s WHERE id=%s",
+                        (d["roles_devueltos"], d["tarimas_devueltas"], d["pacas_carton_devueltas"], d["id"])
+                    )
+                fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+                hora_hoy = datetime.now().strftime("%H:%M:%S")
+                cur.execute(
+                    "UPDATE viajes SET estado='Liquidado', usuario_liquido=%s, "
+                    "fecha_liquidacion=%s, hora_liquidacion=%s WHERE id=%s",
+                    (usuario, fecha_hoy, hora_hoy, viaje_id)
+                )
+            conn.commit()
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
 
 
 # ==========================================
@@ -390,11 +442,87 @@ with tab1:
         st.info("Tu perfil no tiene permisos para despachar viajes.")
 
 # ==========================================
-# MÓDULO 2: LIQUIDACIONES (pendiente de construir)
+# MÓDULO 2: LIQUIDACIONES
 # ==========================================
 with tab2:
-    st.info("Módulo de liquidaciones en construcción: búsqueda por No. de Viaje o Marchamo, "
-            "confirmación de retorno de pacas/roles/tarimas, y cambio de estado del viaje.")
+    if perfil_activo in ["Administrador", "Liquidador"]:
+        st.header("Liquidación de Viajes")
+        st.caption("Registra lo que el camión trajo de regreso de cada tienda. Las cajas no se devuelven.")
+
+        col_crit, col_val, col_btn = st.columns([1, 2, 1])
+        with col_crit:
+            criterio = st.selectbox("Buscar por", ["No. de Viaje", "Marchamo de Ida", "Placa"], key="criterio_liq")
+        with col_val:
+            valor_busqueda = st.text_input("Valor a buscar", key="valor_liq")
+        with col_btn:
+            st.write("")
+            st.write("")
+            buscar = st.button("🔍 Buscar Viaje")
+
+        if buscar:
+            if valor_busqueda.strip():
+                viaje, destinos = buscar_viaje_para_liquidar(valor_busqueda)
+                st.session_state["viaje_liq"] = viaje
+                st.session_state["destinos_liq"] = destinos
+            else:
+                st.warning("Escribe un valor para buscar.")
+
+        viaje = st.session_state.get("viaje_liq")
+        destinos = st.session_state.get("destinos_liq", [])
+
+        if "viaje_liq" in st.session_state and viaje is None:
+            st.warning("No se encontró ningún viaje con ese dato.")
+
+        if viaje:
+            st.markdown("---")
+            st.subheader(f"Viaje {viaje['id_viaje']}")
+            i1, i2, i3, i4 = st.columns(4)
+            i1.metric("Cliente", viaje["cliente"])
+            i2.metric("Placa", viaje["placa"])
+            i3.metric("Piloto", viaje["piloto"])
+            i4.metric("Estado", viaje["estado"])
+
+            if viaje["estado"] == "Liquidado":
+                st.success(f"✅ Este viaje ya fue liquidado el {viaje['fecha_liquidacion']} "
+                            f"{viaje['hora_liquidacion']} por {viaje['usuario_liquido']}.")
+            else:
+                st.markdown("#### Devoluciones por tienda")
+                destinos_actualizados = []
+                for d in destinos:
+                    st.markdown(f"📍 **{d['tienda']}** — marchamo ida: `{d['marchamo_ida']}`")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        roles_dev = st.number_input(
+                            "Roles devueltos", min_value=0, step=1, key=f"roldev_{d['id']}"
+                        )
+                    with c2:
+                        tarimas_dev = st.number_input(
+                            "Tarimas devueltas", min_value=0, step=1, key=f"tardev_{d['id']}"
+                        )
+                    with c3:
+                        pacas_dev = st.number_input(
+                            "Pacas de cartón devueltas", min_value=0, step=1, key=f"pacdev_{d['id']}"
+                        )
+                    destinos_actualizados.append({
+                        "id": d["id"],
+                        "roles_devueltos": roles_dev,
+                        "tarimas_devueltas": tarimas_dev,
+                        "pacas_carton_devueltas": pacas_dev
+                    })
+                    st.markdown("---")
+
+                if st.button("✅ Liquidar Viaje"):
+                    ok, msg = liquidar_viaje(viaje["id"], destinos_actualizados, usuario_activo)
+                    if ok:
+                        st.success(f"Viaje {viaje['id_viaje']} liquidado correctamente. "
+                                   "Ya puede procesarse el pago al transportista.")
+                        del st.session_state["viaje_liq"]
+                        del st.session_state["destinos_liq"]
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Error al liquidar: {msg}")
+    else:
+        st.info("Tu perfil no tiene permisos para liquidar viajes.")
 
 # ==========================================
 # MÓDULO 3: REPORTES (pendiente de construir)
