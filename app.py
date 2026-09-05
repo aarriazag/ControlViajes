@@ -312,17 +312,56 @@ def cargar_catalogos_desde_db():
         }
 
 
-# Config genérica usada por la pantalla de Catálogos: qué tabla y columnas
-# corresponden a cada catálogo, para no repetir código por cada uno.
+# Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
+# llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
 CATALOGOS_CONFIG = {
-    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre"]},
-    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"]},
-    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"]},
-    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"]},
-    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "km", "galones_base"]},
-    "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"]},
-    "Usuarios": {"tabla": "cat_usuarios", "columnas": ["usuario", "perfil"]},
+    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
+    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
+    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
+    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"],
+                 "clave": ["placa"], "numericas": []},
+    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "km", "galones_base"],
+                           "clave": ["cliente", "tienda"], "numericas": ["km", "galones_base"]},
+    "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"],
+                        "clave": ["cliente", "cd"], "numericas": []},
+    "Usuarios": {"tabla": "cat_usuarios", "columnas": ["usuario", "perfil"], "clave": ["usuario"], "numericas": []},
 }
+
+
+def agregar_o_actualizar_registro(tabla, columnas, clave, valores):
+    """Inserta un registro nuevo, o lo actualiza si la llave ya existe (upsert),
+    para poder corregir un solo dato sin tener que resubir todo el Excel."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cols_sql = ", ".join(columnas)
+                placeholders = ", ".join(["%s"] * len(columnas))
+                no_clave = [c for c in columnas if c not in clave]
+                set_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in no_clave)
+                query = f"INSERT INTO {tabla} ({cols_sql}) VALUES ({placeholders})"
+                if set_sql:
+                    query += f" ON CONFLICT ({', '.join(clave)}) DO UPDATE SET {set_sql}"
+                else:
+                    query += f" ON CONFLICT ({', '.join(clave)}) DO NOTHING"
+                cur.execute(query, tuple(valores[c] for c in columnas))
+            conn.commit()
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def eliminar_registro(tabla, clave, valores_clave):
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                where_sql = " AND ".join(f"{c} = %s" for c in clave)
+                cur.execute(f"DELETE FROM {tabla} WHERE {where_sql}", tuple(valores_clave[c] for c in clave))
+            conn.commit()
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
 
 
 def generar_plantilla_excel(columnas):
@@ -504,11 +543,50 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
             return False, str(e)
 
 
+def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados):
+    """Corrige los datos de un viaje ya guardado (solo permitido mientras esté
+    'Pendiente de Liquidar'). destinos_actualizados es una lista de dicts con el
+    id de cada destino y sus campos corregidos."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                # Revalidar que ningún marchamo de ida corregido choque con el de
+                # OTRO destino que no sea el mismo que estamos editando.
+                for d in destinos_actualizados:
+                    cur.execute(
+                        "SELECT 1 FROM destinos WHERE marchamo_ida = %s AND id != %s",
+                        (d["marchamo_ida"], d["id"])
+                    )
+                    if cur.fetchone():
+                        conn.rollback()
+                        return False, f"El marchamo '{d['marchamo_ida']}' ya está en uso en otro destino."
+
+                cur.execute(
+                    "UPDATE viajes SET placa=%s, transportista=%s, piloto=%s, auxiliar=%s WHERE id=%s",
+                    (placa, transportista, piloto, auxiliar, viaje_id)
+                )
+                for d in destinos_actualizados:
+                    cur.execute(
+                        "UPDATE destinos SET roles=%s, tarimas=%s, cajas=%s, marchamo_ida=%s, "
+                        "marchamo_regreso=%s, remitos=%s, devolucion=%s, creditos=%s, pg_cajas=%s, "
+                        "incidencias=%s, es_complemento=%s WHERE id=%s",
+                        (d["roles"], d["tarimas"], d["cajas"], d["marchamo_ida"],
+                         d["marchamo_regreso"] or None, d["remitos"], d["devolucion"], d["creditos"],
+                         d["pg_cajas"], d["incidencias"], d["es_complemento"], d["id"])
+                    )
+            conn.commit()
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
 def generar_hoja_control_html(viaje, destinos):
     """Arma la Hoja de Control de Viaje como HTML: en pantalla se ve con los colores
     de Ransa, pero al imprimir (@media print) los fondos de color se vuelven blancos
     y solo quedan bordes negros, para que salga limpia en una impresora blanco y negro."""
     marchamo_ida_general = destinos[0]["marchamo_ida"] if destinos else ""
+    marchamo_regreso = next((d["marchamo_regreso"] for d in destinos if d["marchamo_regreso"]), "")
     es_cliente_unisuper = viaje["cliente"].startswith("UniSuper")
 
     bloques_destino = ""
@@ -564,9 +642,11 @@ def generar_hoja_control_html(viaje, destinos):
                         <div class="material-box vacio"><span>TARIMAS</span></div>
                         <div class="material-box vacio"><span>PACAS CARTÓN</span></div>
                     </div>
-                    <div class="firmas">
-                        <div class="firma">Recibe (tienda)</div>
-                        <div class="firma">Piloto / Auxiliar</div>
+                    <div class="etiqueta" style="margin-top:10px;">CONTROL DE TIEMPOS (LLENAR A MANO)</div>
+                    <div class="material-grid">
+                        <div class="material-box vacio"><span>HORA LLEGADA</span></div>
+                        <div class="material-box vacio"><span>INICIO DESCARGA</span></div>
+                        <div class="material-box vacio"><span>HORA SALIDA</span></div>
                     </div>
                 </div>
             </div>
@@ -588,6 +668,12 @@ def generar_hoja_control_html(viaje, destinos):
         .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 20px; margin-bottom: 20px; }}
         .dato label {{ display: block; font-size: 11px; color: #666; text-transform: uppercase; }}
         .dato span {{ font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
+        .dato-blanco span {{ border-bottom: 1px dashed #999; min-height: 18px; }}
+        .marchamo-retorno-box {{
+            background: #FFF4EC; border: 2px solid #E8804A; color: #A63603;
+            font-size: 18px; font-weight: bold; text-align: center;
+            padding: 10px; border-radius: 8px; margin-bottom: 18px;
+        }}
         .titulo-destinos {{ background: #00693E; color: white; padding: 6px 12px; font-weight: bold;
                              border-radius: 4px; margin-bottom: 10px; }}
         .destino-card {{ border: 1px solid #ccc; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
@@ -620,6 +706,7 @@ def generar_hoja_control_html(viaje, destinos):
             .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
             .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
             .badge-complemento {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
+            .marchamo-retorno-box {{ background: #fff !important; color: #000 !important; border: 2px solid #000; }}
             .material-box {{ border: 1px solid #000; }}
         }}
     </style>
@@ -632,8 +719,11 @@ def generar_hoja_control_html(viaje, destinos):
             <div class="titulo">
                 <h2>HOJA DE SALIDA</h2>
                 <p>Control de Ruta · Documento de Despacho</p>
+                <p style="margin-top:4px;">Generado: <b>{viaje['fecha_creacion']} {viaje['hora_creacion']}</b>
+                   por <b>{viaje['usuario_creador']}</b></p>
             </div>
         </div>
+        {f'<div class="marchamo-retorno-box">🔄 MARCHAMO DE RETORNO: <b>{marchamo_regreso}</b></div>' if marchamo_regreso else ''}
         <div class="datos-grid">
             <div class="dato"><label>No. de Viaje</label><span>{viaje['id_viaje']}</span></div>
             <div class="dato"><label>Cliente</label><span>{viaje['cliente']}</span></div>
@@ -641,11 +731,10 @@ def generar_hoja_control_html(viaje, destinos):
             <div class="dato"><label>Transportista</label><span>{viaje['transportista']}</span></div>
             <div class="dato"><label>Placa</label><span>{viaje['placa']}</span></div>
             <div class="dato"><label>Fecha</label><span>{viaje['fecha_creacion']}</span></div>
-            <div class="dato"><label>Hora</label><span>{viaje['hora_creacion']}</span></div>
+            <div class="dato dato-blanco"><label>Horario (Garita — hora real de salida)</label><span>&nbsp;</span></div>
             <div class="dato"><label>Piloto</label><span>{viaje['piloto']}</span></div>
             <div class="dato"><label>Auxiliar</label><span>{viaje['auxiliar']}</span></div>
             <div class="dato"><label>Marchamo de Ida</label><span>{marchamo_ida_general}</span></div>
-            <div class="dato"><label>Generado por</label><span>{viaje['usuario_creador']}</span></div>
         </div>
         <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
         {bloques_destino}
@@ -702,11 +791,10 @@ if 'num_destinos' not in st.session_state:
     st.session_state.num_destinos = 1
 
 # ==========================================
-# SIDEBAR
+# SIDEBAR + FLUJO DE ENTRADA (Login → Cliente/CD → App)
 # ==========================================
 st.sidebar.markdown("<h2 style='color:#00693E; font-weight:700; letter-spacing:-0.02em;'>🚚 RANSA</h2>", unsafe_allow_html=True)
 st.sidebar.caption("Control de Ruta")
-st.sidebar.title("🔐 Configuración Inicial")
 
 st.sidebar.markdown("---")
 try:
@@ -717,14 +805,60 @@ except Exception as e:
     st.sidebar.error(f"🔴 Sin conexión a la base de datos: {e}")
     st.stop()
 
-# --- Bloqueo de sesión: Cliente y CD Origen se eligen UNA SOLA VEZ al entrar.
-# Para cambiarlos hay que cerrar esta pestaña y volver a abrir la app (eso
-# reinicia la sesión). Esto evita que a mitad de una jornada alguien cambie sin
-# querer el cliente/CD y se mezclen viajes de otro contexto.
+# --- PANTALLA 1: LOGIN ---
+# Todavía no valida contraseña (eso queda pendiente para cuando resolvamos
+# seguridad de verdad), pero exige un clic físico explícito para entrar — no
+# avanza solo. Sirve como primera barrera visual mientras estamos en User Test.
+if not st.session_state.get("login_confirmado"):
+    st.markdown("""
+        <div class="ransa-topbar" style="justify-content:center;">
+            <div style="text-align:center;">
+                <div class="titulo">🚚 RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
+                <div class="subtitulo">Ingresa con tu usuario para continuar</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    col_izq, col_centro, col_der = st.columns([1, 1.2, 1])
+    with col_centro:
+        with st.container(border=True):
+            st.markdown("#### 🔐 Iniciar Sesión")
+            usuario_login = st.selectbox("Usuario", list(st.session_state.catalogos["usuarios"].keys()))
+            st.caption(f"Perfil: **{st.session_state.catalogos['usuarios'][usuario_login]}**")
+            if st.button("🔓 Ingresar al Sistema", use_container_width=True):
+                st.session_state["usuario_activo_fijo"] = usuario_login
+                st.session_state["login_confirmado"] = True
+                st.rerun()
+    st.caption("⚠️ Validación de usuario simulada — falta la contraseña real, pendiente para cuando resolvamos seguridad.")
+    st.stop()
+
+usuario_activo = st.session_state["usuario_activo_fijo"]
+perfil_activo = st.session_state.catalogos["usuarios"][usuario_activo]
+
+st.sidebar.success(f"👤 **{usuario_activo}**")
+st.sidebar.caption(f"Perfil: {perfil_activo}")
+if st.sidebar.button("🔒 Cerrar Sesión"):
+    st.session_state["login_confirmado"] = False
+    st.session_state["config_bloqueada"] = False
+    del st.session_state["usuario_activo_fijo"]
+    for k in ("cliente_activo_fijo", "cd_origen_fijo"):
+        st.session_state.pop(k, None)
+    st.rerun()
+
+# --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
+# cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
+# jornada alguien cambie sin querer el cliente/CD y se mezclen viajes).
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔒 Cliente y CD (fijo por sesión)")
 
 if not st.session_state.get("config_bloqueada"):
+    st.markdown("""
+        <div class="ransa-topbar" style="justify-content:center;">
+            <div style="text-align:center;">
+                <div class="titulo">🎯 Selección de Cliente y CD Origen</div>
+                <div class="subtitulo">Confirma para comenzar a trabajar</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
     cliente_activo_sel = st.sidebar.selectbox("🎯 Cliente", list(st.session_state.catalogos["clientes"].keys()))
 
     cds_disponibles = st.session_state.catalogos["cds_por_cliente"].get(cliente_activo_sel, [])
@@ -754,12 +888,6 @@ if st.sidebar.button("🚪 Cambiar Cliente / CD"):
     del st.session_state["cd_origen_fijo"]
     st.rerun()
 st.sidebar.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
-
-st.sidebar.markdown("---")
-usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.catalogos["usuarios"].keys()))
-perfil_activo = st.session_state.catalogos["usuarios"][usuario_activo]
-st.sidebar.info(f"**Perfil:** {perfil_activo}")
-st.sidebar.caption("⚠️ Esto es una simulación de usuario, no un login real. Falta agregar autenticación con contraseña antes de usarlo en producción con varios digitadores.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⛽ Parámetros Económicos")
@@ -875,7 +1003,11 @@ with tab1:
                             st.write("")
                             agregar_pedido = st.form_submit_button("➕ Agregar")
                     if agregar_pedido:
-                        if pedido_codigo.strip():
+                        if not pedido_codigo.strip():
+                            st.warning("Escribe un número de pedido antes de agregarlo.")
+                        elif pedido_cajas <= 0:
+                            st.warning("⚠️ Ese pedido no tiene cajas — indica cuántas cajas trae antes de agregarlo.")
+                        else:
                             cajas_wms = validar_pedido_wms(pedido_codigo.strip())
                             lista_pedidos.append({
                                 "pedido": pedido_codigo.strip(),
@@ -883,8 +1015,6 @@ with tab1:
                                 "origen": "WMS" if cajas_wms is not None else "Manual"
                             })
                             st.rerun()
-                        else:
-                            st.warning("Escribe un número de pedido antes de agregarlo.")
 
                     if lista_pedidos:
                         for idx, p in enumerate(lista_pedidos):
@@ -1098,6 +1228,59 @@ with tab2:
                     else:
                         st.error(f"❌ Error al liquidar: {msg}")
 
+                with st.expander("✏️ Editar este viaje (corregir datos digitados)"):
+                    st.caption("Corrige placa, piloto, auxiliar, o los datos de cada tienda. "
+                               "No se puede editar un viaje ya Liquidado o Anulado.")
+                    placas_disp = list(st.session_state.catalogos["camiones"].keys())
+                    placa_idx = placas_disp.index(viaje["placa"]) if viaje["placa"] in placas_disp else 0
+                    placa_edit = st.selectbox("Placa", placas_disp, index=placa_idx, key=f"edit_placa_{viaje['id']}")
+                    datos_cam = st.session_state.catalogos["camiones"].get(placa_edit, {})
+                    transportista_edit = datos_cam.get("transportista", viaje["transportista"])
+
+                    pilotos_disp = st.session_state.catalogos["pilotos"]
+                    pil_idx = pilotos_disp.index(viaje["piloto"]) if viaje["piloto"] in pilotos_disp else 0
+                    piloto_edit = st.selectbox("Piloto", pilotos_disp, index=pil_idx, key=f"edit_piloto_{viaje['id']}")
+
+                    aux_disp = st.session_state.catalogos["auxiliares"]
+                    aux_idx = aux_disp.index(viaje["auxiliar"]) if viaje["auxiliar"] in aux_disp else 0
+                    auxiliar_edit = st.selectbox("Auxiliar", aux_disp, index=aux_idx, key=f"edit_aux_{viaje['id']}")
+
+                    st.markdown("##### Datos por tienda")
+                    destinos_editados = []
+                    for d in destinos:
+                        st.markdown(f"📍 **{d['tienda']}**")
+                        e1, e2, e3 = st.columns(3)
+                        with e1:
+                            roles_e = st.number_input("Roles", min_value=0, step=1, value=d["roles"], key=f"eroles_{d['id']}")
+                        with e2:
+                            tarimas_e = st.number_input("Tarimas", min_value=0, step=1, value=d["tarimas"], key=f"etarimas_{d['id']}")
+                        with e3:
+                            cajas_e = st.number_input("Cajas", min_value=0, step=1, value=d["cajas"], key=f"ecajas_{d['id']}")
+                        e4, e5 = st.columns(2)
+                        with e4:
+                            mida_e = st.text_input("Marchamo Ida", value=d["marchamo_ida"], key=f"emida_{d['id']}")
+                        with e5:
+                            mreg_e = st.text_input("Marchamo Regreso", value=d["marchamo_regreso"] or "", key=f"emreg_{d['id']}")
+                        es_comp_e = st.checkbox("¿Es complemento?", value=d["es_complemento"], key=f"ecomp_{d['id']}")
+                        destinos_editados.append({
+                            "id": d["id"], "roles": roles_e, "tarimas": tarimas_e, "cajas": cajas_e,
+                            "marchamo_ida": mida_e.strip(), "marchamo_regreso": mreg_e.strip(),
+                            "remitos": d["remitos"], "devolucion": d["devolucion"], "creditos": d["creditos"],
+                            "pg_cajas": d["pg_cajas"], "incidencias": d["incidencias"], "es_complemento": es_comp_e
+                        })
+                        st.markdown("---")
+
+                    if st.button("💾 Guardar Correcciones", key=f"btn_editar_{viaje['id']}"):
+                        ok, msg = editar_viaje(viaje["id"], placa_edit, transportista_edit, piloto_edit,
+                                               auxiliar_edit, destinos_editados)
+                        if ok:
+                            st.success(f"Viaje {viaje['id_viaje']} corregido.")
+                            del st.session_state["viaje_liq"]
+                            del st.session_state["destinos_liq"]
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Error al corregir: {msg}")
+
                 with st.expander("🚫 Anular este viaje"):
                     st.caption("Usa esto solo si el viaje se digitó por error. Queda registrado quién y cuándo "
                                "lo anuló; por ahora los marchamos usados quedan libres para digitarse en otro viaje.")
@@ -1144,6 +1327,46 @@ with tab4:
         st.dataframe(df_actual, use_container_width=True)
         st.caption(f"{len(df_actual)} registro(s) actualmente.")
 
+        st.markdown("#### ➕ Agregar o corregir UN registro")
+        st.caption("Para un cambio puntual, sin tener que subir un Excel completo. Si la llave "
+                   "ya existe, se actualiza en vez de duplicarse.")
+        with st.form(key=f"form_registro_{catalogo_sel}", clear_on_submit=True):
+            valores_form = {}
+            for col in config["columnas"]:
+                if col in config["numericas"]:
+                    valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+                else:
+                    valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+            guardar_registro = st.form_submit_button("💾 Guardar Registro")
+        if guardar_registro:
+            faltan_llave = [c for c in config["clave"] if not str(valores_form[c]).strip()]
+            if faltan_llave:
+                st.error(f"❌ Debes llenar: {', '.join(faltan_llave)} (son la llave del registro).")
+            else:
+                ok, msg = agregar_o_actualizar_registro(config["tabla"], config["columnas"], config["clave"], valores_form)
+                if ok:
+                    st.success("✅ Registro guardado.")
+                    st.session_state.catalogos = cargar_catalogos_desde_db()
+                    st.rerun()
+                else:
+                    st.error(f"❌ Error: {msg}")
+
+        if not df_actual.empty:
+            st.markdown("#### 🗑️ Eliminar un registro")
+            opciones_borrar = df_actual.apply(lambda r: " | ".join(str(r[c]) for c in config["clave"]), axis=1).tolist()
+            registro_borrar = st.selectbox("Selecciona el registro a eliminar", opciones_borrar, key=f"del_sel_{catalogo_sel}")
+            if st.button("🗑️ Eliminar Registro Seleccionado", key=f"del_btn_{catalogo_sel}"):
+                valores_clave = dict(zip(config["clave"], registro_borrar.split(" | ")))
+                ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave)
+                if ok:
+                    st.success("✅ Registro eliminado.")
+                    st.session_state.catalogos = cargar_catalogos_desde_db()
+                    st.rerun()
+                else:
+                    st.error(f"❌ Error: {msg}")
+
+        st.markdown("---")
+        st.markdown("#### 📤 Carga masiva (Excel)")
         col_desc, col_sub = st.columns(2)
         with col_desc:
             st.markdown("#### 1. Descargar plantilla")
