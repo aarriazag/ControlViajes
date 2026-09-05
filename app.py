@@ -114,6 +114,10 @@ def init_db():
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS cd_origen TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS remitos TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS incidencias TEXT")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS devolucion TEXT")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS creditos TEXT")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS pg_cajas INTEGER")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS es_complemento BOOLEAN DEFAULT FALSE")
         conn.commit()
 
 
@@ -182,12 +186,15 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                 for i, dest in enumerate(destinos_viaje):
                     cur.execute(
                         "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
-                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias, "
+                        "devolucion, creditos, pg_cajas, es_complemento) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
                          dest["marchamo_ida"], dest["marchamo_regreso"] or None,
                          dest["roles"], dest["tarimas"], dest["cajas"],
-                         dest.get("remitos", ""), dest.get("incidencias", ""))
+                         dest.get("remitos", ""), dest.get("incidencias", ""),
+                         dest.get("devolucion", ""), dest.get("creditos", ""),
+                         dest.get("pg_cajas", 0), dest.get("es_complemento", False))
                     )
             conn.commit()
             return True, id_viaje_str
@@ -277,13 +284,20 @@ def generar_hoja_control_html(viaje, destinos):
             f'<span class="badge-regreso">Marchamo Retorno: {d["marchamo_regreso"]}</span>'
             if d["marchamo_regreso"] else ""
         )
+        badge_complemento = '<span class="badge-complemento">COMPLEMENTO</span>' if d["es_complemento"] else ""
         incidencia_txt = d["incidencias"] or ""
         incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
+        material_cajas = (
+            f'<div class="material-box"><b>{d["cajas"]}</b><span>CAJAS</span></div>'
+            f'<div class="material-box"><b>{d["pg_cajas"] or 0}</b><span>CAJAS P&amp;G</span></div>'
+            if not d["es_complemento"] else ""
+        )
 
         bloques_destino += f"""
         <div class="destino-card">
             <div class="destino-header">
                 <span class="destino-num">{idx}</span> {d['tienda']}
+                {badge_complemento}
                 {badge_regreso}
             </div>
             <div class="destino-body">
@@ -292,10 +306,12 @@ def generar_hoja_control_html(viaje, destinos):
                     <div class="material-grid">
                         <div class="material-box"><b>{d['roles']}</b><span>ROLES</span></div>
                         <div class="material-box"><b>{d['tarimas']}</b><span>TARIMAS</span></div>
-                        <div class="material-box"><b>{d['cajas']}</b><span>CAJAS</span></div>
+                        {material_cajas}
                     </div>
                     <div class="sub-info">No. de Pedidos: <b>{pedidos_txt}</b></div>
-                    <div class="sub-info">Remitos: <b>{d['remitos'] or '—'}</b></div>
+                    <div class="sub-info">Remisión: <b>{d['remitos'] or '—'}</b> &nbsp;|&nbsp;
+                        Devolución: <b>{d['devolucion'] or '—'}</b> &nbsp;|&nbsp;
+                        Créditos: <b>{d['creditos'] or '—'}</b></div>
                     {incidencia_html}
                 </div>
                 <div class="material-devuelto">
@@ -336,6 +352,8 @@ def generar_hoja_control_html(viaje, destinos):
         .destino-num {{ background: #007A33; color: white; border-radius: 50%; padding: 2px 9px; margin-right: 6px; }}
         .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 3px 10px;
                            border-radius: 4px; font-size: 12px; }}
+        .badge-complemento {{ background: #A63603; color: white; padding: 3px 10px;
+                               border-radius: 4px; font-size: 12px; margin-left: 8px; }}
         .destino-body {{ display: flex; }}
         .material-enviado, .material-devuelto {{ flex: 1; padding: 10px 12px; }}
         .material-devuelto {{ border-left: 2px dashed #ccc; }}
@@ -358,6 +376,7 @@ def generar_hoja_control_html(viaje, destinos):
             .logo, .titulo h2, .dato span, .etiqueta, .destino-num, .material-box b {{ color: #000 !important; }}
             .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
             .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
+            .badge-complemento {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
             .material-box {{ border: 1px solid #000; }}
         }}
     </style>
@@ -602,88 +621,122 @@ with tab1:
         tiendas_usadas_en_form = set()
 
         for i in range(total_destinos):
-            st.markdown(f"### 📍 Destino #{i + 1}")
+            with st.container(border=True):
+                st.markdown(f"#### 📍 Destino #{i + 1}")
 
-            tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
-            km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
-            gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
-            st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
+                tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
+                km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
+                gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
+                st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
 
-            # --- Lista de pedidos (memoria temporal) ---
-            # Cada pedido agregado aquí suma sus cajas al total. Cuando exista la
-            # conexión con el WMS, validar_pedido_wms() traerá el conteo real en vez
-            # del que digita el usuario a mano.
-            key_lista_pedidos = f"pedidos_lista_{run}_{i}"
-            if key_lista_pedidos not in st.session_state:
-                st.session_state[key_lista_pedidos] = []
-            lista_pedidos = st.session_state[key_lista_pedidos]
+                es_complemento = st.toggle(
+                    "¿Es complemento? (el resto de un pedido que no cupo en un viaje anterior)",
+                    key=f"comp_{run}_{i}"
+                )
+                if es_complemento:
+                    st.caption("Solo se piden Roles y Tarimas — las cajas y P&G van en el otro vehículo.")
 
-            st.markdown("**📦 Cajas** — agrega los pedidos de esta tienda (o usa el total manual más abajo)")
-            with st.form(key=f"form_pedido_{run}_{i}", clear_on_submit=True):
-                fp1, fp2, fp3 = st.columns([2, 1, 1])
-                with fp1:
-                    pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}")
-                with fp2:
-                    pedido_cajas = st.number_input("Cajas de este pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}")
-                with fp3:
-                    st.write("")
-                    agregar_pedido = st.form_submit_button("➕ Agregar")
-            if agregar_pedido:
-                if pedido_codigo.strip():
-                    cajas_wms = validar_pedido_wms(pedido_codigo.strip())
-                    lista_pedidos.append({
-                        "pedido": pedido_codigo.strip(),
-                        "cajas": cajas_wms if cajas_wms is not None else pedido_cajas,
-                        "origen": "WMS" if cajas_wms is not None else "Manual"
-                    })
-                    st.rerun()
+                # --- Lista de pedidos (memoria temporal) ---
+                # Cada pedido agregado aquí suma sus cajas al total. Cuando exista la
+                # conexión con el WMS, validar_pedido_wms() traerá el conteo real en vez
+                # del que digita el usuario a mano.
+                key_lista_pedidos = f"pedidos_lista_{run}_{i}"
+                if key_lista_pedidos not in st.session_state:
+                    st.session_state[key_lista_pedidos] = []
+                lista_pedidos = st.session_state[key_lista_pedidos]
+
+                if not es_complemento:
+                    st.markdown("**📦 Cajas** — agrega los pedidos de esta tienda (o usa el total manual)")
+                    with st.form(key=f"form_pedido_{run}_{i}", clear_on_submit=True):
+                        fp1, fp2, fp3 = st.columns([2, 1, 1])
+                        with fp1:
+                            pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}")
+                        with fp2:
+                            pedido_cajas = st.number_input("Cajas de este pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}")
+                        with fp3:
+                            st.write("")
+                            agregar_pedido = st.form_submit_button("➕ Agregar")
+                    if agregar_pedido:
+                        if pedido_codigo.strip():
+                            cajas_wms = validar_pedido_wms(pedido_codigo.strip())
+                            lista_pedidos.append({
+                                "pedido": pedido_codigo.strip(),
+                                "cajas": cajas_wms if cajas_wms is not None else pedido_cajas,
+                                "origen": "WMS" if cajas_wms is not None else "Manual"
+                            })
+                            st.rerun()
+                        else:
+                            st.warning("Escribe un número de pedido antes de agregarlo.")
+
+                    if lista_pedidos:
+                        for idx, p in enumerate(lista_pedidos):
+                            pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
+                            pc1.write(f"📄 {p['pedido']}")
+                            pc2.write(f"{p['cajas']} cajas")
+                            pc3.write(f"_{p['origen']}_")
+                            if pc4.button("🗑️", key=f"del_pedido_{run}_{i}_{idx}"):
+                                lista_pedidos.pop(idx)
+                                st.rerun()
+                        cajas_total = sum(p["cajas"] for p in lista_pedidos)
+                        st.number_input("Total Cajas (suma de pedidos)", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
+                    else:
+                        cajas_total = st.number_input("Cajas (total manual, sin pedidos detallados)", min_value=0, step=1, key=f"c_{run}_{i}")
                 else:
-                    st.warning("Escribe un número de pedido antes de agregarlo.")
+                    cajas_total = 0
+                    st.caption("📦 Cajas: no aplica en un complemento.")
 
-            if lista_pedidos:
-                for idx, p in enumerate(lista_pedidos):
-                    pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
-                    pc1.write(f"📄 {p['pedido']}")
-                    pc2.write(f"{p['cajas']} cajas")
-                    pc3.write(f"_{p['origen']}_")
-                    if pc4.button("🗑️", key=f"del_pedido_{run}_{i}_{idx}"):
-                        lista_pedidos.pop(idx)
-                        st.rerun()
-                cajas_total = sum(p["cajas"] for p in lista_pedidos)
-                st.number_input("Total Cajas (suma de pedidos)", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
-            else:
-                cajas_total = st.number_input("Cajas (total manual, sin pedidos detallados)", min_value=0, step=1, key=f"c_{run}_{i}")
+                st.markdown("**🧱 Material físico**")
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1:
+                    tarimas = st.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{run}_{i}")
+                with mc2:
+                    roles = st.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{run}_{i}")
+                with mc3:
+                    if not es_complemento:
+                        pg_cajas = st.number_input("Cajas P&G (Procter & Gamble)", min_value=0, step=1, key=f"pg_{run}_{i}")
+                    else:
+                        pg_cajas = 0
+                        st.caption("P&G: no aplica en un complemento.")
 
-            st.markdown("**🧱 Tarimas y Roles**")
-            tarimas = st.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{run}_{i}")
-            roles = st.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{run}_{i}")
+                st.markdown("**📄 Documentos de la tienda**")
+                dc1, dc2, dc3 = st.columns(3)
+                with dc1:
+                    remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                with dc2:
+                    devolucion_txt = st.text_input("Devolución", key=f"dev_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                with dc3:
+                    creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
 
-            with st.expander("📎 Remitos e Incidencias (opcional)"):
-                remitos_txt = st.text_input("Remitos", key=f"remitos_{run}_{i}", placeholder="Ej: R-001, R-002")
-                incidencias_txt = st.text_area("Incidencias en esta tienda", key=f"inc_{run}_{i}",
-                                                placeholder="Ej: tienda cerrada, faltante detectado, etc.")
+                observaciones_txt = st.text_area(
+                    "📝 Observaciones", key=f"obs_{run}_{i}",
+                    placeholder="Ej: lleva transferencia T-123, tienda cerrada, faltante detectado, etc."
+                )
 
-            st.markdown("**🔒 Marchamo de Ida**")
-            m_ida_tienda = st.text_input("Marchamo IDA (Único, se cierra al terminar esta tienda)", key=f"mida_{run}_{i}")
+                st.markdown("**🔒 Marchamo de Ida**")
+                m_ida_tienda = st.text_input("Marchamo IDA (Único, se cierra al terminar esta tienda)", key=f"mida_{run}_{i}")
 
-            if tienda:
-                if tienda in tiendas_usadas_en_form:
-                    st.warning(f"⚠️ La tienda '{tienda}' ya está agregada como otro destino de este mismo viaje.")
-                tiendas_usadas_en_form.add(tienda)
-                destinos_viaje.append({
-                    "tienda": tienda,
-                    "km": km_t,
-                    "galones_base": gal_t,
-                    "pedidos": json.dumps(lista_pedidos),
-                    "marchamo_ida": m_ida_tienda.strip(),
-                    "marchamo_regreso": "",  # se completa más abajo, en el cierre del viaje
-                    "roles": roles,
-                    "tarimas": tarimas,
-                    "cajas": cajas_total,
-                    "remitos": remitos_txt.strip(),
-                    "incidencias": incidencias_txt.strip()
-                })
-            st.markdown("---")
+                if tienda:
+                    if tienda in tiendas_usadas_en_form:
+                        st.warning(f"⚠️ La tienda '{tienda}' ya está agregada como otro destino de este mismo viaje.")
+                    tiendas_usadas_en_form.add(tienda)
+                    destinos_viaje.append({
+                        "tienda": tienda,
+                        "km": km_t,
+                        "galones_base": gal_t,
+                        "pedidos": json.dumps(lista_pedidos),
+                        "marchamo_ida": m_ida_tienda.strip(),
+                        "marchamo_regreso": "",  # se completa más abajo, en el cierre del viaje
+                        "roles": roles,
+                        "tarimas": tarimas,
+                        "cajas": cajas_total,
+                        "remitos": remitos_txt.strip(),
+                        "incidencias": observaciones_txt.strip(),
+                        "devolucion": devolucion_txt.strip(),
+                        "creditos": creditos_txt.strip(),
+                        "pg_cajas": pg_cajas,
+                        "es_complemento": es_complemento
+                    })
+            st.markdown("")
 
         st.subheader("3. Cierre del Viaje")
         st.caption("El Marchamo de Regreso se coloca al final, cuando ya se cerraron todas las tiendas.")
