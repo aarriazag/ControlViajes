@@ -496,23 +496,36 @@ def obtener_viajes_recientes(limite=10):
         )
 
 
-def buscar_viaje(valor_busqueda):
-    """Busca un viaje por No. de Viaje, Marchamo de Ida (de cualquiera de sus destinos), o Placa.
-    Devuelve (viaje, destinos) o (None, []) si no encuentra nada."""
-    valor = valor_busqueda.strip()
+def buscar_viajes(valor_busqueda):
+    """Busca viajes por coincidencia PARCIAL (no exacta) de No. de Viaje, Marchamo de
+    Ida (de cualquiera de sus destinos), o Placa. Devuelve una lista (puede tener
+    más de un resultado si el texto buscado coincide con varios viajes)."""
+    valor = f"%{valor_busqueda.strip()}%"
     with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
-            SELECT v.* FROM viajes v
-            WHERE v.id_viaje = %s OR v.placa = %s
-               OR EXISTS (SELECT 1 FROM destinos d WHERE d.viaje_id = v.id AND d.marchamo_ida = %s)
-            ORDER BY v.id DESC LIMIT 1
+            SELECT DISTINCT v.* FROM viajes v
+            WHERE v.id_viaje ILIKE %s OR v.placa ILIKE %s
+               OR EXISTS (SELECT 1 FROM destinos d WHERE d.viaje_id = v.id AND d.marchamo_ida ILIKE %s)
+            ORDER BY v.id DESC LIMIT 20
         """, (valor, valor, valor))
-        viaje = cur.fetchone()
-        if not viaje:
-            return None, []
-        cur.execute("SELECT * FROM destinos WHERE viaje_id = %s ORDER BY orden", (viaje["id"],))
-        destinos = cur.fetchall()
-        return viaje, destinos
+        return cur.fetchall()
+
+
+def obtener_destinos_de_viaje(viaje_id):
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM destinos WHERE viaje_id = %s ORDER BY orden", (viaje_id,))
+        return cur.fetchall()
+
+
+def listar_viajes_pendientes(limite=30):
+    """Viajes que todavía no se han liquidado ni anulado, para elegir directo
+    de una lista sin tener que escribir nada."""
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM viajes WHERE estado = 'Pendiente de Liquidar'
+            ORDER BY id DESC LIMIT %s
+        """, (limite,))
+        return cur.fetchall()
 
 
 def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
@@ -656,57 +669,58 @@ def generar_hoja_control_html(viaje, destinos):
     <html>
     <head>
     <style>
-        body {{ font-family: Arial, sans-serif; color: #1a1a1a; padding: 20px; }}
+        @page {{ size: letter; margin: 10mm; }}
+        body {{ font-family: Arial, sans-serif; color: #1a1a1a; padding: 14px; font-size: 13px; }}
         .hoja {{ max-width: 800px; margin: auto; }}
         .header {{ display: flex; justify-content: space-between; align-items: flex-start;
-                   border-bottom: 4px solid #00693E; padding-bottom: 10px; margin-bottom: 15px; }}
-        .logo {{ font-size: 28px; font-weight: bold; color: #00693E; }}
+                   border-bottom: 3px solid #00693E; padding-bottom: 6px; margin-bottom: 8px; }}
+        .logo {{ font-size: 22px; font-weight: bold; color: #00693E; }}
         .titulo {{ text-align: right; }}
-        .titulo h2 {{ margin: 0; color: #00693E; }}
-        .titulo p {{ margin: 0; color: #666; font-size: 12px; }}
-        .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 20px; margin-bottom: 20px; }}
-        .dato label {{ display: block; font-size: 11px; color: #666; text-transform: uppercase; }}
-        .dato span {{ font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
-        .dato-blanco span {{ border-bottom: 1px dashed #999; min-height: 18px; }}
+        .titulo h2 {{ margin: 0; color: #00693E; font-size: 16px; }}
+        .titulo p {{ margin: 0; color: #666; font-size: 10px; }}
+        .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px 16px; margin-bottom: 8px; }}
+        .dato label {{ display: block; font-size: 9px; color: #666; text-transform: uppercase; }}
+        .dato span {{ font-size: 12px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
+        .dato-blanco span {{ border-bottom: 1px dashed #999; min-height: 14px; }}
         .marchamo-retorno-box {{
             background: #FFF4EC; border: 2px solid #E8804A; color: #A63603;
-            font-size: 18px; font-weight: bold; text-align: center;
-            padding: 10px; border-radius: 8px; margin-bottom: 18px;
+            font-size: 14px; font-weight: bold; text-align: center;
+            padding: 5px; border-radius: 6px; margin-bottom: 8px;
         }}
-        .titulo-destinos {{ background: #00693E; color: white; padding: 6px 12px; font-weight: bold;
-                             border-radius: 4px; margin-bottom: 10px; }}
-        .destino-card {{ border: 1px solid #ccc; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
-        .destino-header {{ background: #eef6ef; padding: 8px 12px; font-weight: bold; position: relative; }}
-        .destino-num {{ background: #00693E; color: white; border-radius: 50%; padding: 2px 9px; margin-right: 6px; }}
-        .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 3px 10px;
-                           border-radius: 4px; font-size: 12px; }}
-        .badge-complemento {{ background: #A63603; color: white; padding: 3px 10px;
-                               border-radius: 4px; font-size: 12px; margin-left: 8px; }}
+        .titulo-destinos {{ background: #00693E; color: white; padding: 3px 10px; font-weight: bold;
+                             border-radius: 4px; margin-bottom: 6px; font-size: 12px; }}
+        .destino-card {{ border: 1px solid #ccc; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
+        .destino-header {{ background: #eef6ef; padding: 4px 10px; font-weight: bold; position: relative; font-size: 12px; }}
+        .destino-num {{ background: #00693E; color: white; border-radius: 50%; padding: 1px 7px; margin-right: 5px; font-size: 11px; }}
+        .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 1px 8px;
+                           border-radius: 4px; font-size: 10px; }}
+        .badge-complemento {{ background: #A63603; color: white; padding: 1px 8px;
+                               border-radius: 4px; font-size: 10px; margin-left: 6px; }}
         .destino-body {{ display: flex; }}
-        .material-enviado, .material-devuelto {{ flex: 1; padding: 10px 12px; }}
+        .material-enviado, .material-devuelto {{ flex: 1; padding: 5px 8px; }}
         .material-devuelto {{ border-left: 2px dashed #ccc; }}
-        .etiqueta {{ font-size: 11px; color: #00693E; font-weight: bold; margin-bottom: 6px; }}
-        .material-grid {{ display: flex; gap: 8px; }}
-        .material-box {{ flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 8px 4px; }}
-        .material-box b {{ display: block; font-size: 18px; color: #00693E; }}
-        .material-box.vacio {{ min-height: 40px; }}
-        .material-box span {{ font-size: 10px; color: #666; }}
-        .sub-info {{ font-size: 12px; margin-top: 6px; }}
-        .incidencia {{ font-size: 12px; margin-top: 6px; color: #b34700; }}
-        .firmas {{ display: flex; justify-content: space-between; margin-top: 25px; font-size: 11px; color: #666; }}
-        .firma {{ border-top: 1px solid #666; padding-top: 3px; width: 45%; text-align: center; }}
-        .footer {{ display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 20px; }}
+        .etiqueta {{ font-size: 9px; color: #00693E; font-weight: bold; margin-bottom: 3px; }}
+        .material-grid {{ display: flex; gap: 5px; }}
+        .material-box {{ flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 3px 2px; }}
+        .material-box b {{ display: block; font-size: 13px; color: #00693E; }}
+        .material-box.vacio {{ min-height: 22px; }}
+        .material-box span {{ font-size: 8px; color: #666; }}
+        .sub-info {{ font-size: 10px; margin-top: 3px; }}
+        .incidencia {{ font-size: 10px; margin-top: 3px; color: #b34700; }}
+        .footer {{ display: flex; justify-content: space-between; font-size: 9px; color: #999; margin-top: 10px; }}
         .btn-imprimir {{ background: #00693E; color: white; border: none; padding: 10px 20px;
                           border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }}
 
         @media print {{
+            body {{ padding: 0; font-size: 11px; }}
             .btn-imprimir {{ display: none; }}
             .logo, .titulo h2, .dato span, .etiqueta, .destino-num, .material-box b {{ color: #000 !important; }}
             .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
             .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
             .badge-complemento {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
-            .marchamo-retorno-box {{ background: #fff !important; color: #000 !important; border: 2px solid #000; }}
+            .marchamo-retorno-box {{ background: #fff !important; color: #000 !important; border: 2px solid #000; padding: 3px; }}
             .material-box {{ border: 1px solid #000; }}
+            .destino-card {{ break-inside: avoid; }}
         }}
     </style>
     </head>
@@ -799,7 +813,6 @@ st.sidebar.markdown("---")
 try:
     with closing(get_conn()):
         pass
-    st.sidebar.success("🟢 Conectado a la base de datos")
 except Exception as e:
     st.sidebar.error(f"🔴 Sin conexión a la base de datos: {e}")
     st.stop()
@@ -846,10 +859,8 @@ if st.sidebar.button("🔒 Cerrar Sesión"):
 # --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
 # cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
 # jornada alguien cambie sin querer el cliente/CD y se mezclen viajes).
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔒 Cliente y CD (fijo por sesión)")
-
 if not st.session_state.get("config_bloqueada"):
+    st.sidebar.markdown("---")
     st.markdown("""
         <div class="ransa-topbar" style="justify-content:center;">
             <div style="text-align:center;">
@@ -879,18 +890,14 @@ if not st.session_state.get("config_bloqueada"):
 cliente_activo = st.session_state["cliente_activo_fijo"]
 cd_origen_fijo = st.session_state["cd_origen_fijo"]
 
-st.sidebar.success(f"Cliente: **{cliente_activo}**")
-st.sidebar.success(f"CD Origen: **{cd_origen_fijo}**")
+st.sidebar.markdown("---")
+st.sidebar.success(f"🎯 **{cliente_activo}** · CD {cd_origen_fijo}")
 if st.sidebar.button("🚪 Cambiar Cliente / CD"):
     st.session_state["config_bloqueada"] = False
     del st.session_state["cliente_activo_fijo"]
     del st.session_state["cd_origen_fijo"]
     st.rerun()
 st.sidebar.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⛽ Parámetros Económicos")
-precio_diesel_semana = st.sidebar.number_input("Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
 
 st.markdown(f"""
     <div class="ransa-topbar">
@@ -969,7 +976,16 @@ with tab1:
             with st.container(border=True):
                 st.markdown(f"#### 📍 Destino #{i + 1}")
 
-                tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
+                key_subrun_pedido = f"pedido_subrun_{run}_{i}"
+                if key_subrun_pedido not in st.session_state:
+                    st.session_state[key_subrun_pedido] = 0
+                subrun = st.session_state[key_subrun_pedido]
+
+                col_tienda, col_pedido = st.columns([1.3, 1])
+                with col_tienda:
+                    tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
+                with col_pedido:
+                    pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
                 km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
                 gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
                 st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
@@ -991,16 +1007,12 @@ with tab1:
                 lista_pedidos = st.session_state[key_lista_pedidos]
 
                 if not es_complemento:
-                    st.markdown("**📦 Cajas** — agrega los pedidos de esta tienda (o usa el total manual)")
-                    with st.form(key=f"form_pedido_{run}_{i}", clear_on_submit=True):
-                        fp1, fp2, fp3 = st.columns([2, 1, 1])
-                        with fp1:
-                            pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}")
-                        with fp2:
-                            pedido_cajas = st.number_input("Cajas de este pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}")
-                        with fp3:
-                            st.write("")
-                            agregar_pedido = st.form_submit_button("➕ Agregar")
+                    fp2, fp3 = st.columns([1, 1])
+                    with fp2:
+                        pedido_cajas = st.number_input("Cajas de este pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}_{subrun}")
+                    with fp3:
+                        st.write("")
+                        agregar_pedido = st.button("➕ Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}")
                     if agregar_pedido:
                         if not pedido_codigo.strip():
                             st.warning("Escribe un número de pedido antes de agregarlo.")
@@ -1013,6 +1025,7 @@ with tab1:
                                 "cajas": cajas_wms if cajas_wms is not None else pedido_cajas,
                                 "origen": "WMS" if cajas_wms is not None else "Manual"
                             })
+                            st.session_state[key_subrun_pedido] += 1  # limpia los campos de pedido/cajas
                             st.rerun()
 
                     if lista_pedidos:
@@ -1138,8 +1151,10 @@ with tab1:
         if st.session_state.get("ultimo_viaje_guardado"):
             st.markdown("---")
             if st.button(f"🖨️ Ver Hoja de Control del viaje {st.session_state['ultimo_viaje_guardado']}"):
-                v, d = buscar_viaje(st.session_state["ultimo_viaje_guardado"])
-                if v:
+                resultados = buscar_viajes(st.session_state["ultimo_viaje_guardado"])
+                if resultados:
+                    v = resultados[0]
+                    d = obtener_destinos_de_viaje(v["id"])
                     components.html(generar_hoja_control_html(v, d), height=900, scrolling=True)
 
         st.markdown("### 🕒 Últimos viajes registrados")
@@ -1155,29 +1170,63 @@ with tab2:
         st.header("Liquidación de Viajes")
         st.caption("Registra lo que el camión trajo de regreso de cada tienda. Las cajas no se devuelven.")
 
-        col_crit, col_val, col_btn = st.columns([1, 2, 1])
-        with col_crit:
-            criterio = st.selectbox("Buscar por", ["No. de Viaje", "Marchamo de Ida", "Placa"], key="criterio_liq")
+        with st.expander("📋 Ver viajes pendientes de liquidar (sin buscar nada)", expanded=False):
+            pendientes = listar_viajes_pendientes()
+            if not pendientes:
+                st.caption("No hay viajes pendientes de liquidar en este momento.")
+            else:
+                for p in pendientes:
+                    pcol1, pcol2, pcol3, pcol4, pcol5 = st.columns([2, 2, 2, 2, 1])
+                    pcol1.write(f"**{p['id_viaje']}**")
+                    pcol2.write(p["cliente"])
+                    pcol3.write(p["placa"])
+                    pcol4.write(f"{p['fecha_creacion']} {p['hora_creacion']}")
+                    if pcol5.button("Elegir", key=f"elegir_pend_{p['id']}"):
+                        st.session_state["viaje_liq"] = p
+                        st.session_state["destinos_liq"] = obtener_destinos_de_viaje(p["id"])
+                        st.rerun()
+
+        col_val, col_btn = st.columns([4, 1])
         with col_val:
-            valor_busqueda = st.text_input("Valor a buscar", key="valor_liq")
+            valor_busqueda = st.text_input(
+                "Buscar por No. de Viaje, Marchamo de Ida o Placa (no hace falta escribirlo completo)",
+                key="valor_liq"
+            )
         with col_btn:
             st.write("")
-            st.write("")
-            buscar = st.button("🔍 Buscar Viaje")
+            buscar = st.button("🔍 Buscar", use_container_width=True)
 
         if buscar:
             if valor_busqueda.strip():
-                viaje, destinos = buscar_viaje(valor_busqueda)
-                st.session_state["viaje_liq"] = viaje
-                st.session_state["destinos_liq"] = destinos
+                resultados = buscar_viajes(valor_busqueda)
+                st.session_state["resultados_busqueda_liq"] = resultados
+                st.session_state.pop("viaje_liq", None)
+                st.session_state.pop("destinos_liq", None)
             else:
-                st.warning("Escribe un valor para buscar.")
+                st.warning("Escribe algo para buscar.")
+
+        resultados = st.session_state.get("resultados_busqueda_liq", [])
+        if resultados and "viaje_liq" not in st.session_state:
+            if len(resultados) == 1:
+                st.session_state["viaje_liq"] = resultados[0]
+                st.session_state["destinos_liq"] = obtener_destinos_de_viaje(resultados[0]["id"])
+            else:
+                st.info(f"Encontré {len(resultados)} viajes que coinciden — elige el correcto:")
+                for r in resultados:
+                    rcol1, rcol2, rcol3, rcol4, rcol5 = st.columns([2, 2, 2, 2, 1])
+                    rcol1.write(f"**{r['id_viaje']}**")
+                    rcol2.write(r["cliente"])
+                    rcol3.write(r["placa"])
+                    rcol4.write(r["estado"])
+                    if rcol5.button("Elegir", key=f"elegir_res_{r['id']}"):
+                        st.session_state["viaje_liq"] = r
+                        st.session_state["destinos_liq"] = obtener_destinos_de_viaje(r["id"])
+                        st.rerun()
+        elif "resultados_busqueda_liq" in st.session_state and not resultados and "viaje_liq" not in st.session_state:
+            st.warning("No se encontró ningún viaje con ese dato.")
 
         viaje = st.session_state.get("viaje_liq")
         destinos = st.session_state.get("destinos_liq", [])
-
-        if "viaje_liq" in st.session_state and viaje is None:
-            st.warning("No se encontró ningún viaje con ese dato.")
 
         if viaje:
             st.markdown("---")
@@ -1230,6 +1279,7 @@ with tab2:
                                    "Ya puede procesarse el pago al transportista.")
                         del st.session_state["viaje_liq"]
                         del st.session_state["destinos_liq"]
+                        st.session_state.pop("resultados_busqueda_liq", None)
                         st.rerun()
                     else:
                         st.error(f"❌ Error al liquidar: {msg}")
@@ -1283,6 +1333,7 @@ with tab2:
                             st.success(f"Viaje {viaje['id_viaje']} corregido.")
                             del st.session_state["viaje_liq"]
                             del st.session_state["destinos_liq"]
+                            st.session_state.pop("resultados_busqueda_liq", None)
                             st.rerun()
                         else:
                             st.error(f"❌ Error al corregir: {msg}")
@@ -1300,6 +1351,7 @@ with tab2:
                                 st.success(f"Viaje {viaje['id_viaje']} anulado.")
                                 del st.session_state["viaje_liq"]
                                 del st.session_state["destinos_liq"]
+                                st.session_state.pop("resultados_busqueda_liq", None)
                                 st.rerun()
                             else:
                                 st.error(f"❌ Error al anular: {msg}")
@@ -1310,8 +1362,9 @@ with tab2:
 # MÓDULO 3: REPORTES (pendiente de construir)
 # ==========================================
 with tab3:
+    precio_diesel_semana = st.number_input("⛽ Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
     st.info("Módulo de reportes en construcción: impacto de diésel por viaje/tienda usando el "
-            "precio configurado en la barra lateral.")
+            "precio de arriba.")
 
 # ==========================================
 # MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
@@ -1336,14 +1389,26 @@ with tab4:
         st.markdown("#### ➕ Agregar o corregir UN registro")
         st.caption("Para un cambio puntual, sin tener que subir un Excel completo. Si la llave "
                    "ya existe, se actualiza en vez de duplicarse.")
-        with st.form(key=f"form_registro_{catalogo_sel}", clear_on_submit=True):
-            valores_form = {}
-            for col in config["columnas"]:
-                if col in config["numericas"]:
-                    valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+
+        NUEVO_CLIENTE_OPCION = "➕ Nuevo cliente..."
+        valores_form = {}
+        for col in config["columnas"]:
+            if col == "cliente":
+                # Selector en vez de texto libre: evita que cada persona escriba el
+                # mismo cliente con variaciones distintas (typos, mayúsculas, espacios).
+                clientes_existentes = sorted(st.session_state.catalogos["clientes"].keys())
+                cliente_elegido = st.selectbox(
+                    "Cliente", clientes_existentes + [NUEVO_CLIENTE_OPCION], key=f"campo_{catalogo_sel}_cliente_sel"
+                )
+                if cliente_elegido == NUEVO_CLIENTE_OPCION:
+                    valores_form["cliente"] = st.text_input("Nombre del cliente nuevo", key=f"campo_{catalogo_sel}_cliente_nuevo")
                 else:
-                    valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
-            guardar_registro = st.form_submit_button("💾 Guardar Registro")
+                    valores_form["cliente"] = cliente_elegido
+            elif col in config["numericas"]:
+                valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+            else:
+                valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+        guardar_registro = st.button("💾 Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
         if guardar_registro:
             faltan_llave = [c for c in config["clave"] if not str(valores_form[c]).strip()]
             if faltan_llave:
