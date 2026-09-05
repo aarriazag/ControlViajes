@@ -4,34 +4,125 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import json
+import io
 from datetime import datetime
 from contextlib import closing
 
 # Configuración de la página web con estilo e identidad corporativa
-st.set_page_config(page_title="Ransa - Gestión Logística de Viajes", layout="wide", page_icon="🚚")
+st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon="🚚")
 
-# --- ESTILOS VISUALES RANSA (VERDE Y BLANCO) ---
+# --- SISTEMA DE DISEÑO RANSA ---
+# Paleta: verde corporativo como color de marca, grises neutros para texto y
+# fondos, tarjetas con sombra sutil y tipografía consistente — pensado para que
+# la app se sienta como una herramienta interna de una empresa grande, no como
+# un prototipo. Todo centralizado aquí para que un cambio de color se haga en
+# un solo lugar.
 st.markdown("""
     <style>
+        :root {
+            --ransa-verde: #00693E;
+            --ransa-verde-oscuro: #004D2C;
+            --ransa-verde-claro: #E8F3EC;
+            --ransa-naranja: #E8804A;
+            --gris-texto: #2B2E33;
+            --gris-medio: #6B7280;
+            --gris-borde: #E2E5E9;
+            --gris-fondo: #F7F8FA;
+        }
+
+        html, body, [class*="css"] {
+            font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+            color: var(--gris-texto);
+        }
+
+        /* Encabezados */
+        h1, h2, h3 { letter-spacing: -0.01em; }
+        h1 { font-weight: 700 !important; }
+        h2, h3 { font-weight: 600 !important; }
+
+        /* Botones primarios */
         div.stButton > button:first-child {
-            background-color: #007A33 !important;
+            background-color: var(--ransa-verde) !important;
             color: white !important;
-            border-radius: 6px !important;
+            border-radius: 8px !important;
             border: none !important;
-            font-weight: bold !important;
+            font-weight: 600 !important;
+            padding: 0.5rem 1.1rem !important;
+            transition: background-color 0.15s ease-in-out;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
         }
         div.stButton > button:first-child:hover {
-            background-color: #005C25 !important;
+            background-color: var(--ransa-verde-oscuro) !important;
             color: white !important;
         }
+        div.stButton > button:disabled {
+            background-color: var(--gris-borde) !important;
+            color: var(--gris-medio) !important;
+            box-shadow: none;
+        }
+
+        /* Pestañas */
         button[data-baseweb="tab"] {
-            font-size: 16px !important;
-            font-weight: bold !important;
+            font-size: 15px !important;
+            font-weight: 600 !important;
+            color: var(--gris-medio);
         }
         button[aria-selected="true"] {
-            color: #007A33 !important;
-            border-bottom-color: #007A33 !important;
+            color: var(--ransa-verde) !important;
+            border-bottom: 3px solid var(--ransa-verde) !important;
         }
+        div[data-baseweb="tab-highlight"] { background-color: var(--ransa-verde) !important; }
+
+        /* Tarjetas (st.container(border=True)) con look "panel corporativo" */
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            border-radius: 12px !important;
+            border: 1px solid var(--gris-borde) !important;
+            box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
+            background-color: white;
+        }
+
+        /* Métricas tipo KPI card */
+        div[data-testid="stMetric"] {
+            background-color: white;
+            border: 1px solid var(--gris-borde);
+            border-radius: 10px;
+            padding: 0.9rem 1rem;
+            box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+        }
+        div[data-testid="stMetricLabel"] { color: var(--gris-medio) !important; font-weight: 600; }
+        div[data-testid="stMetricValue"] { color: var(--ransa-verde) !important; }
+
+        /* Sidebar */
+        section[data-testid="stSidebar"] {
+            background-color: var(--gris-fondo);
+            border-right: 1px solid var(--gris-borde);
+        }
+
+        /* Alertas (success/info/warning/error) con bordes redondeados consistentes */
+        div[data-testid="stAlert"] { border-radius: 8px; }
+
+        /* Barra superior de marca */
+        .ransa-topbar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 14px 22px; border-radius: 12px;
+            background: linear-gradient(90deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
+            color: white; margin-bottom: 18px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+        }
+        .ransa-topbar .titulo { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+        .ransa-topbar .subtitulo { font-size: 13px; opacity: 0.85; font-weight: 400; }
+        .ransa-topbar .contexto {
+            text-align: right; font-size: 13px; line-height: 1.5;
+            background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 8px;
+        }
+        .ransa-badge {
+            display: inline-block; background: var(--ransa-verde-claro); color: var(--ransa-verde-oscuro);
+            font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 999px;
+            letter-spacing: 0.03em; text-transform: uppercase; margin-left: 8px;
+        }
+
+        /* Reduce el padding superior por defecto de Streamlit para que la topbar quede pegada arriba */
+        .block-container { padding-top: 1.6rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -118,7 +209,153 @@ def init_db():
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS creditos TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS pg_cajas INTEGER")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS es_complemento BOOLEAN DEFAULT FALSE")
+
+        # ---- Tablas de catálogos (antes vivían "quemadas" en el código Python) ----
+        cur.execute("CREATE TABLE IF NOT EXISTS cat_transportistas (nombre TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS cat_pilotos (nombre TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS cat_auxiliares (nombre TEXT PRIMARY KEY)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_camiones (
+                placa TEXT PRIMARY KEY, tipo TEXT, transportista TEXT, piloto TEXT, auxiliar TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_clientes_tiendas (
+                cliente TEXT, tienda TEXT, km REAL, galones_base REAL,
+                PRIMARY KEY (cliente, tienda)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_cds_por_cliente (
+                cliente TEXT, cd TEXT, PRIMARY KEY (cliente, cd)
+            )
+        """)
+        cur.execute("CREATE TABLE IF NOT EXISTS cat_usuarios (usuario TEXT PRIMARY KEY, perfil TEXT)")
         conn.commit()
+
+        # Sembrar datos de ejemplo SOLO la primera vez (tablas vacías), para que la
+        # app no quede sin catálogos apenas se activa esta versión.
+        cur.execute("SELECT COUNT(*) FROM cat_clientes_tiendas")
+        if cur.fetchone()[0] == 0:
+            cur.executemany("INSERT INTO cat_transportistas (nombre) VALUES (%s)",
+                             [("Transportes Express",), ("Logística del Norte",), ("Flota Interna",)])
+            cur.executemany("INSERT INTO cat_pilotos (nombre) VALUES (%s)",
+                             [("Juan Pérez",), ("María Rodríguez",), ("Luis Martínez",), ("Andrés Custodio",)])
+            cur.executemany("INSERT INTO cat_auxiliares (nombre) VALUES (%s)",
+                             [("Carlos López",), ("Pedro Gómez",), ("José Hernández",), ("Ramiro Ruiz",)])
+            cur.executemany(
+                "INSERT INTO cat_camiones (placa, tipo, transportista, piloto, auxiliar) VALUES (%s,%s,%s,%s,%s)",
+                [("C-123ABC", "5 Ton", "Transportes Express", "Juan Pérez", "Carlos López"),
+                 ("C-456DEF", "10 Ton", "Logística del Norte", "María Rodríguez", "Pedro Gómez"),
+                 ("C-789GHI", "20 Ton", "Flota Interna", "Luis Martínez", "José Hernández")]
+            )
+            cur.executemany(
+                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km, galones_base) VALUES (%s,%s,%s,%s)",
+                [("Dollarcity", "Dollarcity Zona 10", 15.5, 3.5),
+                 ("Dollarcity", "Dollarcity Mixco", 32.0, 7.0),
+                 ("UniSuper", "UniSuper Central", 22.1, 5.0),
+                 ("UniSuper Importados", "UniSuper Importados Norte", 18.0, 4.0),
+                 ("UniSuper LTX", "UniSuper LTX Sur", 45.3, 10.0)]
+            )
+            cur.executemany(
+                "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s)",
+                [("Dollarcity", "CD Barcenas"), ("Dollarcity", "CD Central"),
+                 ("UniSuper", "CD Barcenas"),
+                 ("UniSuper Importados", "CD Barcenas"),
+                 ("UniSuper LTX", "CD Barcenas")]
+            )
+            cur.executemany(
+                "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s)",
+                [("Admin_Logistica", "Administrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
+            )
+            conn.commit()
+
+
+def cargar_catalogos_desde_db():
+    """Lee las 6 tablas de catálogos y arma el mismo diccionario que antes vivía
+    quemado en el código, para que el resto de la app no tenga que cambiar nada."""
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT usuario, perfil FROM cat_usuarios")
+        usuarios = {r["usuario"]: r["perfil"] for r in cur.fetchall()}
+
+        cur.execute("SELECT nombre FROM cat_transportistas ORDER BY nombre")
+        transportistas = [r["nombre"] for r in cur.fetchall()]
+
+        cur.execute("SELECT nombre FROM cat_pilotos ORDER BY nombre")
+        pilotos = [r["nombre"] for r in cur.fetchall()]
+
+        cur.execute("SELECT nombre FROM cat_auxiliares ORDER BY nombre")
+        auxiliares = [r["nombre"] for r in cur.fetchall()]
+
+        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar FROM cat_camiones ORDER BY placa")
+        camiones = {r["placa"]: {"tipo": r["tipo"], "transportista": r["transportista"],
+                                  "piloto": r["piloto"], "auxiliar": r["auxiliar"]} for r in cur.fetchall()}
+
+        cur.execute("SELECT cliente, tienda, km, galones_base FROM cat_clientes_tiendas ORDER BY cliente, tienda")
+        clientes = {}
+        for r in cur.fetchall():
+            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "galones_base": r["galones_base"]}
+
+        cur.execute("SELECT cliente, cd FROM cat_cds_por_cliente ORDER BY cliente, cd")
+        cds_por_cliente = {}
+        for r in cur.fetchall():
+            cds_por_cliente.setdefault(r["cliente"], []).append(r["cd"])
+
+        return {
+            "usuarios": usuarios,
+            "transportistas": transportistas,
+            "pilotos": pilotos,
+            "auxiliares": auxiliares,
+            "camiones": camiones,
+            "clientes": clientes,
+            "cds_por_cliente": cds_por_cliente
+        }
+
+
+# Config genérica usada por la pantalla de Catálogos: qué tabla y columnas
+# corresponden a cada catálogo, para no repetir código por cada uno.
+CATALOGOS_CONFIG = {
+    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre"]},
+    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"]},
+    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"]},
+    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"]},
+    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "km", "galones_base"]},
+    "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"]},
+    "Usuarios": {"tabla": "cat_usuarios", "columnas": ["usuario", "perfil"]},
+}
+
+
+def generar_plantilla_excel(columnas):
+    """Genera un Excel vacío (solo encabezados) con las columnas correctas,
+    para que el usuario lo llene y lo vuelva a subir."""
+    buffer = io.BytesIO()
+    pd.DataFrame(columns=columnas).to_excel(buffer, index=False, engine="openpyxl")
+    return buffer.getvalue()
+
+
+def leer_catalogo_actual(tabla, columnas):
+    with closing(get_conn()) as conn:
+        return pd.read_sql_query(f"SELECT {', '.join(columnas)} FROM {tabla}", conn)
+
+
+def reemplazar_catalogo(tabla, columnas, df):
+    """Reemplaza TODO el contenido de la tabla por las filas del Excel subido,
+    en una sola transacción (si algo falla, no se pierde el catálogo anterior)."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {tabla}")
+                placeholders = ", ".join(["%s"] * len(columnas))
+                filas = [tuple(row[c] for c in columnas) for _, row in df.iterrows()]
+                if filas:
+                    cur.executemany(
+                        f"INSERT INTO {tabla} ({', '.join(columnas)}) VALUES ({placeholders})", filas
+                    )
+            conn.commit()
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
 
 
 init_db()
@@ -272,6 +509,7 @@ def generar_hoja_control_html(viaje, destinos):
     de Ransa, pero al imprimir (@media print) los fondos de color se vuelven blancos
     y solo quedan bordes negros, para que salga limpia en una impresora blanco y negro."""
     marchamo_ida_general = destinos[0]["marchamo_ida"] if destinos else ""
+    es_cliente_unisuper = viaje["cliente"].startswith("UniSuper")
 
     bloques_destino = ""
     for idx, d in enumerate(destinos, start=1):
@@ -289,8 +527,15 @@ def generar_hoja_control_html(viaje, destinos):
         incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
         material_cajas = (
             f'<div class="material-box"><b>{d["cajas"]}</b><span>CAJAS</span></div>'
-            f'<div class="material-box"><b>{d["pg_cajas"] or 0}</b><span>CAJAS P&amp;G</span></div>'
+            + (f'<div class="material-box"><b>{d["pg_cajas"] or 0}</b><span>CAJAS P&amp;G</span></div>'
+               if es_cliente_unisuper else "")
             if not d["es_complemento"] else ""
+        )
+        documentos_html = (
+            f'<div class="sub-info">Remisión: <b>{d["remitos"] or "—"}</b> &nbsp;|&nbsp;'
+            f'Devolución: <b>{d["devolucion"] or "—"}</b> &nbsp;|&nbsp;'
+            f'Créditos: <b>{d["creditos"] or "—"}</b></div>'
+            if es_cliente_unisuper else ""
         )
 
         bloques_destino += f"""
@@ -309,9 +554,7 @@ def generar_hoja_control_html(viaje, destinos):
                         {material_cajas}
                     </div>
                     <div class="sub-info">No. de Pedidos: <b>{pedidos_txt}</b></div>
-                    <div class="sub-info">Remisión: <b>{d['remitos'] or '—'}</b> &nbsp;|&nbsp;
-                        Devolución: <b>{d['devolucion'] or '—'}</b> &nbsp;|&nbsp;
-                        Créditos: <b>{d['creditos'] or '—'}</b></div>
+                    {documentos_html}
                     {incidencia_html}
                 </div>
                 <div class="material-devuelto">
@@ -337,19 +580,19 @@ def generar_hoja_control_html(viaje, destinos):
         body {{ font-family: Arial, sans-serif; color: #1a1a1a; padding: 20px; }}
         .hoja {{ max-width: 800px; margin: auto; }}
         .header {{ display: flex; justify-content: space-between; align-items: flex-start;
-                   border-bottom: 4px solid #007A33; padding-bottom: 10px; margin-bottom: 15px; }}
-        .logo {{ font-size: 28px; font-weight: bold; color: #007A33; }}
+                   border-bottom: 4px solid #00693E; padding-bottom: 10px; margin-bottom: 15px; }}
+        .logo {{ font-size: 28px; font-weight: bold; color: #00693E; }}
         .titulo {{ text-align: right; }}
-        .titulo h2 {{ margin: 0; color: #007A33; }}
+        .titulo h2 {{ margin: 0; color: #00693E; }}
         .titulo p {{ margin: 0; color: #666; font-size: 12px; }}
         .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 20px; margin-bottom: 20px; }}
         .dato label {{ display: block; font-size: 11px; color: #666; text-transform: uppercase; }}
         .dato span {{ font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
-        .titulo-destinos {{ background: #007A33; color: white; padding: 6px 12px; font-weight: bold;
+        .titulo-destinos {{ background: #00693E; color: white; padding: 6px 12px; font-weight: bold;
                              border-radius: 4px; margin-bottom: 10px; }}
         .destino-card {{ border: 1px solid #ccc; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
         .destino-header {{ background: #eef6ef; padding: 8px 12px; font-weight: bold; position: relative; }}
-        .destino-num {{ background: #007A33; color: white; border-radius: 50%; padding: 2px 9px; margin-right: 6px; }}
+        .destino-num {{ background: #00693E; color: white; border-radius: 50%; padding: 2px 9px; margin-right: 6px; }}
         .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 3px 10px;
                            border-radius: 4px; font-size: 12px; }}
         .badge-complemento {{ background: #A63603; color: white; padding: 3px 10px;
@@ -357,10 +600,10 @@ def generar_hoja_control_html(viaje, destinos):
         .destino-body {{ display: flex; }}
         .material-enviado, .material-devuelto {{ flex: 1; padding: 10px 12px; }}
         .material-devuelto {{ border-left: 2px dashed #ccc; }}
-        .etiqueta {{ font-size: 11px; color: #007A33; font-weight: bold; margin-bottom: 6px; }}
+        .etiqueta {{ font-size: 11px; color: #00693E; font-weight: bold; margin-bottom: 6px; }}
         .material-grid {{ display: flex; gap: 8px; }}
         .material-box {{ flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 8px 4px; }}
-        .material-box b {{ display: block; font-size: 18px; color: #007A33; }}
+        .material-box b {{ display: block; font-size: 18px; color: #00693E; }}
         .material-box.vacio {{ min-height: 40px; }}
         .material-box span {{ font-size: 10px; color: #666; }}
         .sub-info {{ font-size: 12px; margin-top: 6px; }}
@@ -368,7 +611,7 @@ def generar_hoja_control_html(viaje, destinos):
         .firmas {{ display: flex; justify-content: space-between; margin-top: 25px; font-size: 11px; color: #666; }}
         .firma {{ border-top: 1px solid #666; padding-top: 3px; width: 45%; text-align: center; }}
         .footer {{ display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 20px; }}
-        .btn-imprimir {{ background: #007A33; color: white; border: none; padding: 10px 20px;
+        .btn-imprimir {{ background: #00693E; color: white; border: none; padding: 10px 20px;
                           border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }}
 
         @media print {{
@@ -443,49 +686,12 @@ def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
 
 
 # ==========================================
-# CATÁLOGOS MAESTROS (por ahora en memoria; candidatos a moverse a
-# tablas propias más adelante si se necesita editarlos desde la app)
+# CATÁLOGOS MAESTROS — ahora viven en la base de datos (tablas cat_*), no en el
+# código. Se cargan una vez por sesión; la pantalla "⚙️ Catálogos" permite
+# subir un Excel para reemplazarlos sin tocar una sola línea de código.
 # ==========================================
 if 'catalogos' not in st.session_state:
-    st.session_state.catalogos = {
-        "usuarios": {
-            "Admin_Logistica": "Administrador",
-            "Op_Salidas": "Operador",
-            "Liq_Transporte": "Liquidador"
-        },
-        "transportistas": ["Transportes Express", "Logística del Norte", "Flota Interna"],
-        # Valores de ejemplo — ajústalos a los reales cuando tengamos el módulo de catálogos
-        "clientes": {
-            "Dollarcity": {
-                "Dollarcity Zona 10": {"km": 15.5, "galones_base": 3.5},
-                "Dollarcity Mixco": {"km": 32.0, "galones_base": 7.0}
-            },
-            "UniSuper": {
-                "UniSuper Central": {"km": 22.1, "galones_base": 5.0}
-            },
-            "UniSuper Importados": {
-                "UniSuper Importados Norte": {"km": 18.0, "galones_base": 4.0}
-            },
-            "UniSuper LTX": {
-                "UniSuper LTX Sur": {"km": 45.3, "galones_base": 10.0}
-            }
-        },
-        # CDs posibles por cliente. Si un cliente solo tiene uno, se confirma
-        # automático; si tiene varios, la app deja elegir cuál.
-        "cds_por_cliente": {
-            "Dollarcity": ["CD Barcenas", "CD Central"],
-            "UniSuper": ["CD Barcenas"],
-            "UniSuper Importados": ["CD Barcenas"],
-            "UniSuper LTX": ["CD Barcenas"]
-        },
-        "camiones": {
-            "C-123ABC": {"tipo": "5 Ton", "transportista": "Transportes Express", "piloto": "Juan Pérez", "auxiliar": "Carlos López"},
-            "C-456DEF": {"tipo": "10 Ton", "transportista": "Logística del Norte", "piloto": "María Rodríguez", "auxiliar": "Pedro Gómez"},
-            "C-789GHI": {"tipo": "20 Ton", "transportista": "Flota Interna", "piloto": "Luis Martínez", "auxiliar": "José Hernández"}
-        },
-        "pilotos": ["Juan Pérez", "María Rodríguez", "Luis Martínez", "Andrés Custodio"],
-        "auxiliares": ["Carlos López", "Pedro Gómez", "José Hernández", "Ramiro Ruiz"]
-    }
+    st.session_state.catalogos = cargar_catalogos_desde_db()
 
 # Contador de "corridas" del formulario: se incrementa después de guardar un
 # viaje para que los widgets nazcan con keys nuevas (así el formulario queda
@@ -498,7 +704,8 @@ if 'num_destinos' not in st.session_state:
 # ==========================================
 # SIDEBAR
 # ==========================================
-st.sidebar.markdown("<h2 style='color:#007A33; font-weight:bold;'>RANSA</h2>", unsafe_allow_html=True)
+st.sidebar.markdown("<h2 style='color:#00693E; font-weight:700; letter-spacing:-0.02em;'>🚚 RANSA</h2>", unsafe_allow_html=True)
+st.sidebar.caption("Control de Ruta")
 st.sidebar.title("🔐 Configuración Inicial")
 
 st.sidebar.markdown("---")
@@ -558,11 +765,25 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("⛽ Parámetros Económicos")
 precio_diesel_semana = st.sidebar.number_input("Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
 
-st.markdown("<h1 style='color: #007A33;'>🚚 Ransa · Sistema Integral de Gestión Logística (TMS)</h1>", unsafe_allow_html=True)
-st.markdown(f"### Operando Cliente: <span style='color:#007A33;'>{cliente_activo}</span>", unsafe_allow_html=True)
+st.markdown(f"""
+    <div class="ransa-topbar">
+        <div>
+            <div class="titulo">🚚 RANSA <span style="font-weight:400;">· Control de Ruta</span>
+                <span class="ransa-badge">TMS</span>
+            </div>
+            <div class="subtitulo">Sistema Integral de Gestión Logística</div>
+        </div>
+        <div class="contexto">
+            <b>{cliente_activo}</b> · CD {cd_origen_fijo}<br>
+            {usuario_activo} ({perfil_activo})
+        </div>
+    </div>
+""", unsafe_allow_html=True)
 st.markdown("---")
 
-tab1, tab2, tab3 = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel", "⚙️ Catálogos"
+])
 
 # ==========================================
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
@@ -611,11 +832,8 @@ with tab1:
         st.caption("Primero cuenta lo físico (cajas, tarimas, roles); el marchamo de ida se pone al final, "
                     "cuando ya cerraste el conteo de esa tienda.")
 
-        if st.button("➕ Añadir Destino Adicional"):
-            st.session_state.num_destinos += 1
-            st.rerun()
-
         tiendas_cliente = st.session_state.catalogos["clientes"][cliente_activo]
+        es_cliente_unisuper = cliente_activo.startswith("UniSuper")
         destinos_viaje = []
         total_destinos = st.session_state.num_destinos
         tiendas_usadas_en_form = set()
@@ -686,26 +904,25 @@ with tab1:
                     st.caption("📦 Cajas: no aplica en un complemento.")
 
                 st.markdown("**🧱 Material físico**")
-                mc1, mc2, mc3 = st.columns(3)
-                with mc1:
-                    tarimas = st.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{run}_{i}")
-                with mc2:
-                    roles = st.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{run}_{i}")
-                with mc3:
+                tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
+                roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
+
+                if es_cliente_unisuper:
                     if not es_complemento:
                         pg_cajas = st.number_input("Cajas P&G (Procter & Gamble)", min_value=0, step=1, key=f"pg_{run}_{i}")
                     else:
                         pg_cajas = 0
                         st.caption("P&G: no aplica en un complemento.")
 
-                st.markdown("**📄 Documentos de la tienda**")
-                dc1, dc2, dc3 = st.columns(3)
-                with dc1:
+                    st.markdown("**📄 Documentos de la tienda (UniSuper)**")
                     remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                with dc2:
                     devolucion_txt = st.text_input("Devolución", key=f"dev_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                with dc3:
                     creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                else:
+                    pg_cajas = 0
+                    remitos_txt = ""
+                    devolucion_txt = ""
+                    creditos_txt = ""
 
                 observaciones_txt = st.text_area(
                     "📝 Observaciones", key=f"obs_{run}_{i}",
@@ -737,6 +954,10 @@ with tab1:
                         "es_complemento": es_complemento
                     })
             st.markdown("")
+
+        if st.button("➕ Añadir Destino Adicional"):
+            st.session_state.num_destinos += 1
+            st.rerun()
 
         st.subheader("3. Cierre del Viaje")
         st.caption("El Marchamo de Regreso se coloca al final, cuando ya se cerraron todas las tiendas.")
@@ -902,3 +1123,60 @@ with tab2:
 with tab3:
     st.info("Módulo de reportes en construcción: impacto de diésel por viaje/tienda usando el "
             "precio configurado en la barra lateral.")
+
+# ==========================================
+# MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
+# reemplazar el catálogo completo. Solo Administrador.
+# ==========================================
+with tab4:
+    if perfil_activo != "Administrador":
+        st.info("Solo el perfil Administrador puede gestionar catálogos.")
+    else:
+        st.header("Gestión de Catálogos")
+        st.caption("Descarga la plantilla, llénala en Excel y súbela para reemplazar ese catálogo. "
+                    "Los demás catálogos no se tocan.")
+
+        catalogo_sel = st.selectbox("Catálogo a gestionar", list(CATALOGOS_CONFIG.keys()))
+        config = CATALOGOS_CONFIG[catalogo_sel]
+
+        st.markdown("#### Datos actuales")
+        df_actual = leer_catalogo_actual(config["tabla"], config["columnas"])
+        st.dataframe(df_actual, use_container_width=True)
+        st.caption(f"{len(df_actual)} registro(s) actualmente.")
+
+        col_desc, col_sub = st.columns(2)
+        with col_desc:
+            st.markdown("#### 1. Descargar plantilla")
+            st.download_button(
+                "⬇️ Descargar plantilla Excel",
+                data=generar_plantilla_excel(config["columnas"]),
+                file_name=f"plantilla_{config['tabla']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        with col_sub:
+            st.markdown("#### 2. Subir y reemplazar")
+            archivo = st.file_uploader("Excel con los datos nuevos", type=["xlsx"], key=f"upload_{catalogo_sel}")
+
+        if archivo is not None:
+            try:
+                df_nuevo = pd.read_excel(archivo, engine="openpyxl")
+                faltantes = [c for c in config["columnas"] if c not in df_nuevo.columns]
+                if faltantes:
+                    st.error(f"❌ Al archivo le faltan estas columnas: {', '.join(faltantes)}")
+                else:
+                    st.markdown("#### Vista previa de lo que se va a cargar")
+                    st.dataframe(df_nuevo[config["columnas"]], use_container_width=True)
+                    st.warning(f"⚠️ Esto **reemplaza por completo** el catálogo '{catalogo_sel}' "
+                               f"({len(df_actual)} registro(s) actuales → {len(df_nuevo)} nuevo(s)).")
+                    confirmar = st.checkbox("Confirmo que quiero reemplazar este catálogo", key=f"conf_{catalogo_sel}")
+                    if st.button("🔄 Reemplazar Catálogo", disabled=not confirmar):
+                        ok, msg = reemplazar_catalogo(config["tabla"], config["columnas"], df_nuevo)
+                        if ok:
+                            st.success(f"✅ Catálogo '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s).")
+                            st.session_state.catalogos = cargar_catalogos_desde_db()
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Error al reemplazar: {msg}")
+            except Exception as e:
+                st.error(f"❌ No se pudo leer el archivo: {e}")
