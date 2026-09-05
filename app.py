@@ -1,7 +1,9 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import json
 from datetime import datetime
 from contextlib import closing
 
@@ -104,6 +106,14 @@ def init_db():
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS usuario_liquido TEXT")
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS fecha_liquidacion TEXT")
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS hora_liquidacion TEXT")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS usuario_anulo TEXT")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS fecha_anulacion TEXT")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS motivo_anulacion TEXT")
+        # Columnas para la Hoja de Control de Viaje (impresión)
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS cliente_principal TEXT")
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS cd_origen TEXT")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS remitos TEXT")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS incidencias TEXT")
         conn.commit()
 
 
@@ -143,7 +153,7 @@ def siguiente_correlativo(cliente, cur):
     return f"{prefijo}-{numero:04d}"
 
 
-def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje):
+def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None):
     """Guarda el viaje y sus destinos en una sola transacción.
     Devuelve (True, id_viaje) si funcionó, o (False, mensaje_error) si no."""
     with closing(get_conn()) as conn:
@@ -162,26 +172,37 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
 
                 cur.execute(
                     "INSERT INTO viajes (id_viaje, cliente, placa, transportista, piloto, auxiliar, "
-                    "usuario_creador, fecha_creacion, hora_creacion) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                    "RETURNING id",
-                    (id_viaje_str, cliente, placa, transportista, piloto, auxiliar, usuario, fecha_hoy, hora_hoy)
+                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (id_viaje_str, cliente, placa, transportista, piloto, auxiliar, usuario, fecha_hoy, hora_hoy,
+                     cd_origen)
                 )
                 viaje_id = cur.fetchone()[0]
 
                 for i, dest in enumerate(destinos_viaje):
                     cur.execute(
                         "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
-                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
                          dest["marchamo_ida"], dest["marchamo_regreso"] or None,
-                         dest["roles"], dest["tarimas"], dest["cajas"])
+                         dest["roles"], dest["tarimas"], dest["cajas"],
+                         dest.get("remitos", ""), dest.get("incidencias", ""))
                     )
             conn.commit()
             return True, id_viaje_str
         except psycopg2.IntegrityError as e:
             conn.rollback()
             return False, f"Error de integridad (probablemente un marchamo duplicado): {e}"
+
+
+def validar_pedido_wms(pedido_codigo):
+    """PENDIENTE: aquí se conectará la consulta real al WMS para traer el número de
+    cajas despachadas de un pedido. Por ahora no hay conexión configurada, así que
+    devuelve None y la app usa el conteo manual que digite el usuario.
+    Cuando tengamos el acceso al WMS, esta función deberá devolver un entero
+    (cajas reales) o lanzar una excepción si el pedido no existe."""
+    return None
 
 
 def obtener_viajes_recientes(limite=10):
@@ -192,7 +213,7 @@ def obtener_viajes_recientes(limite=10):
         )
 
 
-def buscar_viaje_para_liquidar(valor_busqueda):
+def buscar_viaje(valor_busqueda):
     """Busca un viaje por No. de Viaje, Marchamo de Ida (de cualquiera de sus destinos), o Placa.
     Devuelve (viaje, destinos) o (None, []) si no encuentra nada."""
     valor = valor_busqueda.strip()
@@ -209,6 +230,171 @@ def buscar_viaje_para_liquidar(valor_busqueda):
         cur.execute("SELECT * FROM destinos WHERE viaje_id = %s ORDER BY orden", (viaje["id"],))
         destinos = cur.fetchall()
         return viaje, destinos
+
+
+def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
+    """Marca el viaje como Anulado (no lo borra, queda como registro para auditoría).
+    Por defecto libera los marchamos de sus destinos para que puedan reutilizarse en
+    otro viaje, ya que un viaje anulado normalmente significa un error de digitación,
+    no un marchamo físicamente gastado. Esto es ajustable con liberar_marchamos=False."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                fecha_hoy = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    "UPDATE viajes SET estado='Anulado', usuario_anulo=%s, "
+                    "fecha_anulacion=%s, motivo_anulacion=%s WHERE id=%s",
+                    (usuario, fecha_hoy, motivo, viaje_id)
+                )
+                if liberar_marchamos:
+                    # Libera los marchamos poniéndolos como usados-pero-anulados con un
+                    # sufijo único, para que marchamo_ya_usado() ya no los bloquee.
+                    cur.execute(
+                        "UPDATE destinos SET marchamo_ida = marchamo_ida || '-ANULADO-' || id::text "
+                        "WHERE viaje_id = %s", (viaje_id,)
+                    )
+            conn.commit()
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def generar_hoja_control_html(viaje, destinos):
+    """Arma la Hoja de Control de Viaje como HTML: en pantalla se ve con los colores
+    de Ransa, pero al imprimir (@media print) los fondos de color se vuelven blancos
+    y solo quedan bordes negros, para que salga limpia en una impresora blanco y negro."""
+    marchamo_ida_general = destinos[0]["marchamo_ida"] if destinos else ""
+
+    bloques_destino = ""
+    for idx, d in enumerate(destinos, start=1):
+        try:
+            pedidos_lista = json.loads(d["pedidos"]) if d["pedidos"] else []
+        except (json.JSONDecodeError, TypeError):
+            pedidos_lista = []
+        pedidos_txt = ", ".join(p["pedido"] for p in pedidos_lista) if pedidos_lista else "—"
+        badge_regreso = (
+            f'<span class="badge-regreso">Marchamo Retorno: {d["marchamo_regreso"]}</span>'
+            if d["marchamo_regreso"] else ""
+        )
+        incidencia_txt = d["incidencias"] or ""
+        incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
+
+        bloques_destino += f"""
+        <div class="destino-card">
+            <div class="destino-header">
+                <span class="destino-num">{idx}</span> {d['tienda']}
+                {badge_regreso}
+            </div>
+            <div class="destino-body">
+                <div class="material-enviado">
+                    <div class="etiqueta">MATERIAL ENVIADO</div>
+                    <div class="material-grid">
+                        <div class="material-box"><b>{d['roles']}</b><span>ROLES</span></div>
+                        <div class="material-box"><b>{d['tarimas']}</b><span>TARIMAS</span></div>
+                        <div class="material-box"><b>{d['cajas']}</b><span>CAJAS</span></div>
+                    </div>
+                    <div class="sub-info">No. de Pedidos: <b>{pedidos_txt}</b></div>
+                    <div class="sub-info">Remitos: <b>{d['remitos'] or '—'}</b></div>
+                    {incidencia_html}
+                </div>
+                <div class="material-devuelto">
+                    <div class="etiqueta">DEVUELTO POR LA TIENDA (LLENAR A MANO)</div>
+                    <div class="material-grid">
+                        <div class="material-box vacio"><span>ROLES</span></div>
+                        <div class="material-box vacio"><span>TARIMAS</span></div>
+                        <div class="material-box vacio"><span>PACAS CARTÓN</span></div>
+                    </div>
+                    <div class="firmas">
+                        <div class="firma">Recibe (tienda)</div>
+                        <div class="firma">Piloto / Auxiliar</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+
+    return f"""
+    <html>
+    <head>
+    <style>
+        body {{ font-family: Arial, sans-serif; color: #1a1a1a; padding: 20px; }}
+        .hoja {{ max-width: 800px; margin: auto; }}
+        .header {{ display: flex; justify-content: space-between; align-items: flex-start;
+                   border-bottom: 4px solid #007A33; padding-bottom: 10px; margin-bottom: 15px; }}
+        .logo {{ font-size: 28px; font-weight: bold; color: #007A33; }}
+        .titulo {{ text-align: right; }}
+        .titulo h2 {{ margin: 0; color: #007A33; }}
+        .titulo p {{ margin: 0; color: #666; font-size: 12px; }}
+        .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 20px; margin-bottom: 20px; }}
+        .dato label {{ display: block; font-size: 11px; color: #666; text-transform: uppercase; }}
+        .dato span {{ font-size: 15px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
+        .titulo-destinos {{ background: #007A33; color: white; padding: 6px 12px; font-weight: bold;
+                             border-radius: 4px; margin-bottom: 10px; }}
+        .destino-card {{ border: 1px solid #ccc; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
+        .destino-header {{ background: #eef6ef; padding: 8px 12px; font-weight: bold; position: relative; }}
+        .destino-num {{ background: #007A33; color: white; border-radius: 50%; padding: 2px 9px; margin-right: 6px; }}
+        .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 3px 10px;
+                           border-radius: 4px; font-size: 12px; }}
+        .destino-body {{ display: flex; }}
+        .material-enviado, .material-devuelto {{ flex: 1; padding: 10px 12px; }}
+        .material-devuelto {{ border-left: 2px dashed #ccc; }}
+        .etiqueta {{ font-size: 11px; color: #007A33; font-weight: bold; margin-bottom: 6px; }}
+        .material-grid {{ display: flex; gap: 8px; }}
+        .material-box {{ flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 8px 4px; }}
+        .material-box b {{ display: block; font-size: 18px; color: #007A33; }}
+        .material-box.vacio {{ min-height: 40px; }}
+        .material-box span {{ font-size: 10px; color: #666; }}
+        .sub-info {{ font-size: 12px; margin-top: 6px; }}
+        .incidencia {{ font-size: 12px; margin-top: 6px; color: #b34700; }}
+        .firmas {{ display: flex; justify-content: space-between; margin-top: 25px; font-size: 11px; color: #666; }}
+        .firma {{ border-top: 1px solid #666; padding-top: 3px; width: 45%; text-align: center; }}
+        .footer {{ display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 20px; }}
+        .btn-imprimir {{ background: #007A33; color: white; border: none; padding: 10px 20px;
+                          border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }}
+
+        @media print {{
+            .btn-imprimir {{ display: none; }}
+            .logo, .titulo h2, .dato span, .etiqueta, .destino-num, .material-box b {{ color: #000 !important; }}
+            .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
+            .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
+            .material-box {{ border: 1px solid #000; }}
+        }}
+    </style>
+    </head>
+    <body>
+    <div class="hoja">
+        <button class="btn-imprimir" onclick="window.print()">🖨️ Imprimir</button>
+        <div class="header">
+            <div class="logo">🚚 RANSA</div>
+            <div class="titulo">
+                <h2>HOJA DE SALIDA</h2>
+                <p>Control de Ruta · Documento de Despacho</p>
+            </div>
+        </div>
+        <div class="datos-grid">
+            <div class="dato"><label>No. de Viaje</label><span>{viaje['id_viaje']}</span></div>
+            <div class="dato"><label>Cliente</label><span>{viaje['cliente']}</span></div>
+            <div class="dato"><label>CD Origen</label><span>{viaje['cd_origen'] or '—'}</span></div>
+            <div class="dato"><label>Transportista</label><span>{viaje['transportista']}</span></div>
+            <div class="dato"><label>Placa</label><span>{viaje['placa']}</span></div>
+            <div class="dato"><label>Fecha</label><span>{viaje['fecha_creacion']}</span></div>
+            <div class="dato"><label>Hora</label><span>{viaje['hora_creacion']}</span></div>
+            <div class="dato"><label>Piloto</label><span>{viaje['piloto']}</span></div>
+            <div class="dato"><label>Auxiliar</label><span>{viaje['auxiliar']}</span></div>
+            <div class="dato"><label>Marchamo de Ida</label><span>{marchamo_ida_general}</span></div>
+            <div class="dato"><label>Generado por</label><span>{viaje['usuario_creador']}</span></div>
+        </div>
+        <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
+        {bloques_destino}
+        <div class="footer">
+            <span>Hoja generada por el sistema Control de Ruta · Ransa</span>
+            <span>Sellar y entregar al finalizar el viaje para su liquidación.</span>
+        </div>
+    </div>
+    </body>
+    </html>
+    """
 
 
 def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
@@ -249,16 +435,29 @@ if 'catalogos' not in st.session_state:
             "Liq_Transporte": "Liquidador"
         },
         "transportistas": ["Transportes Express", "Logística del Norte", "Flota Interna"],
+        # Valores de ejemplo — ajústalos a los reales cuando tengamos el módulo de catálogos
         "clientes": {
-            "Supermercados Alfa": {
-                "Alfa Central": {"km": 15.5, "galones_base": 3.5},
-                "Alfa Norte": {"km": 32.0, "galones_base": 7.0},
-                "Alfa Sur": {"km": 8.4, "galones_base": 2.0}
+            "Dollarcity": {
+                "Dollarcity Zona 10": {"km": 15.5, "galones_base": 3.5},
+                "Dollarcity Mixco": {"km": 32.0, "galones_base": 7.0}
             },
-            "Hiper Tiendas Beta": {
-                "Beta Este": {"km": 22.1, "galones_base": 5.0},
-                "Beta Oeste": {"km": 45.3, "galones_base": 10.0}
+            "UniSuper": {
+                "UniSuper Central": {"km": 22.1, "galones_base": 5.0}
+            },
+            "UniSuper Importados": {
+                "UniSuper Importados Norte": {"km": 18.0, "galones_base": 4.0}
+            },
+            "UniSuper LTX": {
+                "UniSuper LTX Sur": {"km": 45.3, "galones_base": 10.0}
             }
+        },
+        # CDs posibles por cliente. Si un cliente solo tiene uno, se confirma
+        # automático; si tiene varios, la app deja elegir cuál.
+        "cds_por_cliente": {
+            "Dollarcity": ["CD Barcenas", "CD Central"],
+            "UniSuper": ["CD Barcenas"],
+            "UniSuper Importados": ["CD Barcenas"],
+            "UniSuper LTX": ["CD Barcenas"]
         },
         "camiones": {
             "C-123ABC": {"tipo": "5 Ton", "transportista": "Transportes Express", "piloto": "Juan Pérez", "auxiliar": "Carlos López"},
@@ -283,8 +482,6 @@ if 'num_destinos' not in st.session_state:
 st.sidebar.markdown("<h2 style='color:#007A33; font-weight:bold;'>RANSA</h2>", unsafe_allow_html=True)
 st.sidebar.title("🔐 Configuración Inicial")
 
-cliente_activo = st.sidebar.selectbox("🎯 CLIENTE ACTIVO", list(st.session_state.catalogos["clientes"].keys()))
-
 st.sidebar.markdown("---")
 try:
     with closing(get_conn()):
@@ -293,6 +490,39 @@ try:
 except Exception as e:
     st.sidebar.error(f"🔴 Sin conexión a la base de datos: {e}")
     st.stop()
+
+# --- Bloqueo de sesión: Cliente y CD Origen se eligen UNA SOLA VEZ al entrar.
+# Para cambiarlos hay que cerrar esta pestaña y volver a abrir la app (eso
+# reinicia la sesión). Esto evita que a mitad de una jornada alguien cambie sin
+# querer el cliente/CD y se mezclen viajes de otro contexto.
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔒 Cliente y CD (fijo por sesión)")
+
+if not st.session_state.get("config_bloqueada"):
+    cliente_activo_sel = st.sidebar.selectbox("🎯 Cliente", list(st.session_state.catalogos["clientes"].keys()))
+
+    cds_disponibles = st.session_state.catalogos["cds_por_cliente"].get(cliente_activo_sel, [])
+    if len(cds_disponibles) <= 1:
+        cd_origen_sel = cds_disponibles[0] if cds_disponibles else ""
+        st.sidebar.info(f"CD Origen (único, automático): **{cd_origen_sel}**")
+    else:
+        cd_origen_sel = st.sidebar.selectbox("CD Origen", cds_disponibles)
+
+    if st.sidebar.button("🔒 Confirmar y Comenzar a Trabajar"):
+        st.session_state["cliente_activo_fijo"] = cliente_activo_sel
+        st.session_state["cd_origen_fijo"] = cd_origen_sel
+        st.session_state["config_bloqueada"] = True
+        st.rerun()
+    st.info("👈 Selecciona el Cliente (y el CD Origen si el cliente tiene más de uno) en la "
+            "barra lateral, y confirma para comenzar a trabajar.")
+    st.stop()
+
+cliente_activo = st.session_state["cliente_activo_fijo"]
+cd_origen_fijo = st.session_state["cd_origen_fijo"]
+
+st.sidebar.success(f"Cliente: **{cliente_activo}**")
+st.sidebar.success(f"CD Origen: **{cd_origen_fijo}**")
+st.sidebar.caption("Para cambiar cualquiera de estos, cierra esta pestaña y vuelve a entrar.")
 
 st.sidebar.markdown("---")
 usuario_activo = st.sidebar.selectbox("Simular Usuario Activo", list(st.session_state.catalogos["usuarios"].keys()))
@@ -316,6 +546,7 @@ tab1, tab2, tab3 = st.tabs(["📋 Despacho (Salidas)", "💰 Recepción (Liquida
 with tab1:
     if perfil_activo in ["Administrador", "Operador"]:
         st.header("Generación de Hoja de Control de Viaje")
+        st.caption(f"👤 Digitando como: **{usuario_activo}** ({perfil_activo}) · CD Origen: **{cd_origen_fijo}**")
 
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
 
@@ -324,6 +555,8 @@ with tab1:
         c2.text_input("Fecha de Creación", value=datetime.now().strftime("%Y-%m-%d"), disabled=True, key=f"f_crea_{run}")
         c3.text_input("Hora de Creación", value=datetime.now().strftime("%H:%M:%S"), disabled=True, key=f"h_crea_{run}")
         st.caption("El No. de Viaje definitivo se asigna al guardar, para evitar que dos digitadores reciban el mismo número.")
+
+        cd_origen_final = cd_origen_fijo
 
         st.subheader("1. Selección de Transporte")
         col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
@@ -350,7 +583,9 @@ with tab1:
             auxiliares = st.session_state.catalogos["auxiliares"]
             auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
 
-        st.subheader("2. Destinos y Control de Marchamos")
+        st.subheader("2. Destinos y Carga por Tienda")
+        st.caption("Primero cuenta lo físico (cajas, tarimas, roles); el marchamo de ida se pone al final, "
+                    "cuando ya cerraste el conteo de esa tienda.")
 
         if st.button("➕ Añadir Destino Adicional"):
             st.session_state.num_destinos += 1
@@ -362,30 +597,69 @@ with tab1:
         tiendas_usadas_en_form = set()
 
         for i in range(total_destinos):
-            st.markdown(f"📍 **Destino #{i + 1}**")
-            d1, d2, d3, d4 = st.columns(4)
-            d5, d6, d7 = st.columns(3)
+            st.markdown(f"### 📍 Destino #{i + 1}")
 
-            with d1:
-                tienda = d1.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
-                km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
-                gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
-                st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
-            with d2:
-                m_ida_tienda = d2.text_input("🔒 Marchamo IDA (Único)", key=f"mida_{run}_{i}")
-            with d3:
-                es_ultimo = (i == total_destinos - 1)
-                m_reg_tienda = d3.text_input("🔄 Marchamo REGRESO", key=f"mreg_{run}_{i}", disabled=not es_ultimo,
-                                              placeholder="Solo última tienda" if not es_ultimo else "")
-            with d4:
-                peds = d4.text_input("No. Pedidos (Separados por coma)", key=f"p_{run}_{i}", placeholder="Ej: P01, P02")
+            tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
+            km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
+            gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
+            st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
 
-            with d5:
-                roles = d5.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{run}_{i}")
-            with d6:
-                tarimas = d6.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{run}_{i}")
-            with d7:
-                cajas = d7.number_input("Cajas Manual / WMS", min_value=0, step=1, key=f"c_{run}_{i}")
+            # --- Lista de pedidos (memoria temporal) ---
+            # Cada pedido agregado aquí suma sus cajas al total. Cuando exista la
+            # conexión con el WMS, validar_pedido_wms() traerá el conteo real en vez
+            # del que digita el usuario a mano.
+            key_lista_pedidos = f"pedidos_lista_{run}_{i}"
+            if key_lista_pedidos not in st.session_state:
+                st.session_state[key_lista_pedidos] = []
+            lista_pedidos = st.session_state[key_lista_pedidos]
+
+            st.markdown("**📦 Cajas** — agrega los pedidos de esta tienda (o usa el total manual más abajo)")
+            with st.form(key=f"form_pedido_{run}_{i}", clear_on_submit=True):
+                fp1, fp2, fp3 = st.columns([2, 1, 1])
+                with fp1:
+                    pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}")
+                with fp2:
+                    pedido_cajas = st.number_input("Cajas de este pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}")
+                with fp3:
+                    st.write("")
+                    agregar_pedido = st.form_submit_button("➕ Agregar")
+            if agregar_pedido:
+                if pedido_codigo.strip():
+                    cajas_wms = validar_pedido_wms(pedido_codigo.strip())
+                    lista_pedidos.append({
+                        "pedido": pedido_codigo.strip(),
+                        "cajas": cajas_wms if cajas_wms is not None else pedido_cajas,
+                        "origen": "WMS" if cajas_wms is not None else "Manual"
+                    })
+                    st.rerun()
+                else:
+                    st.warning("Escribe un número de pedido antes de agregarlo.")
+
+            if lista_pedidos:
+                for idx, p in enumerate(lista_pedidos):
+                    pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
+                    pc1.write(f"📄 {p['pedido']}")
+                    pc2.write(f"{p['cajas']} cajas")
+                    pc3.write(f"_{p['origen']}_")
+                    if pc4.button("🗑️", key=f"del_pedido_{run}_{i}_{idx}"):
+                        lista_pedidos.pop(idx)
+                        st.rerun()
+                cajas_total = sum(p["cajas"] for p in lista_pedidos)
+                st.number_input("Total Cajas (suma de pedidos)", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
+            else:
+                cajas_total = st.number_input("Cajas (total manual, sin pedidos detallados)", min_value=0, step=1, key=f"c_{run}_{i}")
+
+            st.markdown("**🧱 Tarimas y Roles**")
+            tarimas = st.number_input("Tarimas Madera", min_value=0, step=1, key=f"tar_{run}_{i}")
+            roles = st.number_input("Roles Metálicos", min_value=0, step=1, key=f"r_{run}_{i}")
+
+            with st.expander("📎 Remitos e Incidencias (opcional)"):
+                remitos_txt = st.text_input("Remitos", key=f"remitos_{run}_{i}", placeholder="Ej: R-001, R-002")
+                incidencias_txt = st.text_area("Incidencias en esta tienda", key=f"inc_{run}_{i}",
+                                                placeholder="Ej: tienda cerrada, faltante detectado, etc.")
+
+            st.markdown("**🔒 Marchamo de Ida**")
+            m_ida_tienda = st.text_input("Marchamo IDA (Único, se cierra al terminar esta tienda)", key=f"mida_{run}_{i}")
 
             if tienda:
                 if tienda in tiendas_usadas_en_form:
@@ -395,14 +669,22 @@ with tab1:
                     "tienda": tienda,
                     "km": km_t,
                     "galones_base": gal_t,
-                    "pedidos": peds,
+                    "pedidos": json.dumps(lista_pedidos),
                     "marchamo_ida": m_ida_tienda.strip(),
-                    "marchamo_regreso": m_reg_tienda.strip() if es_ultimo else "",
+                    "marchamo_regreso": "",  # se completa más abajo, en el cierre del viaje
                     "roles": roles,
                     "tarimas": tarimas,
-                    "cajas": cajas
+                    "cajas": cajas_total,
+                    "remitos": remitos_txt.strip(),
+                    "incidencias": incidencias_txt.strip()
                 })
             st.markdown("---")
+
+        st.subheader("3. Cierre del Viaje")
+        st.caption("El Marchamo de Regreso se coloca al final, cuando ya se cerraron todas las tiendas.")
+        marchamo_regreso_viaje = st.text_input("🔄 Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}")
+        if destinos_viaje:
+            destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
 
         if st.button("💾 Guardar Viaje y Generar Hoja de Control"):
             marchamos_vacios = any(not d["marchamo_ida"] for d in destinos_viaje)
@@ -416,8 +698,8 @@ with tab1:
                 st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
             elif marchamos_repetidos_en_form:
                 st.error("❌ Error: Hay marchamos de ida repetidos dentro de este mismo viaje.")
-            elif total_destinos > 0 and not destinos_viaje[-1]["marchamo_regreso"]:
-                st.error("❌ Error: El Marchamo de Regreso es obligatorio en la última tienda para cerrar el circuito.")
+            elif not marchamo_regreso_viaje.strip():
+                st.error("❌ Error: El Marchamo de Regreso es obligatorio para cerrar el circuito.")
             else:
                 ok, resultado = guardar_viaje(
                     cliente=cliente_activo,
@@ -426,15 +708,24 @@ with tab1:
                     piloto=piloto_final,
                     auxiliar=auxiliar_final,
                     usuario=usuario_activo,
-                    destinos_viaje=destinos_viaje
+                    destinos_viaje=destinos_viaje,
+                    cd_origen=cd_origen_final
                 )
                 if ok:
                     st.success(f"✅ Viaje {resultado} guardado correctamente.")
                     st.session_state.num_destinos = 1
                     st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
+                    st.session_state["ultimo_viaje_guardado"] = resultado
                     st.rerun()
                 else:
                     st.error(f"❌ Error: {resultado}")
+
+        if st.session_state.get("ultimo_viaje_guardado"):
+            st.markdown("---")
+            if st.button(f"🖨️ Ver Hoja de Control del viaje {st.session_state['ultimo_viaje_guardado']}"):
+                v, d = buscar_viaje(st.session_state["ultimo_viaje_guardado"])
+                if v:
+                    components.html(generar_hoja_control_html(v, d), height=900, scrolling=True)
 
         st.markdown("### 🕒 Últimos viajes registrados")
         st.dataframe(obtener_viajes_recientes(), use_container_width=True)
@@ -461,7 +752,7 @@ with tab2:
 
         if buscar:
             if valor_busqueda.strip():
-                viaje, destinos = buscar_viaje_para_liquidar(valor_busqueda)
+                viaje, destinos = buscar_viaje(valor_busqueda)
                 st.session_state["viaje_liq"] = viaje
                 st.session_state["destinos_liq"] = destinos
             else:
@@ -482,9 +773,15 @@ with tab2:
             i3.metric("Piloto", viaje["piloto"])
             i4.metric("Estado", viaje["estado"])
 
+            if st.button("🖨️ Ver / Reimprimir Hoja de Control", key=f"hoja_{viaje['id']}"):
+                components.html(generar_hoja_control_html(viaje, destinos), height=900, scrolling=True)
+
             if viaje["estado"] == "Liquidado":
                 st.success(f"✅ Este viaje ya fue liquidado el {viaje['fecha_liquidacion']} "
                             f"{viaje['hora_liquidacion']} por {viaje['usuario_liquido']}.")
+            elif viaje["estado"] == "Anulado":
+                st.error(f"🚫 Este viaje fue anulado el {viaje['fecha_anulacion']} por "
+                         f"{viaje['usuario_anulo']}. Motivo: {viaje['motivo_anulacion']}")
             else:
                 st.markdown("#### Devoluciones por tienda")
                 destinos_actualizados = []
@@ -521,6 +818,23 @@ with tab2:
                         st.rerun()
                     else:
                         st.error(f"❌ Error al liquidar: {msg}")
+
+                with st.expander("🚫 Anular este viaje"):
+                    st.caption("Usa esto solo si el viaje se digitó por error. Queda registrado quién y cuándo "
+                               "lo anuló; por ahora los marchamos usados quedan libres para digitarse en otro viaje.")
+                    motivo_anulacion = st.text_input("Motivo de la anulación", key=f"motivo_anular_{viaje['id']}")
+                    if st.button("🚫 Confirmar Anulación", key=f"btn_anular_{viaje['id']}"):
+                        if not motivo_anulacion.strip():
+                            st.warning("Escribe el motivo antes de anular.")
+                        else:
+                            ok, msg = anular_viaje(viaje["id"], usuario_activo, motivo_anulacion.strip())
+                            if ok:
+                                st.success(f"Viaje {viaje['id_viaje']} anulado.")
+                                del st.session_state["viaje_liq"]
+                                del st.session_state["destinos_liq"]
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Error al anular: {msg}")
     else:
         st.info("Tu perfil no tiene permisos para liquidar viajes.")
 
