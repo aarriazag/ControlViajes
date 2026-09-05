@@ -605,14 +605,13 @@ def generar_hoja_control_html(viaje, destinos):
         incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
         material_cajas = (
             f'<div class="material-box"><b>{d["cajas"]}</b><span>CAJAS</span></div>'
-            + (f'<div class="material-box"><b>{d["pg_cajas"] or 0}</b><span>CAJAS P&amp;G</span></div>'
-               if es_cliente_unisuper else "")
             if not d["es_complemento"] else ""
         )
         documentos_html = (
             f'<div class="sub-info">Remisión: <b>{d["remitos"] or "—"}</b> &nbsp;|&nbsp;'
             f'Devolución: <b>{d["devolucion"] or "—"}</b> &nbsp;|&nbsp;'
-            f'Créditos: <b>{d["creditos"] or "—"}</b></div>'
+            f'Créditos: <b>{d["creditos"] or "—"}</b> &nbsp;|&nbsp;'
+            f'Cartas Solicitud Producto P&amp;G: <b>{d["pg_cajas"] or 0}</b></div>'
             if es_cliente_unisuper else ""
         )
 
@@ -1034,20 +1033,27 @@ with tab1:
                     st.caption("📦 Cajas: no aplica en un complemento.")
 
                 st.markdown("**🧱 Material físico**")
-                tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
-                roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
+                mf1, mf2 = st.columns(2)
+                with mf1:
+                    tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
+                with mf2:
+                    roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
 
                 if es_cliente_unisuper:
-                    if not es_complemento:
-                        pg_cajas = st.number_input("Cajas P&G (Procter & Gamble)", min_value=0, step=1, key=f"pg_{run}_{i}")
-                    else:
-                        pg_cajas = 0
-                        st.caption("P&G: no aplica en un complemento.")
-
                     st.markdown("**📄 Documentos de la tienda (UniSuper)**")
-                    remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                    devolucion_txt = st.text_input("Devolución", key=f"dev_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                    creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                    dc1, dc2, dc3, dc4 = st.columns(4)
+                    with dc1:
+                        remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                    with dc2:
+                        devolucion_txt = st.text_input("Devolución", key=f"dev_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                    with dc3:
+                        creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                    with dc4:
+                        if not es_complemento:
+                            pg_cajas = st.number_input("Cartas Solicitud Producto P&G", min_value=0, step=1, key=f"pg_{run}_{i}")
+                        else:
+                            pg_cajas = 0
+                            st.caption("No aplica en complemento.")
                 else:
                     pg_cajas = 0
                     remitos_txt = ""
