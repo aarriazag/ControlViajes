@@ -6,10 +6,20 @@ import psycopg2.extras
 import json
 import io
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from contextlib import closing
 
 # Configuración de la página web con estilo e identidad corporativa
 st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon="🚚")
+
+# El servidor (Render) corre en otro huso horario — todos los usuarios de esta
+# app están en Guatemala, así que fijamos la hora ahí en vez de usar la hora
+# del servidor o intentar leer la del navegador de cada quien.
+ZONA_HORARIA = ZoneInfo("America/Guatemala")
+
+
+def ahora():
+    return datetime.now(ZONA_HORARIA)
 
 # --- SISTEMA DE DISEÑO RANSA ---
 # Paleta: verde corporativo como color de marca, grises neutros para texto y
@@ -20,14 +30,15 @@ st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_ico
 st.markdown("""
     <style>
         :root {
-            --ransa-verde: #00693E;
-            --ransa-verde-oscuro: #004D2C;
-            --ransa-verde-claro: #E8F3EC;
-            --ransa-naranja: #E8804A;
-            --gris-texto: #2B2E33;
-            --gris-medio: #6B7280;
-            --gris-borde: #E2E5E9;
-            --gris-fondo: #F7F8FA;
+            --ransa-verde: #0B4A32;
+            --ransa-verde-oscuro: #072F20;
+            --ransa-verde-claro: #E6EEEA;
+            --ransa-naranja: #B5622E;
+            --gris-texto: #1F2328;
+            --gris-medio: #5B6169;
+            --gris-borde: #DCDFE3;
+            --gris-fondo: #F5F6F7;
+            --gris-oscuro: #2E3338;
         }
 
         html, body, [class*="css"] {
@@ -558,8 +569,8 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                         return False, f"El marchamo '{dest['marchamo_ida']}' ya fue usado en otro viaje."
 
                 id_viaje_str = siguiente_correlativo(cliente, cur)
-                fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-                hora_hoy = datetime.now().strftime("%H:%M:%S")
+                fecha_hoy = ahora().strftime("%Y-%m-%d")
+                hora_hoy = ahora().strftime("%H:%M:%S")
 
                 cur.execute(
                     "INSERT INTO viajes (id_viaje, cliente, placa, transportista, piloto, auxiliar, "
@@ -647,7 +658,7 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
-                fecha_hoy = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                fecha_hoy = ahora().strftime("%Y-%m-%d %H:%M:%S")
                 cur.execute(
                     "UPDATE viajes SET estado='Anulado', usuario_anulo=%s, "
                     "fecha_anulacion=%s, motivo_anulacion=%s WHERE id=%s",
@@ -742,6 +753,7 @@ def generar_hoja_control_html(viaje, destinos):
         <div class="destino-card">
             <div class="destino-header">
                 <span class="destino-num">{idx}</span> {d['tienda']}
+                <span class="marchamo-inline">🔒 {d['marchamo_ida']}</span>
                 {badge_complemento}
                 {badge_regreso}
             </div>
@@ -793,31 +805,33 @@ def generar_hoja_control_html(viaje, destinos):
         body {{ font-family: Arial, sans-serif; color: #1a1a1a; padding: 14px; font-size: 13px; }}
         .hoja {{ max-width: 800px; margin: auto; }}
         .header {{ display: flex; justify-content: space-between; align-items: flex-start;
-                   border-bottom: 3px solid #00693E; padding-bottom: 6px; margin-bottom: 8px; }}
-        .logo {{ font-size: 22px; font-weight: bold; color: #00693E; }}
+                   border-bottom: 3px solid #0B4A32; padding-bottom: 6px; margin-bottom: 8px; }}
+        .logo {{ font-size: 22px; font-weight: bold; color: #0B4A32; }}
         .titulo {{ text-align: right; }}
-        .titulo h2 {{ margin: 0; color: #00693E; font-size: 16px; }}
+        .titulo h2 {{ margin: 0; color: #0B4A32; font-size: 16px; }}
         .titulo p {{ margin: 0; color: #666; font-size: 10px; }}
         .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px 16px; margin-bottom: 8px; }}
         .dato label {{ display: block; font-size: 9px; color: #666; text-transform: uppercase; }}
         .dato span {{ font-size: 12px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
         .dato-blanco span {{ border-bottom: 1px dashed #999; min-height: 14px; }}
-        .titulo-destinos {{ background: #00693E; color: white; padding: 3px 10px; font-weight: bold;
+        .titulo-destinos {{ background: #0B4A32; color: white; padding: 3px 10px; font-weight: bold;
                              border-radius: 4px; margin-bottom: 6px; font-size: 12px; }}
         .destino-card {{ border: 1px solid #ccc; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
         .destino-header {{ background: #eef6ef; padding: 4px 10px; font-weight: bold; position: relative; font-size: 12px; }}
-        .destino-num {{ background: #00693E; color: white; border-radius: 50%; padding: 1px 7px; margin-right: 5px; font-size: 11px; }}
-        .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 3px 12px;
+        .destino-num {{ background: #0B4A32; color: white; border-radius: 50%; padding: 1px 7px; margin-right: 5px; font-size: 11px; }}
+        .marchamo-inline {{ margin-left: 10px; font-size: 11px; font-weight: 600; color: #0B4A32;
+                             background: #fff; border: 1px solid #0B4A32; border-radius: 4px; padding: 1px 8px; }}
+        .badge-regreso {{ float: right; background: #B5622E; color: white; padding: 3px 12px;
                            border-radius: 4px; font-size: 13px; font-weight: bold; }}
-        .badge-complemento {{ background: #A63603; color: white; padding: 1px 8px;
+        .badge-complemento {{ background: #7A3E1D; color: white; padding: 1px 8px;
                                border-radius: 4px; font-size: 10px; margin-left: 6px; }}
         .destino-body {{ display: flex; }}
         .material-enviado, .material-devuelto {{ flex: 1; padding: 5px 8px; }}
         .material-devuelto {{ border-left: 2px dashed #ccc; }}
-        .etiqueta {{ font-size: 9px; color: #00693E; font-weight: bold; margin-bottom: 3px; }}
+        .etiqueta {{ font-size: 9px; color: #0B4A32; font-weight: bold; margin-bottom: 3px; }}
         .material-grid {{ display: flex; gap: 5px; }}
         .material-box {{ flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 3px 2px; }}
-        .material-box b {{ display: block; font-size: 13px; color: #00693E; }}
+        .material-box b {{ display: block; font-size: 13px; color: #0B4A32; }}
         .material-box.vacio {{ min-height: 22px; }}
         .material-box span {{ font-size: 8px; color: #666; }}
         .sub-info {{ font-size: 10px; margin-top: 3px; }}
@@ -828,7 +842,7 @@ def generar_hoja_control_html(viaje, destinos):
         .sello-espacio {{ min-height: 46px; }}
         .incidencia {{ font-size: 10px; margin-top: 3px; color: #b34700; }}
         .footer {{ display: flex; justify-content: space-between; font-size: 9px; color: #999; margin-top: 10px; }}
-        .btn-imprimir {{ background: #00693E; color: white; border: none; padding: 10px 20px;
+        .btn-imprimir {{ background: #0B4A32; color: white; border: none; padding: 10px 20px;
                           border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }}
 
         @media print {{
@@ -836,6 +850,7 @@ def generar_hoja_control_html(viaje, destinos):
             .btn-imprimir {{ display: none; }}
             .logo, .titulo h2, .dato span, .etiqueta, .destino-num, .material-box b {{ color: #000 !important; }}
             .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
+            .marchamo-inline {{ border: 1px solid #000; color: #000 !important; background: #fff !important; }}
             .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
             .badge-complemento {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
             .material-box {{ border: 1px solid #000; }}
@@ -847,7 +862,7 @@ def generar_hoja_control_html(viaje, destinos):
     <div class="hoja">
         <button class="btn-imprimir" onclick="window.print()">🖨️ Imprimir</button>
         <div class="header">
-            <div class="logo">🚚 RANSA</div>
+            <div class="logo">RANSA</div>
             <div class="titulo">
                 <h2>HOJA DE SALIDA</h2>
                 <p>Control de Ruta · Documento de Despacho</p>
@@ -891,8 +906,8 @@ def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
                         "pacas_carton_devueltas=%s WHERE id=%s",
                         (d["roles_devueltos"], d["tarimas_devueltas"], d["pacas_carton_devueltas"], d["id"])
                     )
-                fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-                hora_hoy = datetime.now().strftime("%H:%M:%S")
+                fecha_hoy = ahora().strftime("%Y-%m-%d")
+                hora_hoy = ahora().strftime("%H:%M:%S")
                 cur.execute(
                     "UPDATE viajes SET estado='Liquidado', usuario_liquido=%s, "
                     "fecha_liquidacion=%s, hora_liquidacion=%s WHERE id=%s",
@@ -924,7 +939,7 @@ if 'num_destinos' not in st.session_state:
 # ==========================================
 # SIDEBAR + FLUJO DE ENTRADA (Login → Cliente/CD → App)
 # ==========================================
-st.sidebar.markdown("<h2 style='color:#00693E; font-weight:700; letter-spacing:-0.02em;'>🚚 RANSA</h2>", unsafe_allow_html=True)
+st.sidebar.markdown("<h2 style='color:#0B4A32; font-weight:700; letter-spacing:-0.02em;'>RANSA</h2>", unsafe_allow_html=True)
 st.sidebar.caption("Control de Ruta")
 
 st.sidebar.markdown("---")
@@ -943,7 +958,7 @@ if not st.session_state.get("login_confirmado"):
     st.markdown("""
         <div class="ransa-topbar" style="justify-content:center;">
             <div style="text-align:center;">
-                <div class="titulo">🚚 RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
+                <div class="titulo">RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
                 <div class="subtitulo">Ingresa con tu usuario para continuar</div>
             </div>
         </div>
@@ -951,10 +966,10 @@ if not st.session_state.get("login_confirmado"):
     col_izq, col_centro, col_der = st.columns([1, 1.2, 1])
     with col_centro:
         with st.container(border=True):
-            st.markdown("#### 🔐 Iniciar Sesión")
+            st.markdown("#### :material/lock: Iniciar Sesión")
             usuario_login = st.selectbox("Usuario", list(st.session_state.catalogos["usuarios"].keys()))
             st.caption(f"Perfil: **{st.session_state.catalogos['usuarios'][usuario_login]}**")
-            if st.button("🔓 Ingresar al Sistema", use_container_width=True):
+            if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
                 st.session_state["usuario_activo_fijo"] = usuario_login
                 st.session_state["login_confirmado"] = True
                 st.rerun()
@@ -966,7 +981,7 @@ perfil_activo = st.session_state.catalogos["usuarios"][usuario_activo]
 
 st.sidebar.success(f"👤 **{usuario_activo}**")
 st.sidebar.caption(f"Perfil: {perfil_activo}")
-if st.sidebar.button("🔒 Cerrar Sesión"):
+if st.sidebar.button(":material/logout: Cerrar Sesión"):
     st.session_state["login_confirmado"] = False
     st.session_state["config_bloqueada"] = False
     del st.session_state["usuario_activo_fijo"]
@@ -1003,7 +1018,7 @@ if not st.session_state.get("config_bloqueada"):
     else:
         cd_origen_sel = st.sidebar.selectbox("CD Origen", cds_disponibles)
 
-    if st.sidebar.button("🔒 Confirmar y Comenzar a Trabajar"):
+    if st.sidebar.button(":material/check_circle: Confirmar y Comenzar a Trabajar"):
         st.session_state["cliente_activo_fijo"] = cliente_activo_sel
         st.session_state["cd_origen_fijo"] = cd_origen_sel
         st.session_state["config_bloqueada"] = True
@@ -1017,7 +1032,7 @@ cd_origen_fijo = st.session_state["cd_origen_fijo"]
 
 st.sidebar.markdown("---")
 st.sidebar.success(f"🎯 **{cliente_activo}** · CD {cd_origen_fijo}")
-if st.sidebar.button("🚪 Cambiar Cliente / CD"):
+if st.sidebar.button(":material/swap_horiz: Cambiar Cliente / CD"):
     st.session_state["config_bloqueada"] = False
     del st.session_state["cliente_activo_fijo"]
     del st.session_state["cd_origen_fijo"]
@@ -1027,7 +1042,7 @@ st.sidebar.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pie
 st.markdown(f"""
     <div class="ransa-topbar">
         <div>
-            <div class="titulo">🚚 RANSA <span style="font-weight:400;">· Control de Ruta</span>
+            <div class="titulo">RANSA <span style="font-weight:400;">· Control de Ruta</span>
                 <span class="ransa-badge">TMS</span>
             </div>
             <div class="subtitulo">Sistema Integral de Gestión Logística</div>
@@ -1041,7 +1056,10 @@ st.markdown(f"""
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "📋 Despacho (Salidas)", "💰 Recepción (Liquidaciones)", "📊 Reportes e Impacto Diésel", "⚙️ Catálogos"
+    ":material/local_shipping: Despacho (Salidas)",
+    ":material/receipt_long: Recepción (Liquidaciones)",
+    ":material/bar_chart: Reportes e Impacto Diésel",
+    ":material/settings: Catálogos"
 ])
 
 # ==========================================
@@ -1049,43 +1067,44 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ==========================================
 with tab1:
     if perfil_activo in ["Administrador", "Operador"]:
-        st.header("Generación de Hoja de Control de Viaje")
+        st.header(":material/local_shipping: Generación de Hoja de Control de Viaje")
         st.caption(f"👤 Digitando como: **{usuario_activo}** ({perfil_activo}) · CD Origen: **{cd_origen_fijo}**")
 
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
 
         c1, c2, c3 = st.columns(3)
         c1.metric("No. Viaje (vista previa)", peek_siguiente_correlativo(cliente_activo))
-        c2.text_input("Fecha de Creación", value=datetime.now().strftime("%Y-%m-%d"), disabled=True, key=f"f_crea_{run}")
-        c3.text_input("Hora de Creación", value=datetime.now().strftime("%H:%M:%S"), disabled=True, key=f"h_crea_{run}")
+        c2.text_input("Fecha de Creación", value=ahora().strftime("%Y-%m-%d"), disabled=True, key=f"f_crea_{run}")
+        c3.text_input("Hora de Creación", value=ahora().strftime("%H:%M:%S"), disabled=True, key=f"h_crea_{run}")
         st.caption("El No. de Viaje definitivo se asigna al guardar, para evitar que dos digitadores reciban el mismo número.")
 
         cd_origen_final = cd_origen_fijo
 
         st.subheader("1. Selección de Transporte")
-        col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
+        with st.container(border=True):
+            col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
 
-        with col_p:
-            placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.catalogos["camiones"].keys()), key=f"placa_{run}")
+            with col_p:
+                placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.catalogos["camiones"].keys()), key=f"placa_{run}")
 
-        t_pred, cap_pred, pil_pred, aux_pred = "", "", "", ""
-        if placa:
-            datos_c = st.session_state.catalogos["camiones"][placa]
-            t_pred = datos_c["transportista"]
-            cap_pred = datos_c["tipo"]
-            pil_pred = datos_c["piloto"]
-            aux_pred = datos_c["auxiliar"]
+            t_pred, cap_pred, pil_pred, aux_pred = "", "", "", ""
+            if placa:
+                datos_c = st.session_state.catalogos["camiones"][placa]
+                t_pred = datos_c["transportista"]
+                cap_pred = datos_c["tipo"]
+                pil_pred = datos_c["piloto"]
+                aux_pred = datos_c["auxiliar"]
 
-        with col_t:
-            st.text_input("Transportista", value=t_pred, disabled=True, key=f"transp_{run}")
-        with col_cap:
-            st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
-        with col_pil:
-            pilotos = st.session_state.catalogos["pilotos"]
-            piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
-        with col_aux:
-            auxiliares = st.session_state.catalogos["auxiliares"]
-            auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
+            with col_t:
+                st.text_input("Transportista", value=t_pred, disabled=True, key=f"transp_{run}")
+            with col_cap:
+                st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
+            with col_pil:
+                pilotos = st.session_state.catalogos["pilotos"]
+                piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
+            with col_aux:
+                auxiliares = st.session_state.catalogos["auxiliares"]
+                auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
 
         st.subheader("2. Destinos y Carga por Tienda")
         st.caption("Primero cuenta lo físico (cajas, tarimas, roles); el marchamo de ida se pone al final, "
@@ -1106,45 +1125,42 @@ with tab1:
                     st.session_state[key_subrun_pedido] = 0
                 subrun = st.session_state[key_subrun_pedido]
 
-                col_tienda, col_pedido = st.columns([1.3, 1])
+                key_lista_pedidos = f"pedidos_lista_{run}_{i}"
+                if key_lista_pedidos not in st.session_state:
+                    st.session_state[key_lista_pedidos] = []
+                lista_pedidos = st.session_state[key_lista_pedidos]
+
+                col_tienda, col_comp = st.columns([2, 1.3])
                 with col_tienda:
                     tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
-                with col_pedido:
-                    pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
+                with col_comp:
+                    st.write("")
+                    es_complemento = st.toggle("¿Es complemento?", key=f"comp_{run}_{i}")
+
                 km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
                 rendimiento_camion = st.session_state.catalogos["rendimiento"].get(cap_pred)
                 if tienda and rendimiento_camion:
                     gal_t = round(km_t / rendimiento_camion, 2)
-                    st.caption(f"Distancia: {km_t} KM | Diésel estimado ({cap_pred}, {rendimiento_camion} km/gal): {gal_t} Gal")
+                    st.caption(f"Distancia: {km_t} KM | Diésel estimado ({cap_pred}, {rendimiento_camion} km/gal): {gal_t} Gal"
+                               + (" | Complemento: solo Roles y Tarimas, cajas/P&G van en el otro vehículo." if es_complemento else ""))
                 elif tienda:
                     gal_t = 0.0
                     st.caption(f"Distancia: {km_t} KM | ⚠️ Sin rendimiento configurado para '{cap_pred}' — agrégalo en Catálogos.")
                 else:
                     gal_t = 0.0
 
-                es_complemento = st.toggle(
-                    "¿Es complemento? (el resto de un pedido que no cupo en un viaje anterior)",
-                    key=f"comp_{run}_{i}"
-                )
-                if es_complemento:
-                    st.caption("Solo se piden Roles y Tarimas — las cajas y P&G van en el otro vehículo.")
-
-                # --- Lista de pedidos (memoria temporal) ---
-                # Cada pedido agregado aquí suma sus cajas al total. Cuando exista la
-                # conexión con el WMS, validar_pedido_wms() traerá el conteo real en vez
-                # del que digita el usuario a mano.
-                key_lista_pedidos = f"pedidos_lista_{run}_{i}"
-                if key_lista_pedidos not in st.session_state:
-                    st.session_state[key_lista_pedidos] = []
-                lista_pedidos = st.session_state[key_lista_pedidos]
-
+                # --- Pedido (memoria temporal) + material físico, todo en una fila ---
+                # Cuando exista la conexión con el WMS, validar_pedido_wms() traerá el
+                # conteo real de cajas en vez del que digita el usuario a mano.
                 if not es_complemento:
-                    fp2, fp3 = st.columns([1, 1])
+                    fp1, fp2, fp3, fp4 = st.columns([1.6, 1, 1, 1])
+                    with fp1:
+                        pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
                     with fp2:
-                        pedido_cajas = st.number_input("Cajas de este pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}_{subrun}")
+                        pedido_cajas = st.number_input("Cajas del pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}_{subrun}")
                     with fp3:
                         st.write("")
-                        agregar_pedido = st.button("➕ Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}")
+                        agregar_pedido = st.button("➕ Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
                     if agregar_pedido:
                         if not pedido_codigo.strip():
                             st.warning("Escribe un número de pedido antes de agregarlo.")
@@ -1161,6 +1177,9 @@ with tab1:
                             st.rerun()
 
                     if lista_pedidos:
+                        with fp4:
+                            cajas_total = sum(p["cajas"] for p in lista_pedidos)
+                            st.number_input("Total Cajas", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
                         for idx, p in enumerate(lista_pedidos):
                             pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
                             pc1.write(f"📄 {p['pedido']}")
@@ -1169,15 +1188,12 @@ with tab1:
                             if pc4.button("🗑️", key=f"del_pedido_{run}_{i}_{idx}"):
                                 lista_pedidos.pop(idx)
                                 st.rerun()
-                        cajas_total = sum(p["cajas"] for p in lista_pedidos)
-                        st.number_input("Total Cajas (suma de pedidos)", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
                     else:
-                        cajas_total = st.number_input("Cajas (total manual, sin pedidos detallados)", min_value=0, step=1, key=f"c_{run}_{i}")
+                        with fp4:
+                            cajas_total = st.number_input("Cajas (manual)", min_value=0, step=1, key=f"c_{run}_{i}")
                 else:
                     cajas_total = 0
-                    st.caption("📦 Cajas: no aplica en un complemento.")
 
-                st.markdown("**🧱 Material físico**")
                 mf1, mf2 = st.columns(2)
                 with mf1:
                     tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
@@ -1185,7 +1201,6 @@ with tab1:
                     roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
 
                 if es_cliente_unisuper:
-                    st.markdown("**📄 Documentos de la tienda (UniSuper)**")
                     dc1, dc2, dc3, dc4 = st.columns(4)
                     with dc1:
                         remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
@@ -1195,10 +1210,9 @@ with tab1:
                         creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
                     with dc4:
                         if not es_complemento:
-                            pg_cajas = st.number_input("Cartas Solicitud Producto P&G", min_value=0, step=1, key=f"pg_{run}_{i}")
+                            pg_cajas = st.number_input("Cartas Sol. P&G", min_value=0, step=1, key=f"pg_{run}_{i}")
                         else:
                             pg_cajas = 0
-                            st.caption("No aplica en complemento.")
                 else:
                     pg_cajas = 0
                     remitos_txt = ""
@@ -1236,17 +1250,20 @@ with tab1:
                     })
             st.markdown("")
 
-        if st.button("➕ Añadir Destino Adicional"):
+        if st.button(":material/add: Añadir Destino Adicional"):
             st.session_state.num_destinos += 1
             st.rerun()
 
         st.subheader("3. Cierre del Viaje")
-        st.caption("El Marchamo de Regreso se coloca al final, cuando ya se cerraron todas las tiendas.")
-        marchamo_regreso_viaje = st.text_input("🔄 Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}")
-        if destinos_viaje:
-            destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
+        with st.container(border=True):
+            st.caption("El Marchamo de Regreso se coloca al final, cuando ya se cerraron todas las tiendas.")
+            marchamo_regreso_viaje = st.text_input(":material/lock_reset: Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}")
+            if destinos_viaje:
+                destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
 
-        if st.button("💾 Guardar Viaje y Generar Hoja de Control"):
+            guardar_click = st.button(":material/save: Guardar Viaje y Generar Hoja de Control", use_container_width=True)
+
+        if guardar_click:
             marchamos_vacios = any(not d["marchamo_ida"] for d in destinos_viaje)
             marchamos_repetidos_en_form = len([d["marchamo_ida"] for d in destinos_viaje]) != len(
                 set(d["marchamo_ida"] for d in destinos_viaje)
@@ -1294,7 +1311,7 @@ with tab1:
                     components.html(generar_hoja_control_html(v, d), height=900, scrolling=True)
 
         st.markdown("### 🕒 Últimos viajes registrados")
-        st.dataframe(obtener_viajes_recientes(), use_container_width=True)
+        st.dataframe(obtener_viajes_recientes(), use_container_width=True, height=280)
     else:
         st.info("Tu perfil no tiene permisos para despachar viajes.")
 
@@ -1303,7 +1320,7 @@ with tab1:
 # ==========================================
 with tab2:
     if perfil_activo in ["Administrador", "Liquidador"]:
-        st.header("Liquidación de Viajes")
+        st.header(":material/receipt_long: Liquidación de Viajes")
         st.caption("Registra lo que el camión trajo de regreso de cada tienda. Las cajas no se devuelven.")
 
         with st.expander("📋 Ver viajes pendientes de liquidar (sin buscar nada)", expanded=False):
@@ -1330,7 +1347,7 @@ with tab2:
             )
         with col_btn:
             st.write("")
-            buscar = st.button("🔍 Buscar", use_container_width=True)
+            buscar = st.button(":material/search: Buscar", use_container_width=True)
 
         if buscar:
             if valor_busqueda.strip():
@@ -1408,7 +1425,7 @@ with tab2:
                     })
                     st.markdown("---")
 
-                if st.button("✅ Liquidar Viaje"):
+                if st.button(":material/check: Liquidar Viaje"):
                     ok, msg = liquidar_viaje(viaje["id"], destinos_actualizados, usuario_activo)
                     if ok:
                         st.success(f"Viaje {viaje['id_viaje']} liquidado correctamente. "
@@ -1478,7 +1495,7 @@ with tab2:
                     st.caption("Usa esto solo si el viaje se digitó por error. Queda registrado quién y cuándo "
                                "lo anuló; por ahora los marchamos usados quedan libres para digitarse en otro viaje.")
                     motivo_anulacion = st.text_input("Motivo de la anulación", key=f"motivo_anular_{viaje['id']}")
-                    if st.button("🚫 Confirmar Anulación", key=f"btn_anular_{viaje['id']}"):
+                    if st.button(":material/block: Confirmar Anulación", key=f"btn_anular_{viaje['id']}"):
                         if not motivo_anulacion.strip():
                             st.warning("Escribe el motivo antes de anular.")
                         else:
@@ -1510,7 +1527,7 @@ with tab4:
     if perfil_activo != "Administrador":
         st.info("Solo el perfil Administrador puede gestionar catálogos.")
     else:
-        st.header("Gestión de Catálogos")
+        st.header(":material/settings: Gestión de Catálogos")
         st.caption("Descarga la plantilla, llénala en Excel y súbela para reemplazar ese catálogo. "
                     "Los demás catálogos no se tocan.")
 
@@ -1519,7 +1536,7 @@ with tab4:
 
         st.markdown("#### Datos actuales")
         df_actual = leer_catalogo_actual(config["tabla"], config["columnas"])
-        st.dataframe(df_actual, use_container_width=True)
+        st.dataframe(df_actual, use_container_width=True, height=280)
         st.caption(f"{len(df_actual)} registro(s) actualmente.")
 
         st.markdown("#### ➕ Agregar o corregir UN registro")
@@ -1545,11 +1562,22 @@ with tab4:
                 # exista en el catálogo de Usuarios, no texto libre.
                 usuarios_existentes = sorted(st.session_state.catalogos["usuarios"].keys())
                 valores_form["usuario"] = st.selectbox("Usuario", usuarios_existentes, key=f"campo_{catalogo_sel}_usuario_sel")
+            elif col == "tipo" and catalogo_sel == "Rendimiento por Camión":
+                # Los tonelajes válidos son los que ya existen en el catálogo de
+                # Camiones — así se evitan variantes como "5 Ton", "5 T", "05 Ton".
+                tipos_existentes = sorted(set(
+                    c["tipo"] for c in st.session_state.catalogos["camiones"].values() if c["tipo"]
+                ))
+                if tipos_existentes:
+                    valores_form["tipo"] = st.selectbox("Tipo", tipos_existentes, key=f"campo_{catalogo_sel}_tipo_sel")
+                else:
+                    st.warning("Todavía no hay ningún tonelaje registrado en el catálogo de Camiones.")
+                    valores_form["tipo"] = ""
             elif col in config["numericas"]:
                 valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
             else:
                 valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
-        guardar_registro = st.button("💾 Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
+        guardar_registro = st.button(":material/save: Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
         if guardar_registro:
             faltan_llave = [c for c in config["clave"] if not str(valores_form[c]).strip()]
             if faltan_llave:
@@ -1567,7 +1595,7 @@ with tab4:
             st.markdown("#### 🗑️ Eliminar un registro")
             opciones_borrar = df_actual.apply(lambda r: " | ".join(str(r[c]) for c in config["clave"]), axis=1).tolist()
             registro_borrar = st.selectbox("Selecciona el registro a eliminar", opciones_borrar, key=f"del_sel_{catalogo_sel}")
-            if st.button("🗑️ Eliminar Registro Seleccionado", key=f"del_btn_{catalogo_sel}"):
+            if st.button(":material/delete: Eliminar Registro Seleccionado", key=f"del_btn_{catalogo_sel}"):
                 valores_clave = dict(zip(config["clave"], registro_borrar.split(" | ")))
                 ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave)
                 if ok:
@@ -1583,7 +1611,7 @@ with tab4:
         with col_desc:
             st.markdown("#### 1. Descargar plantilla")
             st.download_button(
-                "⬇️ Descargar plantilla Excel",
+                ":material/download: Descargar plantilla Excel",
                 data=generar_plantilla_excel(config["columnas"]),
                 file_name=f"plantilla_{config['tabla']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
