@@ -5,7 +5,7 @@ import psycopg2
 import psycopg2.extras
 import json
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import closing
 
@@ -181,6 +181,24 @@ st.markdown("""
 
         /* Dataframes con esquinas redondeadas consistentes */
         div[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; border: 1px solid var(--gris-borde); }
+
+        /* Círculo numerado para cada destino, estilo "paso a paso" */
+        .badge-numero {
+            width: 28px; height: 28px; border-radius: 50%;
+            background: var(--ransa-verde); color: white;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 13px; margin-top: 6px;
+        }
+
+        /* Botón primario (type="primary") con look de CTA oscuro, como el mockup */
+        div.stButton > button[kind="primary"] {
+            background-color: var(--gris-oscuro) !important;
+            font-size: 15px !important;
+            padding: 0.7rem 1.1rem !important;
+        }
+        div.stButton > button[kind="primary"]:hover {
+            background-color: #14181c !important;
+        }
         </style>
 """, unsafe_allow_html=True)
 
@@ -267,9 +285,11 @@ def init_db():
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS creditos TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS pg_cajas INTEGER")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS es_complemento BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS tipo_pago TEXT")
 
         # ---- Tablas de catálogos (antes vivían "quemadas" en el código Python) ----
         cur.execute("CREATE TABLE IF NOT EXISTS cat_transportistas (nombre TEXT PRIMARY KEY)")
+        cur.execute("ALTER TABLE cat_transportistas ADD COLUMN IF NOT EXISTS razon_social TEXT")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_pilotos (nombre TEXT PRIMARY KEY)")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_auxiliares (nombre TEXT PRIMARY KEY)")
         cur.execute("""
@@ -433,7 +453,7 @@ def actualizar_default_camion(placa, piloto, auxiliar):
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
 CATALOGOS_CONFIG = {
-    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
+    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social"], "clave": ["nombre"], "numericas": []},
     "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"],
@@ -585,14 +605,15 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                     cur.execute(
                         "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
                         "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias, "
-                        "devolucion, creditos, pg_cajas, es_complemento) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "devolucion, creditos, pg_cajas, es_complemento, tipo_pago) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
                          dest["marchamo_ida"], dest["marchamo_regreso"] or None,
                          dest["roles"], dest["tarimas"], dest["cajas"],
                          dest.get("remitos", ""), dest.get("incidencias", ""),
                          dest.get("devolucion", ""), dest.get("creditos", ""),
-                         dest.get("pg_cajas", 0), dest.get("es_complemento", False))
+                         dest.get("pg_cajas", 0), dest.get("es_complemento", False),
+                         dest.get("tipo_pago", "Local"))
                     )
             conn.commit()
             return True, id_viaje_str
@@ -616,6 +637,58 @@ def obtener_viajes_recientes(limite=10):
             "SELECT id_viaje, cliente, placa, piloto, fecha_creacion, hora_creacion, estado "
             "FROM viajes ORDER BY id DESC LIMIT %s", conn, params=(limite,)
         )
+
+
+def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
+    """Un renglón por viaje: la tienda que se muestra es la más lejana (mayor km)
+    del viaje, junto con cuántas tiendas llevaba en total. BULTOS = solo cajas."""
+    with closing(get_conn()) as conn:
+        query = """
+            WITH agregado AS (
+                SELECT viaje_id,
+                       STRING_AGG(marchamo_ida, ' / ' ORDER BY orden) AS marchamos,
+                       COUNT(*) AS cantidad_tiendas,
+                       SUM(cajas) AS bultos
+                FROM destinos
+                GROUP BY viaje_id
+            ),
+            mas_lejano AS (
+                SELECT DISTINCT ON (viaje_id) viaje_id, tienda, tipo_pago
+                FROM destinos
+                ORDER BY viaje_id, km DESC NULLS LAST
+            )
+            SELECT
+                v.fecha_creacion AS "Fecha",
+                v.id_viaje AS "No. Despacho",
+                v.usuario_creador AS "Supervisor/Coordinador",
+                ag.marchamos AS "No. de Marchamo",
+                ml.tienda AS "Tienda (más lejana)",
+                ag.cantidad_tiendas AS "Cantidad de Tiendas",
+                v.placa AS "Placa",
+                v.piloto AS "Piloto a Cargo",
+                v.cd_origen AS "Origen",
+                ml.tipo_pago AS "Clasificación de Destino",
+                cam.tipo AS "Tonelaje",
+                v.transportista AS "Transportista",
+                tr.razon_social AS "Razón Social",
+                ag.bultos AS "Bultos (Cajas)"
+            FROM viajes v
+            JOIN agregado ag ON ag.viaje_id = v.id
+            JOIN mas_lejano ml ON ml.viaje_id = v.id
+            LEFT JOIN cat_camiones cam ON cam.placa = v.placa
+            LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
+            WHERE v.estado != 'Anulado'
+              AND v.fecha_creacion BETWEEN %s AND %s
+              AND (%s = 'Todos' OR v.cliente = %s)
+            ORDER BY v.fecha_creacion DESC, v.id DESC
+        """
+        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+
+
+def exportar_excel(df):
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False, engine="openpyxl")
+    return buffer.getvalue()
 
 
 def buscar_viajes(valor_busqueda):
@@ -704,10 +777,10 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                     cur.execute(
                         "UPDATE destinos SET roles=%s, tarimas=%s, cajas=%s, marchamo_ida=%s, "
                         "marchamo_regreso=%s, remitos=%s, devolucion=%s, creditos=%s, pg_cajas=%s, "
-                        "incidencias=%s, es_complemento=%s WHERE id=%s",
+                        "incidencias=%s, es_complemento=%s, tipo_pago=%s WHERE id=%s",
                         (d["roles"], d["tarimas"], d["cajas"], d["marchamo_ida"],
                          d["marchamo_regreso"] or None, d["remitos"], d["devolucion"], d["creditos"],
-                         d["pg_cajas"], d["incidencias"], d["es_complemento"], d["id"])
+                         d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"], d["id"])
                     )
             conn.commit()
             return True, "OK"
@@ -1067,201 +1140,223 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ==========================================
 with tab1:
     if perfil_activo in ["Administrador", "Operador"]:
-        st.header(":material/local_shipping: Generación de Hoja de Control de Viaje")
-        st.caption(f"👤 Digitando como: **{usuario_activo}** ({perfil_activo}) · CD Origen: **{cd_origen_fijo}**")
+        st.header(":material/local_shipping: Creación de Viaje")
+        st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
 
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("No. Viaje (vista previa)", peek_siguiente_correlativo(cliente_activo))
-        c2.text_input("Fecha de Creación", value=ahora().strftime("%Y-%m-%d"), disabled=True, key=f"f_crea_{run}")
-        c3.text_input("Hora de Creación", value=ahora().strftime("%H:%M:%S"), disabled=True, key=f"h_crea_{run}")
-        st.caption("El No. de Viaje definitivo se asigna al guardar, para evitar que dos digitadores reciban el mismo número.")
-
-        cd_origen_final = cd_origen_fijo
-
-        st.subheader("1. Selección de Transporte")
-        with st.container(border=True):
-            col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
-
-            with col_p:
-                placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.catalogos["camiones"].keys()), key=f"placa_{run}")
-
-            t_pred, cap_pred, pil_pred, aux_pred = "", "", "", ""
-            if placa:
-                datos_c = st.session_state.catalogos["camiones"][placa]
-                t_pred = datos_c["transportista"]
-                cap_pred = datos_c["tipo"]
-                pil_pred = datos_c["piloto"]
-                aux_pred = datos_c["auxiliar"]
-
-            with col_t:
-                st.text_input("Transportista", value=t_pred, disabled=True, key=f"transp_{run}")
-            with col_cap:
-                st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
-            with col_pil:
-                pilotos = st.session_state.catalogos["pilotos"]
-                piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
-            with col_aux:
-                auxiliares = st.session_state.catalogos["auxiliares"]
-                auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
-
-        st.subheader("2. Destinos y Carga por Tienda")
-        st.caption("Primero cuenta lo físico (cajas, tarimas, roles); el marchamo de ida se pone al final, "
-                    "cuando ya cerraste el conteo de esa tienda.")
-
         tiendas_cliente = st.session_state.catalogos["clientes"][cliente_activo]
         es_cliente_unisuper = cliente_activo.startswith("UniSuper")
-        destinos_viaje = []
-        total_destinos = st.session_state.num_destinos
-        tiendas_usadas_en_form = set()
 
-        for i in range(total_destinos):
+        col_main, col_side = st.columns([2.2, 1], gap="medium")
+
+        with col_main:
             with st.container(border=True):
-                st.markdown(f"#### 📍 Destino #{i + 1}")
+                st.markdown("##### :material/badge: INFORMACIÓN DEL VIAJE")
+                ic1, ic2, ic3 = st.columns(3)
+                ic1.text_input("Cliente Operativo", value=cliente_activo, disabled=True, key=f"info_cli_{run}")
+                ic2.text_input("Correlativo de Viaje (automático)", value=peek_siguiente_correlativo(cliente_activo), disabled=True, key=f"info_corr_{run}")
+                ic3.text_input("CD Origen", value=cd_origen_fijo, disabled=True, key=f"info_cd_{run}")
 
-                key_subrun_pedido = f"pedido_subrun_{run}_{i}"
-                if key_subrun_pedido not in st.session_state:
-                    st.session_state[key_subrun_pedido] = 0
-                subrun = st.session_state[key_subrun_pedido]
+                col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
+                with col_p:
+                    placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.catalogos["camiones"].keys()), key=f"placa_{run}")
 
-                key_lista_pedidos = f"pedidos_lista_{run}_{i}"
-                if key_lista_pedidos not in st.session_state:
-                    st.session_state[key_lista_pedidos] = []
-                lista_pedidos = st.session_state[key_lista_pedidos]
+                t_pred, cap_pred, pil_pred, aux_pred = "", "", "", ""
+                if placa:
+                    datos_c = st.session_state.catalogos["camiones"][placa]
+                    t_pred = datos_c["transportista"]
+                    cap_pred = datos_c["tipo"]
+                    pil_pred = datos_c["piloto"]
+                    aux_pred = datos_c["auxiliar"]
 
-                col_tienda, col_comp = st.columns([2, 1.3])
-                with col_tienda:
-                    tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()), key=f"t_{run}_{i}")
-                with col_comp:
-                    st.write("")
-                    es_complemento = st.toggle("¿Es complemento?", key=f"comp_{run}_{i}")
+                with col_t:
+                    st.text_input("Transportista", value=t_pred, disabled=True, key=f"transp_{run}")
+                with col_cap:
+                    st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
+                with col_pil:
+                    pilotos = st.session_state.catalogos["pilotos"]
+                    piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
+                with col_aux:
+                    auxiliares = st.session_state.catalogos["auxiliares"]
+                    auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
 
-                km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
-                rendimiento_camion = st.session_state.catalogos["rendimiento"].get(cap_pred)
-                if tienda and rendimiento_camion:
-                    gal_t = round(km_t / rendimiento_camion, 2)
-                    st.caption(f"Distancia: {km_t} KM | Diésel estimado ({cap_pred}, {rendimiento_camion} km/gal): {gal_t} Gal"
-                               + (" | Complemento: solo Roles y Tarimas, cajas/P&G van en el otro vehículo." if es_complemento else ""))
-                elif tienda:
-                    gal_t = 0.0
-                    st.caption(f"Distancia: {km_t} KM | ⚠️ Sin rendimiento configurado para '{cap_pred}' — agrégalo en Catálogos.")
-                else:
-                    gal_t = 0.0
+            cd_origen_final = cd_origen_fijo
 
-                # --- Pedido (memoria temporal) + material físico, todo en una fila ---
-                # Cuando exista la conexión con el WMS, validar_pedido_wms() traerá el
-                # conteo real de cajas en vez del que digita el usuario a mano.
-                if not es_complemento:
-                    fp1, fp2, fp3, fp4 = st.columns([1.6, 1, 1, 1])
-                    with fp1:
-                        pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
-                    with fp2:
-                        pedido_cajas = st.number_input("Cajas del pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}_{subrun}")
-                    with fp3:
-                        st.write("")
-                        agregar_pedido = st.button("➕ Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
-                    if agregar_pedido:
-                        if not pedido_codigo.strip():
-                            st.warning("Escribe un número de pedido antes de agregarlo.")
-                        elif pedido_cajas <= 0:
-                            st.warning("⚠️ Ese pedido no tiene cajas — indica cuántas cajas trae antes de agregarlo.")
-                        else:
-                            cajas_wms = validar_pedido_wms(pedido_codigo.strip())
-                            lista_pedidos.append({
-                                "pedido": pedido_codigo.strip(),
-                                "cajas": cajas_wms if cajas_wms is not None else pedido_cajas,
-                                "origen": "WMS" if cajas_wms is not None else "Manual"
-                            })
-                            st.session_state[key_subrun_pedido] += 1  # limpia los campos de pedido/cajas
-                            st.rerun()
+            with st.container(border=True):
+                st.markdown("##### :material/route: RUTA Y DESTINOS")
+                st.caption("Cuenta lo físico primero; el marchamo de ida se cierra al final de cada tienda.")
 
-                    if lista_pedidos:
-                        with fp4:
-                            cajas_total = sum(p["cajas"] for p in lista_pedidos)
-                            st.number_input("Total Cajas", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
-                        for idx, p in enumerate(lista_pedidos):
-                            pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
-                            pc1.write(f"📄 {p['pedido']}")
-                            pc2.write(f"{p['cajas']} cajas")
-                            pc3.write(f"_{p['origen']}_")
-                            if pc4.button("🗑️", key=f"del_pedido_{run}_{i}_{idx}"):
-                                lista_pedidos.pop(idx)
+                destinos_viaje = []
+                total_destinos = st.session_state.num_destinos
+                tiendas_usadas_en_form = set()
+
+                for i in range(total_destinos):
+                    key_subrun_pedido = f"pedido_subrun_{run}_{i}"
+                    if key_subrun_pedido not in st.session_state:
+                        st.session_state[key_subrun_pedido] = 0
+                    subrun = st.session_state[key_subrun_pedido]
+
+                    key_lista_pedidos = f"pedidos_lista_{run}_{i}"
+                    if key_lista_pedidos not in st.session_state:
+                        st.session_state[key_lista_pedidos] = []
+                    lista_pedidos = st.session_state[key_lista_pedidos]
+
+                    with st.container(border=True):
+                        cab1, cab2, cab3, cab4 = st.columns([0.35, 2.2, 1.5, 0.4])
+                        cab1.markdown(f'<div class="badge-numero">{i + 1}</div>', unsafe_allow_html=True)
+                        with cab2:
+                            tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()),
+                                                   key=f"t_{run}_{i}", label_visibility="collapsed",
+                                                   placeholder="Tienda / Destino")
+                        with cab3:
+                            m_ida_tienda = st.text_input("Marchamo Ida", key=f"mida_{run}_{i}",
+                                                          label_visibility="collapsed", placeholder="Marchamo Ida")
+                        with cab4:
+                            puede_borrar = (i == total_destinos - 1) and total_destinos > 1
+                            if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=not puede_borrar,
+                                         help="Quitar este destino" if puede_borrar else "Solo puedes quitar el último destino agregado"):
+                                st.session_state.num_destinos -= 1
                                 st.rerun()
-                    else:
-                        with fp4:
-                            cajas_total = st.number_input("Cajas (manual)", min_value=0, step=1, key=f"c_{run}_{i}")
-                else:
-                    cajas_total = 0
 
-                mf1, mf2 = st.columns(2)
-                with mf1:
-                    tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
-                with mf2:
-                    roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
-
-                if es_cliente_unisuper:
-                    dc1, dc2, dc3, dc4 = st.columns(4)
-                    with dc1:
-                        remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                    with dc2:
-                        devolucion_txt = st.text_input("Devolución", key=f"dev_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                    with dc3:
-                        creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
-                    with dc4:
-                        if not es_complemento:
-                            pg_cajas = st.number_input("Cartas Sol. P&G", min_value=0, step=1, key=f"pg_{run}_{i}")
+                        km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
+                        rendimiento_camion = st.session_state.catalogos["rendimiento"].get(cap_pred)
+                        es_complemento = st.toggle("¿Es complemento? (resto de un pedido que no cupo antes)", key=f"comp_{run}_{i}")
+                        if tienda and rendimiento_camion:
+                            gal_t = round(km_t / rendimiento_camion, 2)
+                            st.caption(f"Distancia: {km_t} KM · Diésel estimado ({cap_pred}, {rendimiento_camion} km/gal): {gal_t} Gal"
+                                       + (" · Complemento: solo Roles y Tarimas." if es_complemento else ""))
+                        elif tienda:
+                            gal_t = 0.0
+                            st.caption(f"Distancia: {km_t} KM · ⚠️ Sin rendimiento configurado para '{cap_pred}'.")
                         else:
-                            pg_cajas = 0
-                else:
-                    pg_cajas = 0
-                    remitos_txt = ""
-                    devolucion_txt = ""
-                    creditos_txt = ""
+                            gal_t = 0.0
 
-                observaciones_txt = st.text_area(
-                    "📝 Observaciones", key=f"obs_{run}_{i}",
-                    placeholder="Ej: lleva transferencia T-123, tienda cerrada, faltante detectado, etc."
-                )
+                        with st.expander("Detalle de cajas, material y documentos", expanded=True):
+                            if not es_complemento:
+                                fp1, fp2, fp3 = st.columns([1.6, 1, 1])
+                                with fp1:
+                                    pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
+                                with fp2:
+                                    pedido_cajas = st.number_input("Cajas del pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}_{subrun}")
+                                with fp3:
+                                    st.write("")
+                                    agregar_pedido = st.button(":material/add: Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
+                                if agregar_pedido:
+                                    if not pedido_codigo.strip():
+                                        st.warning("Escribe un número de pedido antes de agregarlo.")
+                                    elif pedido_cajas <= 0:
+                                        st.warning("⚠️ Ese pedido no tiene cajas — indica cuántas cajas trae antes de agregarlo.")
+                                    else:
+                                        cajas_wms = validar_pedido_wms(pedido_codigo.strip())
+                                        lista_pedidos.append({
+                                            "pedido": pedido_codigo.strip(),
+                                            "cajas": cajas_wms if cajas_wms is not None else pedido_cajas,
+                                            "origen": "WMS" if cajas_wms is not None else "Manual"
+                                        })
+                                        st.session_state[key_subrun_pedido] += 1
+                                        st.rerun()
 
-                st.markdown("**🔒 Marchamo de Ida**")
-                m_ida_tienda = st.text_input("Marchamo IDA (Único, se cierra al terminar esta tienda)", key=f"mida_{run}_{i}")
+                                if lista_pedidos:
+                                    for idx, p in enumerate(lista_pedidos):
+                                        pc1, pc2, pc3, pc4 = st.columns([2, 1, 1, 1])
+                                        pc1.write(f":material/description: {p['pedido']}")
+                                        pc2.write(f"{p['cajas']} cajas")
+                                        pc3.write(f"_{p['origen']}_")
+                                        if pc4.button(":material/delete:", key=f"del_pedido_{run}_{i}_{idx}"):
+                                            lista_pedidos.pop(idx)
+                                            st.rerun()
+                            else:
+                                cajas_total = 0
 
-                if tienda:
-                    if tienda in tiendas_usadas_en_form:
-                        st.warning(f"⚠️ La tienda '{tienda}' ya está agregada como otro destino de este mismo viaje.")
-                    tiendas_usadas_en_form.add(tienda)
-                    destinos_viaje.append({
-                        "tienda": tienda,
-                        "km": km_t,
-                        "galones_base": gal_t,
-                        "pedidos": json.dumps(lista_pedidos),
-                        "marchamo_ida": m_ida_tienda.strip(),
-                        "marchamo_regreso": "",  # se completa más abajo, en el cierre del viaje
-                        "roles": roles,
-                        "tarimas": tarimas,
-                        "cajas": cajas_total,
-                        "remitos": remitos_txt.strip(),
-                        "incidencias": observaciones_txt.strip(),
-                        "devolucion": devolucion_txt.strip(),
-                        "creditos": creditos_txt.strip(),
-                        "pg_cajas": pg_cajas,
-                        "es_complemento": es_complemento
-                    })
-            st.markdown("")
+                            mf1, mf2, mf3, mf4 = st.columns(4)
+                            with mf1:
+                                if es_complemento:
+                                    st.number_input("Cajas Totales", value=0, disabled=True, key=f"c_disabled_{run}_{i}")
+                                elif lista_pedidos:
+                                    cajas_total = sum(p["cajas"] for p in lista_pedidos)
+                                    st.number_input("Cajas Totales", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
+                                else:
+                                    cajas_total = st.number_input("Cajas Totales", min_value=0, step=1, key=f"c_{run}_{i}")
+                            with mf2:
+                                tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
+                            with mf3:
+                                roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
+                            with mf4:
+                                tipo_pago = st.selectbox("Clasificación de Destino", ["Local", "Departamental"], key=f"tipopago_{run}_{i}")
 
-        if st.button(":material/add: Añadir Destino Adicional"):
-            st.session_state.num_destinos += 1
-            st.rerun()
+                            if es_cliente_unisuper:
+                                dc1, dc2, dc3, dc4 = st.columns(4)
+                                with dc1:
+                                    remitos_txt = st.text_input("Remisión", key=f"remitos_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                                with dc2:
+                                    devolucion_txt = st.text_input("Devolución", key=f"dev_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                                with dc3:
+                                    creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
+                                with dc4:
+                                    if not es_complemento:
+                                        pg_cajas = st.number_input("Cartas Sol. P&G", min_value=0, step=1, key=f"pg_{run}_{i}")
+                                    else:
+                                        pg_cajas = 0
+                            else:
+                                pg_cajas = 0
+                                remitos_txt = ""
+                                devolucion_txt = ""
+                                creditos_txt = ""
 
-        st.subheader("3. Cierre del Viaje")
-        with st.container(border=True):
-            st.caption("El Marchamo de Regreso se coloca al final, cuando ya se cerraron todas las tiendas.")
-            marchamo_regreso_viaje = st.text_input(":material/lock_reset: Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}")
-            if destinos_viaje:
-                destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
+                            observaciones_txt = st.text_area(
+                                "Observaciones", key=f"obs_{run}_{i}",
+                                placeholder="Ej: lleva transferencia T-123, tienda cerrada, faltante detectado, etc."
+                            )
 
-            guardar_click = st.button(":material/save: Guardar Viaje y Generar Hoja de Control", use_container_width=True)
+                        if tienda:
+                            if tienda in tiendas_usadas_en_form:
+                                st.warning(f"⚠️ La tienda '{tienda}' ya está agregada como otro destino de este mismo viaje.")
+                            tiendas_usadas_en_form.add(tienda)
+                            destinos_viaje.append({
+                                "tienda": tienda,
+                                "km": km_t,
+                                "galones_base": gal_t,
+                                "pedidos": json.dumps(lista_pedidos),
+                                "marchamo_ida": m_ida_tienda.strip(),
+                                "marchamo_regreso": "",  # se completa en el panel de cierre
+                                "roles": roles,
+                                "tarimas": tarimas,
+                                "cajas": cajas_total,
+                                "remitos": remitos_txt.strip(),
+                                "incidencias": observaciones_txt.strip(),
+                                "devolucion": devolucion_txt.strip(),
+                                "creditos": creditos_txt.strip(),
+                                "pg_cajas": pg_cajas,
+                                "es_complemento": es_complemento,
+                                "tipo_pago": tipo_pago
+                            })
+
+                if st.button(":material/add: Agregar Parada"):
+                    st.session_state.num_destinos += 1
+                    st.rerun()
+
+        with col_side:
+            with st.container(border=True):
+                st.markdown("##### :material/inventory_2: CONTROL DE MATERIALES")
+                total_tarimas = sum(d["tarimas"] for d in destinos_viaje)
+                total_roles = sum(d["roles"] for d in destinos_viaje)
+                total_cajas = sum(d["cajas"] for d in destinos_viaje)
+                total_diesel = round(sum(d["galones_base"] for d in destinos_viaje), 2)
+
+                mcol1, mcol2 = st.columns(2)
+                mcol1.metric("Tarimas", total_tarimas)
+                mcol2.metric("Roles Secos", total_roles)
+                mcol1.metric("Cajas Totales", total_cajas)
+                mcol2.metric("Diésel Est. (Gal)", total_diesel)
+
+            with st.container(border=True):
+                st.markdown("##### :material/lock: CIERRE DEL VIAJE")
+                st.caption("Marchamo de Regreso — se coloca cuando ya se cerraron todas las tiendas.")
+                marchamo_regreso_viaje = st.text_input("Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}", label_visibility="collapsed", placeholder="Marchamo de Regreso")
+                if destinos_viaje:
+                    destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
+
+                guardar_click = st.button(":material/print: Generar Viaje e Imprimir", use_container_width=True, type="primary")
 
         if guardar_click:
             marchamos_vacios = any(not d["marchamo_ida"] for d in destinos_viaje)
@@ -1471,11 +1566,15 @@ with tab2:
                         with e5:
                             mreg_e = st.text_input("Marchamo Regreso", value=d["marchamo_regreso"] or "", key=f"emreg_{d['id']}")
                         es_comp_e = st.checkbox("¿Es complemento?", value=d["es_complemento"], key=f"ecomp_{d['id']}")
+                        opciones_pago = ["Local", "Departamental"]
+                        idx_pago = opciones_pago.index(d["tipo_pago"]) if d["tipo_pago"] in opciones_pago else 0
+                        tipo_pago_e = st.selectbox("Clasificación de Destino", opciones_pago, index=idx_pago, key=f"etipopago_{d['id']}")
                         destinos_editados.append({
                             "id": d["id"], "roles": roles_e, "tarimas": tarimas_e, "cajas": cajas_e,
                             "marchamo_ida": mida_e.strip(), "marchamo_regreso": mreg_e.strip(),
                             "remitos": d["remitos"], "devolucion": d["devolucion"], "creditos": d["creditos"],
-                            "pg_cajas": d["pg_cajas"], "incidencias": d["incidencias"], "es_complemento": es_comp_e
+                            "pg_cajas": d["pg_cajas"], "incidencias": d["incidencias"], "es_complemento": es_comp_e,
+                            "tipo_pago": tipo_pago_e
                         })
                         st.markdown("---")
 
@@ -1516,8 +1615,60 @@ with tab2:
 # ==========================================
 with tab3:
     precio_diesel_semana = st.number_input("⛽ Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
-    st.info("Módulo de reportes en construcción: impacto de diésel por viaje/tienda usando el "
-            "precio de arriba.")
+    st.markdown("---")
+
+    reporte_sel = st.selectbox(
+        "Reporte", ["Bitácora de Viajes", "Control de Retornable (próximamente)", "Cajas por Camión (próximamente)"]
+    )
+
+    if reporte_sel == "Bitácora de Viajes":
+        st.subheader(":material/receipt_long: Bitácora de Viajes")
+
+        fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1.3, 0.8])
+        with fcol1:
+            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7))
+        with fcol2:
+            fecha_fin = st.date_input("Hasta", value=ahora().date())
+        with fcol3:
+            clientes_reporte = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
+            cliente_reporte = st.selectbox("Cliente", clientes_reporte)
+        with fcol4:
+            st.write("")
+            generar = st.button(":material/search: Generar", use_container_width=True)
+
+        if generar:
+            st.session_state["df_bitacora"] = obtener_reporte_bitacora(fecha_ini, fecha_fin, cliente_reporte)
+
+        df_bitacora = st.session_state.get("df_bitacora")
+        if df_bitacora is not None:
+            if df_bitacora.empty:
+                st.info("No hay viajes en ese rango de fechas para ese cliente.")
+            else:
+                st.caption(f"{len(df_bitacora)} viaje(s) encontrados.")
+                # Ventana con su propio scroll, en vez de empujar toda la página
+                st.dataframe(df_bitacora, use_container_width=True, height=420)
+
+                ecol1, ecol2 = st.columns(2)
+                with ecol1:
+                    st.download_button(
+                        ":material/download: Exportar a Excel",
+                        data=exportar_excel(df_bitacora),
+                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                with ecol2:
+                    st.download_button(
+                        ":material/download: Exportar a CSV",
+                        data=df_bitacora.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+        else:
+            st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
+    else:
+        st.info("Este reporte todavía no está construido — lo armamos en la próxima ronda.")
 
 # ==========================================
 # MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
