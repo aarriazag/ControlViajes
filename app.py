@@ -1141,7 +1141,7 @@ st.markdown("---")
 tab1, tab2, tab3, tab4 = st.tabs([
     ":material/local_shipping: Despacho (Salidas)",
     ":material/receipt_long: Recepción (Liquidaciones)",
-    ":material/bar_chart: Reportes e Impacto Diésel",
+    ":material/bar_chart: Reportes",
     ":material/settings: Catálogos"
 ])
 
@@ -1154,6 +1154,7 @@ with tab1:
         st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
 
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
+        marchamo_regreso_actual = st.session_state.get(f"mreg_final_{run}", "")
         tiendas_cliente = st.session_state.catalogos["clientes"][cliente_activo]
         es_cliente_unisuper = cliente_activo.startswith("UniSuper")
 
@@ -1231,15 +1232,10 @@ with tab1:
                         km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
                         rendimiento_camion = st.session_state.catalogos["rendimiento"].get(cap_pred)
                         es_complemento = st.toggle("¿Es complemento? (resto de un pedido que no cupo antes)", key=f"comp_{run}_{i}")
-                        if tienda and rendimiento_camion:
-                            gal_t = round(km_t / rendimiento_camion, 2)
-                            st.caption(f"Distancia: {km_t} KM · Diésel estimado ({cap_pred}, {rendimiento_camion} km/gal): {gal_t} Gal"
+                        gal_t = round(km_t / rendimiento_camion, 2) if (tienda and rendimiento_camion) else 0.0
+                        if tienda:
+                            st.caption(f"Distancia: {km_t} KM"
                                        + (" · Complemento: solo Roles y Tarimas." if es_complemento else ""))
-                        elif tienda:
-                            gal_t = 0.0
-                            st.caption(f"Distancia: {km_t} KM · ⚠️ Sin rendimiento configurado para '{cap_pred}'.")
-                        else:
-                            gal_t = 0.0
 
                         with st.expander("Detalle de cajas, material y documentos", expanded=True):
                             if not es_complemento:
@@ -1247,7 +1243,7 @@ with tab1:
                                 with fp1:
                                     pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
                                 with fp2:
-                                    pedido_cajas = st.number_input("Cajas del pedido", min_value=0, step=1, key=f"cajas_pedido_{run}_{i}_{subrun}")
+                                    pedido_cajas = st.number_input("Cajas del pedido", min_value=0, step=1, value=None, placeholder="0", key=f"cajas_pedido_{run}_{i}_{subrun}") or 0
                                 with fp3:
                                     st.write("")
                                     agregar_pedido = st.button(":material/add: Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
@@ -1286,11 +1282,11 @@ with tab1:
                                     cajas_total = sum(p["cajas"] for p in lista_pedidos)
                                     st.number_input("Cajas Totales", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
                                 else:
-                                    cajas_total = st.number_input("Cajas Totales", min_value=0, step=1, key=f"c_{run}_{i}")
+                                    cajas_total = st.number_input("Cajas Totales", min_value=0, step=1, value=None, placeholder="0", key=f"c_{run}_{i}") or 0
                             with mf2:
-                                tarimas = st.number_input("Tarimas", min_value=0, step=1, key=f"tar_{run}_{i}")
+                                tarimas = st.number_input("Tarimas", min_value=0, step=1, value=None, placeholder="0", key=f"tar_{run}_{i}") or 0
                             with mf3:
-                                roles = st.number_input("Roles Secos", min_value=0, step=1, key=f"r_{run}_{i}")
+                                roles = st.number_input("Roles Secos", min_value=0, step=1, value=None, placeholder="0", key=f"r_{run}_{i}") or 0
                             with mf4:
                                 tipo_pago = st.selectbox("Clasificación de Destino", ["Local", "Departamental"], key=f"tipopago_{run}_{i}")
 
@@ -1304,7 +1300,7 @@ with tab1:
                                     creditos_txt = st.text_input("Créditos", key=f"cred_{run}_{i}", max_chars=10, placeholder="10 caracteres")
                                 with dc4:
                                     if not es_complemento:
-                                        pg_cajas = st.number_input("Cartas Sol. P&G", min_value=0, step=1, key=f"pg_{run}_{i}")
+                                        pg_cajas = st.number_input("Cartas Sol. P&G", min_value=0, step=1, value=None, placeholder="0", key=f"pg_{run}_{i}") or 0
                                     else:
                                         pg_cajas = 0
                             else:
@@ -1347,25 +1343,41 @@ with tab1:
 
         with col_side:
             with st.container(border=True):
-                st.markdown("##### :material/inventory_2: CONTROL DE MATERIALES")
+                st.markdown("##### :material/summarize: RESUMEN DE DATOS")
                 total_tarimas = sum(d["tarimas"] for d in destinos_viaje)
                 total_roles = sum(d["roles"] for d in destinos_viaje)
                 total_cajas = sum(d["cajas"] for d in destinos_viaje)
-                total_diesel = round(sum(d["galones_base"] for d in destinos_viaje), 2)
+                cantidad_tiendas = len(destinos_viaje)
 
                 mcol1, mcol2 = st.columns(2)
-                mcol1.metric("Tarimas", total_tarimas)
-                mcol2.metric("Roles Secos", total_roles)
-                mcol1.metric("Cajas Totales", total_cajas)
-                mcol2.metric("Diésel Est. (Gal)", total_diesel)
+                mcol1.metric("Cajas", total_cajas)
+                mcol2.metric("Tarimas", total_tarimas)
+                mcol1.metric("Roles", total_roles)
+                mcol2.metric("Cantidad de Tiendas", cantidad_tiendas)
 
-            with st.container(border=True):
-                st.markdown("##### :material/lock: CIERRE DEL VIAJE")
-                st.caption("Marchamo de Regreso — se coloca cuando ya se cerraron todas las tiendas.")
+                st.markdown("---")
+                st.caption(":material/preview: VISTA PREVIA — HOJA DE SALIDA")
+                if not destinos_viaje:
+                    st.caption("Agrega un destino para ver la vista previa.")
+                else:
+                    for idx, d in enumerate(destinos_viaje, start=1):
+                        st.markdown(f"**{idx}. {d['tienda'] or '—'}**")
+                        st.caption(f"Marchamo Ida: {d['marchamo_ida'] or '—'}")
+                        st.caption(f"Tarimas: {d['tarimas']} · Roles: {d['roles']} · Cajas: {d['cajas']}")
+                        if idx == len(destinos_viaje) and marchamo_regreso_actual:
+                            st.markdown(f":material/lock: **Marchamo Regreso:** {marchamo_regreso_actual}")
+                        st.markdown("---")
+
+        st.markdown("---")
+        with st.container(border=True):
+            st.markdown("##### :material/lock: CIERRE DEL VIAJE")
+            st.caption("Marchamo de Regreso — se coloca cuando ya se cerraron todas las tiendas.")
+            cc1, cc2 = st.columns([2, 1])
+            with cc1:
                 marchamo_regreso_viaje = st.text_input("Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}", label_visibility="collapsed", placeholder="Marchamo de Regreso")
-                if destinos_viaje:
-                    destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
-
+            if destinos_viaje:
+                destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
+            with cc2:
                 guardar_click = st.button(":material/print: Generar Viaje e Imprimir", use_container_width=True, type="primary")
 
         if guardar_click:
@@ -1512,16 +1524,16 @@ with tab2:
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         roles_dev = st.number_input(
-                            "Roles devueltos", min_value=0, step=1, key=f"roldev_{d['id']}"
-                        )
+                            "Roles devueltos", min_value=0, step=1, value=None, placeholder="0", key=f"roldev_{d['id']}"
+                        ) or 0
                     with c2:
                         tarimas_dev = st.number_input(
-                            "Tarimas devueltas", min_value=0, step=1, key=f"tardev_{d['id']}"
-                        )
+                            "Tarimas devueltas", min_value=0, step=1, value=None, placeholder="0", key=f"tardev_{d['id']}"
+                        ) or 0
                     with c3:
                         pacas_dev = st.number_input(
-                            "Pacas de cartón devueltas", min_value=0, step=1, key=f"pacdev_{d['id']}"
-                        )
+                            "Pacas de cartón devueltas", min_value=0, step=1, value=None, placeholder="0", key=f"pacdev_{d['id']}"
+                        ) or 0
                     destinos_actualizados.append({
                         "id": d["id"],
                         "roles_devueltos": roles_dev,
@@ -1624,9 +1636,6 @@ with tab2:
 # MÓDULO 3: REPORTES (pendiente de construir)
 # ==========================================
 with tab3:
-    precio_diesel_semana = st.number_input("⛽ Precio Diésel por Galón ($)", min_value=1.0, value=4.50, step=0.10)
-    st.markdown("---")
-
     reporte_sel = st.selectbox(
         "Reporte", ["Bitácora de Viajes", "Control de Retornable (próximamente)", "Cajas por Camión (próximamente)"]
     )
