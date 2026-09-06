@@ -290,8 +290,11 @@ def init_db():
         # ---- Tablas de catálogos (antes vivían "quemadas" en el código Python) ----
         cur.execute("CREATE TABLE IF NOT EXISTS cat_transportistas (nombre TEXT PRIMARY KEY)")
         cur.execute("ALTER TABLE cat_transportistas ADD COLUMN IF NOT EXISTS razon_social TEXT")
+        cur.execute("ALTER TABLE cat_transportistas ADD COLUMN IF NOT EXISTS codigo SERIAL")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_pilotos (nombre TEXT PRIMARY KEY)")
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS codigo SERIAL")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_auxiliares (nombre TEXT PRIMARY KEY)")
+        cur.execute("ALTER TABLE cat_auxiliares ADD COLUMN IF NOT EXISTS codigo SERIAL")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_camiones (
                 placa TEXT PRIMARY KEY, tipo TEXT, transportista TEXT, piloto TEXT, auxiliar TEXT
@@ -303,6 +306,10 @@ def init_db():
                 PRIMARY KEY (cliente, tienda)
             )
         """)
+        # Código numérico de tienda: se digita a mano (debe combinar con el código
+        # real que uses en otros sistemas — WMS, ERP, etc.) para poder cruzar
+        # información más adelante.
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS codigo_tienda INTEGER")
         # El diésel ya NO se calcula con un galonaje fijo por tienda: depende del
         # rendimiento (km por galón) de cada tipo de camión, así que un viaje en una
         # unidad de 5 Ton consume distinto que uno de 10 Ton a la misma distancia.
@@ -453,13 +460,16 @@ def actualizar_default_camion(placa, piloto, auxiliar):
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
 CATALOGOS_CONFIG = {
-    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social"], "clave": ["nombre"], "numericas": []},
-    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
-    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
+    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social"], "clave": ["nombre"],
+                       "numericas": [], "solo_lectura": ["codigo"]},
+    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"], "clave": ["nombre"], "numericas": [],
+               "solo_lectura": ["codigo"]},
+    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"], "clave": ["nombre"], "numericas": [],
+                  "solo_lectura": ["codigo"]},
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"],
                  "clave": ["placa"], "numericas": []},
-    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "km"],
-                           "clave": ["cliente", "tienda"], "numericas": ["km"]},
+    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km"],
+                           "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"]},
     "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"],
@@ -1686,9 +1696,18 @@ with tab4:
         config = CATALOGOS_CONFIG[catalogo_sel]
 
         st.markdown("#### Datos actuales")
-        df_actual = leer_catalogo_actual(config["tabla"], config["columnas"])
-        st.dataframe(df_actual, use_container_width=True, height=280)
+        columnas_mostrar = config["columnas"] + config.get("solo_lectura", [])
+        df_actual_completo = leer_catalogo_actual(config["tabla"], columnas_mostrar)
+        df_actual = df_actual_completo[config["columnas"]]  # sin las de solo lectura, para el resto de la lógica
+        st.dataframe(df_actual_completo, use_container_width=True, height=280)
         st.caption(f"{len(df_actual)} registro(s) actualmente.")
+        st.download_button(
+            ":material/download: Descargar datos actuales (Excel)",
+            data=exportar_excel(df_actual_completo),
+            file_name=f"{config['tabla']}_actual.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"descargar_actual_{catalogo_sel}"
+        )
 
         st.markdown("#### ➕ Agregar o corregir UN registro")
         st.caption("Para un cambio puntual, sin tener que subir un Excel completo. Si la llave "
