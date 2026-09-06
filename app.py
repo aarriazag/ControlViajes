@@ -815,6 +815,38 @@ def obtener_reporte_liquidaciones(fecha_inicio, fecha_fin, cliente="Todos"):
         return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
+def obtener_reporte_retornable(fecha_inicio, fecha_fin, cliente="Todos"):
+    """Kardex de material retornable (Roles, Tarimas, Pacas de Cartón) por tienda:
+    cuánto se envió, cuánto ha regresado, y cuánto debería seguir en la tienda.
+    Los retornos solo cuentan si el viaje ya está Liquidado — mientras esté
+    Pendiente, ese material sigue contando como "en tienda" (correcto: todavía
+    no se ha confirmado su regreso). Las cajas NO son retornables, por eso no
+    aparecen aquí."""
+    with closing(get_conn()) as conn:
+        query = """
+            SELECT
+                v.cliente AS "Cliente",
+                d.tienda AS "Tienda",
+                SUM(d.roles) AS "Roles Enviados",
+                SUM(COALESCE(d.roles_devueltos, 0)) AS "Roles Retornados",
+                SUM(d.tarimas) AS "Tarimas Enviadas",
+                SUM(COALESCE(d.tarimas_devueltas, 0)) AS "Tarimas Retornadas",
+                SUM(COALESCE(d.pacas_carton_devueltas, 0)) AS "Pacas Cartón Retornadas"
+            FROM destinos d
+            JOIN viajes v ON v.id = d.viaje_id
+            WHERE v.estado != 'Anulado'
+              AND v.fecha_creacion BETWEEN %s AND %s
+              AND (%s = 'Todos' OR v.cliente = %s)
+            GROUP BY v.cliente, d.tienda
+            ORDER BY v.cliente, d.tienda
+        """
+        df = pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+        if not df.empty:
+            df["Roles Saldo en Tienda"] = df["Roles Enviados"] - df["Roles Retornados"]
+            df["Tarimas Saldo en Tienda"] = df["Tarimas Enviadas"] - df["Tarimas Retornadas"]
+        return df
+
+
 def buscar_viajes(valor_busqueda):
     """Busca viajes por coincidencia PARCIAL (no exacta) de No. de Viaje, Marchamo de
     Ida (de cualquiera de sus destinos), o Placa. Devuelve una lista (puede tener
@@ -1889,7 +1921,7 @@ with tab5:
 # ==========================================
 with tab3:
     reporte_sel = st.selectbox(
-        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable (próximamente)", "Cajas por Camión (próximamente)"]
+        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable", "Cajas por Camión (próximamente)"]
     )
 
     if reporte_sel == "Bitácora de Viajes":
@@ -1997,6 +2029,71 @@ with tab3:
                     )
         else:
             st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
+
+    elif reporte_sel == "Control de Retornable":
+        st.subheader(":material/inventory_2: Control de Retornable")
+        st.caption("Roles, Tarimas y Pacas de Cartón — las cajas no son retornables, por eso no aparecen aquí. "
+                   "Mientras un viaje esté Pendiente de Liquidar, su material se cuenta como 'todavía en tienda'.")
+
+        rcol1, rcol2, rcol3, rcol4 = st.columns([1, 1, 1, 1])
+        with rcol1:
+            fecha_ini_r = st.date_input("Desde", value=ahora().date() - timedelta(days=30), key="fecha_ini_ret_rep")
+        with rcol2:
+            fecha_fin_r = st.date_input("Hasta", value=ahora().date(), key="fecha_fin_ret_rep")
+        with rcol3:
+            clientes_reporte_r = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
+            cliente_reporte_r = st.selectbox("Cliente", clientes_reporte_r, key="cliente_ret_rep")
+        with rcol4:
+            material_sel = st.selectbox("Material", ["Todos", "Roles", "Tarimas", "Pacas de Cartón"], key="material_ret_rep")
+
+        generar_r = st.button(":material/search: Generar", key="btn_generar_ret_rep")
+        if generar_r:
+            st.session_state["df_retornable"] = obtener_reporte_retornable(fecha_ini_r, fecha_fin_r, cliente_reporte_r)
+
+        df_ret = st.session_state.get("df_retornable")
+        if df_ret is not None:
+            if df_ret.empty:
+                st.info("No hay movimientos en ese rango de fechas para ese cliente.")
+            else:
+                columnas_por_material = {
+                    "Todos": ["Cliente", "Tienda", "Roles Enviados", "Roles Retornados", "Roles Saldo en Tienda",
+                              "Tarimas Enviadas", "Tarimas Retornadas", "Tarimas Saldo en Tienda",
+                              "Pacas Cartón Retornadas"],
+                    "Roles": ["Cliente", "Tienda", "Roles Enviados", "Roles Retornados", "Roles Saldo en Tienda"],
+                    "Tarimas": ["Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas", "Tarimas Saldo en Tienda"],
+                    "Pacas de Cartón": ["Cliente", "Tienda", "Pacas Cartón Retornadas"],
+                }
+                df_mostrar_r = df_ret[columnas_por_material[material_sel]]
+
+                kcol1, kcol2, kcol3 = st.columns(3)
+                if material_sel in ("Todos", "Roles"):
+                    kcol1.metric("Total Roles en Tiendas", int(df_ret["Roles Saldo en Tienda"].sum()))
+                if material_sel in ("Todos", "Tarimas"):
+                    kcol2.metric("Total Tarimas en Tiendas", int(df_ret["Tarimas Saldo en Tienda"].sum()))
+                if material_sel in ("Todos", "Pacas de Cartón"):
+                    kcol3.metric("Total Pacas Cartón Retornadas", int(df_ret["Pacas Cartón Retornadas"].sum()))
+
+                st.dataframe(df_mostrar_r, use_container_width=True, height=420)
+
+                ecol1, ecol2 = st.columns(2)
+                with ecol1:
+                    st.download_button(
+                        ":material/download: Exportar a Excel",
+                        data=exportar_excel(df_mostrar_r),
+                        file_name=f"retornable_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key="excel_ret_rep"
+                    )
+                with ecol2:
+                    st.download_button(
+                        ":material/download: Exportar a CSV",
+                        data=df_mostrar_r.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"retornable_{fecha_ini_r}_a_{fecha_fin_r}.csv",
+                        mime="text/csv",
+                        use_container_width=True, key="csv_ret_rep"
+                    )
+        else:
+            st.info("Elige el rango de fechas, cliente y material, y presiona Generar.")
     else:
         st.info("Este reporte todavía no está construido — lo armamos en la próxima ronda.")
 
