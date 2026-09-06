@@ -355,6 +355,10 @@ def init_db():
         # real que uses en otros sistemas — WMS, ERP, etc.) para poder cruzar
         # información más adelante.
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS codigo_tienda INTEGER")
+        # Clasificación Local/Departamental: es un dato FIJO de la tienda (su
+        # ubicación), no algo que se decida viaje a viaje — se configura aquí y
+        # el Despacho solo la muestra, ya no se puede escoger ahí.
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS clasificacion TEXT DEFAULT 'Local'")
         # El diésel ya NO se calcula con un galonaje fijo por tienda: depende del
         # rendimiento (km por galón) de cada tipo de camión, así que un viaje en una
         # unidad de 5 Ton consume distinto que uno de 10 Ton a la misma distancia.
@@ -530,10 +534,10 @@ def cargar_catalogos_desde_db():
         camiones = {r["placa"]: {"tipo": r["tipo"], "transportista": r["transportista"],
                                   "piloto": r["piloto"], "auxiliar": r["auxiliar"]} for r in cur.fetchall()}
 
-        cur.execute("SELECT cliente, tienda, km FROM cat_clientes_tiendas ORDER BY cliente, tienda")
+        cur.execute("SELECT cliente, tienda, km, clasificacion FROM cat_clientes_tiendas ORDER BY cliente, tienda")
         clientes = {}
         for r in cur.fetchall():
-            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"]}
+            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "clasificacion": r["clasificacion"] or "Local"}
 
         cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion")
         rendimiento = {r["tipo"]: r["km_por_galon"] for r in cur.fetchall()}
@@ -728,7 +732,7 @@ CATALOGOS_CONFIG = {
                   "solo_lectura": ["codigo"]},
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"],
                  "clave": ["placa"], "numericas": []},
-    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km"],
+    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"]},
     "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
@@ -1754,7 +1758,10 @@ with tab1:
                             with mf3:
                                 roles = st.number_input("Roles Secos", min_value=0, step=1, value=None, placeholder="0", key=f"r_{run}_{i}") or 0
                             with mf4:
-                                tipo_pago = st.selectbox("Clasificación de Destino", ["Local", "Departamental"], key=f"tipopago_{run}_{i}")
+                                # Ya no se elige aquí — es un dato fijo configurado en el
+                                # catálogo de Tiendas, y esta pantalla solo lo muestra.
+                                tipo_pago = tiendas_cliente[tienda]["clasificacion"] if tienda else "Local"
+                                st.text_input("Clasificación de Destino", value=tipo_pago, disabled=True, key=f"tipopago_{run}_{i}")
 
                             if es_cliente_unisuper:
                                 dc1, dc2, dc3, dc4 = st.columns(4)
@@ -2158,9 +2165,10 @@ with tab5:
                                 pg_e = st.number_input("Cartas Sol. P&G", min_value=0, step=1, value=d["pg_cajas"] or 0, key=f"epg_{d['id']}")
                             obs_e = st.text_area("Observaciones", value=d["incidencias"] or "", key=f"eobs_{d['id']}")
                             es_comp_e = st.checkbox("¿Es complemento?", value=d["es_complemento"], key=f"ecomp_{d['id']}")
-                            opciones_pago = ["Local", "Departamental"]
-                            idx_pago = opciones_pago.index(d["tipo_pago"]) if d["tipo_pago"] in opciones_pago else 0
-                            tipo_pago_e = st.selectbox("Clasificación de Destino", opciones_pago, index=idx_pago, key=f"etipopago_{d['id']}")
+                            # Ya no se elige — se deriva de la tienda seleccionada arriba,
+                            # igual que en Despacho (es un dato fijo del catálogo).
+                            tipo_pago_e = tiendas_cliente_g.get(tienda_e, {}).get("clasificacion", "Local")
+                            st.text_input("Clasificación de Destino", value=tipo_pago_e, disabled=True, key=f"etipopago_{d['id']}")
                             destinos_editados.append({
                                 "id": d["id"], "orden": d["orden"], "tienda": tienda_e,
                                 "roles": roles_e, "tarimas": tarimas_e, "cajas": cajas_e,
@@ -2519,6 +2527,8 @@ with tab4:
             elif col == "transportista" and catalogo_sel == "Camiones":
                 transportistas_existentes = sorted(st.session_state.catalogos["transportistas"])
                 valores_form["transportista"] = st.selectbox("Transportista", transportistas_existentes, key=f"campo_{catalogo_sel}_transportista_sel") if transportistas_existentes else ""
+            elif col == "clasificacion":
+                valores_form["clasificacion"] = st.selectbox("Clasificación (Local/Departamental)", ["Local", "Departamental"], key=f"campo_{catalogo_sel}_clasificacion_sel")
             elif col in config["numericas"]:
                 valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
             else:
