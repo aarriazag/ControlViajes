@@ -1370,7 +1370,7 @@ def generar_hoja_control_html(viaje, destinos):
         <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
         {bloques_destino}
         <div class="footer">
-            <span>Hoja generada por el sistema Control de Ruta · Ransa · Ideado por Ángel Arriaza</span>
+            <span>Hoja generada por el sistema Control de Ruta · Ransa</span>
             <span>Sellar y entregar al finalizar el viaje para su liquidación.</span>
         </div>
     </div>
