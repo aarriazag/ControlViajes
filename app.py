@@ -5,6 +5,11 @@ import psycopg2
 import psycopg2.extras
 import json
 import io
+import os
+import hashlib
+import binascii
+import secrets
+import string
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import closing
@@ -20,6 +25,46 @@ ZONA_HORARIA = ZoneInfo("America/Guatemala")
 
 def ahora():
     return datetime.now(ZONA_HORARIA)
+
+
+# --- CONTRASEÑAS: nunca se guardan en texto plano. Se guarda una sal (salt)
+# aleatoria por usuario + el resultado de aplicarle PBKDF2-SHA256 con muchas
+# iteraciones a la contraseña — así, aunque alguien viera la base de datos, no
+# puede recuperar la contraseña original. ---
+ITERACIONES_HASH = 260_000
+
+
+def hash_password(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    hash_bytes = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERACIONES_HASH)
+    return binascii.hexlify(salt).decode(), binascii.hexlify(hash_bytes).decode()
+
+
+def password_coincide(password, salt_hex, hash_hex):
+    if not salt_hex or not hash_hex:
+        return False
+    _, calculado = hash_password(password, salt_hex)
+    return secrets.compare_digest(calculado, hash_hex)
+
+
+def generar_password_temporal(longitud=10):
+    alfabeto = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alfabeto) for _ in range(longitud))
+
+
+def registrar_auditoria(usuario, accion, detalle=""):
+    """Deja rastro de quién hizo qué y cuándo. Es 'best effort': si por algo
+    falla, no debe tumbar la operación que se estaba auditando — solo se
+    registra el fallo en la consola del servidor."""
+    try:
+        with closing(get_conn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO auditoria (fecha_hora, usuario, accion, detalle) VALUES (%s,%s,%s,%s)",
+                (ahora().replace(tzinfo=None), usuario, accion, detalle)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[auditoria] No se pudo registrar: {e}")
 
 # --- SISTEMA DE DISEÑO RANSA ---
 # Paleta: verde corporativo como color de marca, grises neutros para texto y
@@ -324,6 +369,11 @@ def init_db():
             )
         """)
         cur.execute("CREATE TABLE IF NOT EXISTS cat_usuarios (usuario TEXT PRIMARY KEY, perfil TEXT)")
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS password_hash TEXT")
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS password_salt TEXT")
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS debe_cambiar_password BOOLEAN DEFAULT TRUE")
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS creado_por TEXT")
         # Qué clientes puede ver/trabajar cada usuario (excepto Administrador, que ve todos).
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_usuario_clientes (
@@ -333,6 +383,16 @@ def init_db():
         # Clientes como catálogo propio (antes solo existían "implícitos" dentro de
         # Clientes y Tiendas) — necesario para poder referenciarlos con llave foránea.
         cur.execute("CREATE TABLE IF NOT EXISTS cat_clientes (id SERIAL, nombre TEXT PRIMARY KEY)")
+        # Bitácora de auditoría: quién hizo qué y cuándo, en toda la app.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS auditoria (
+                id SERIAL PRIMARY KEY,
+                fecha_hora TIMESTAMP NOT NULL,
+                usuario TEXT NOT NULL,
+                accion TEXT NOT NULL,
+                detalle TEXT
+            )
+        """)
         conn.commit()
 
         # Sembrar datos de ejemplo SOLO la primera vez (tablas vacías), para que la
@@ -401,6 +461,20 @@ def init_db():
             ON CONFLICT (nombre) DO NOTHING
         """)
         conn.commit()
+
+        # Contraseña temporal para cualquier usuario que todavía no tenga una
+        # (los 3 usuarios de ejemplo, o upgrades desde una versión sin login real).
+        # Todos quedan forzados a cambiarla en su primer ingreso.
+        cur.execute("SELECT usuario FROM cat_usuarios WHERE password_hash IS NULL")
+        usuarios_sin_password = [r[0] for r in cur.fetchall()]
+        if usuarios_sin_password:
+            salt_temp, hash_temp = hash_password("Ransa2026")
+            for u in usuarios_sin_password:
+                cur.execute(
+                    "UPDATE cat_usuarios SET password_hash=%s, password_salt=%s, debe_cambiar_password=TRUE WHERE usuario=%s",
+                    (hash_temp, salt_temp, u)
+                )
+            conn.commit()
 
         # ---- Llaves foráneas con actualización en cascada ----
         # Esto es lo que de verdad evita que renombrar un piloto/auxiliar/
@@ -500,6 +574,131 @@ def clientes_permitidos_para(usuario, perfil):
     return [c for c in st.session_state.catalogos["usuario_clientes"].get(usuario, []) if c in todos]
 
 
+def _credenciales_validas(usuario, password):
+    """Chequeo puro de usuario+contraseña, SIN dejar rastro en la auditoría —
+    lo usa verificar_login() (que sí audita) y el cambio de contraseña propia
+    (que no debe registrarse como si fuera un intento de inicio de sesión)."""
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT usuario, perfil, password_hash, password_salt, activo, debe_cambiar_password "
+            "FROM cat_usuarios WHERE usuario = %s", (usuario,)
+        )
+        row = cur.fetchone()
+        if not row or not row["activo"] or not password_coincide(password, row["password_salt"], row["password_hash"]):
+            return None
+        return {"perfil": row["perfil"], "debe_cambiar_password": row["debe_cambiar_password"]}
+
+
+def verificar_login(usuario, password):
+    """Como _credenciales_validas(), pero además deja rastro en la auditoría —
+    tanto de los intentos exitosos como de los fallidos. Úsalo solo en la
+    pantalla de inicio de sesión."""
+    resultado = _credenciales_validas(usuario, password)
+    if resultado is None:
+        registrar_auditoria(usuario or "(vacío)", "Intento de login FALLIDO")
+    else:
+        registrar_auditoria(usuario, "Login exitoso")
+    return resultado
+
+
+def establecer_password(usuario, password_nueva, forzar_cambio_siguiente=False, cambiado_por=None):
+    salt, hashed = hash_password(password_nueva)
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE cat_usuarios SET password_hash=%s, password_salt=%s, debe_cambiar_password=%s WHERE usuario=%s",
+                    (hashed, salt, forzar_cambio_siguiente, usuario)
+                )
+            conn.commit()
+            quien = cambiado_por or usuario
+            accion = "Cambiar su propia contraseña" if quien == usuario else "Restablecer contraseña de otro usuario"
+            registrar_auditoria(quien, accion, f"Usuario afectado: {usuario}")
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def crear_usuario(usuario, perfil, creado_por):
+    """Crea un usuario nuevo con una contraseña temporal generada al azar
+    (se le muestra una sola vez a quien lo crea, para que se la pase a la persona).
+    Queda forzado a cambiarla en su primer ingreso."""
+    password_temp = generar_password_temporal()
+    salt, hashed = hash_password(password_temp)
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO cat_usuarios (usuario, perfil, password_hash, password_salt, activo, "
+                    "debe_cambiar_password, creado_por) VALUES (%s,%s,%s,%s,TRUE,TRUE,%s)",
+                    (usuario, perfil, hashed, salt, creado_por)
+                )
+            conn.commit()
+            registrar_auditoria(creado_por, "Crear usuario", f"Usuario nuevo: {usuario} · Perfil: {perfil}")
+            return True, password_temp
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def cambiar_estado_usuario(usuario, activo, quien_cambia):
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cat_usuarios SET activo=%s WHERE usuario=%s", (activo, usuario))
+            conn.commit()
+            registrar_auditoria(quien_cambia, "Activar/Desactivar usuario",
+                                 f"Usuario: {usuario} · Nuevo estado: {'Activo' if activo else 'Desactivado'}")
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def cambiar_perfil_usuario(usuario, perfil_nuevo, quien_cambia):
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cat_usuarios SET perfil=%s WHERE usuario=%s", (perfil_nuevo, usuario))
+            conn.commit()
+            registrar_auditoria(quien_cambia, "Cambiar perfil de usuario", f"Usuario: {usuario} · Nuevo perfil: {perfil_nuevo}")
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def listar_usuarios_gestion(perfiles=None):
+    """Lista de usuarios para la pantalla de Gestión de Usuarios. Si se pasa
+    `perfiles`, solo devuelve usuarios con esos perfiles (para que un Supervisor
+    no vea ni pueda tocar cuentas de Administrador u otro Supervisor)."""
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if perfiles:
+            cur.execute(
+                "SELECT usuario, perfil, activo, debe_cambiar_password, creado_por FROM cat_usuarios "
+                "WHERE perfil = ANY(%s) ORDER BY usuario", (perfiles,)
+            )
+        else:
+            cur.execute(
+                "SELECT usuario, perfil, activo, debe_cambiar_password, creado_por FROM cat_usuarios ORDER BY usuario"
+            )
+        return cur.fetchall()
+
+
+def obtener_auditoria(fecha_inicio, fecha_fin, usuario_filtro="Todos", limite=500):
+    with closing(get_conn()) as conn:
+        query = """
+            SELECT fecha_hora AS "Fecha y Hora", usuario AS "Usuario", accion AS "Acción", detalle AS "Detalle"
+            FROM auditoria
+            WHERE fecha_hora::date BETWEEN %s AND %s
+              AND (%s = 'Todos' OR usuario = %s)
+            ORDER BY fecha_hora DESC
+            LIMIT %s
+        """
+        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), usuario_filtro, usuario_filtro, limite))
+
+
 def actualizar_default_camion(placa, piloto, auxiliar):
     """Cada vez que se guarda un viaje, el camión 'aprende' el piloto/auxiliar
     usado esta vez y lo deja como default para la próxima — así no siempre hay
@@ -535,15 +734,20 @@ CATALOGOS_CONFIG = {
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"],
                         "clave": ["cliente", "cd"], "numericas": []},
-    "Usuarios": {"tabla": "cat_usuarios", "columnas": ["usuario", "perfil"], "clave": ["usuario"], "numericas": []},
+    # "Usuarios" ya no se gestiona aquí como catálogo genérico — crear una cuenta
+    # necesita generarle una contraseña, así que vive en la pestaña "Usuarios"
+    # dedicada (Gestión de Usuarios), no en un data_editor de texto plano.
     "Acceso Usuario → Cliente": {"tabla": "cat_usuario_clientes", "columnas": ["usuario", "cliente"],
                                  "clave": ["usuario", "cliente"], "numericas": []},
 }
 
 
-def agregar_o_actualizar_registro(tabla, columnas, clave, valores):
+def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clientes_permitidos=None):
     """Inserta un registro nuevo, o lo actualiza si la llave ya existe (upsert),
     para poder corregir un solo dato sin tener que resubir todo el Excel."""
+    if clientes_permitidos is not None and "cliente" in columnas:
+        if str(valores.get("cliente", "")).strip() not in clientes_permitidos:
+            return False, f"No tienes acceso al cliente '{valores.get('cliente')}'."
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
@@ -558,19 +762,26 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores):
                     query += f" ON CONFLICT ({', '.join(clave)}) DO NOTHING"
                 cur.execute(query, tuple(valores[c] for c in columnas))
             conn.commit()
+            registrar_auditoria(usuario, "Agregar/Actualizar registro de catálogo",
+                                 f"Tabla {tabla} · {', '.join(f'{c}={valores[c]}' for c in clave)}")
             return True, "OK"
         except Exception as e:
             conn.rollback()
             return False, str(e)
 
 
-def eliminar_registro(tabla, clave, valores_clave):
+def eliminar_registro(tabla, clave, valores_clave, usuario, clientes_permitidos=None):
+    if clientes_permitidos is not None and "cliente" in clave:
+        if str(valores_clave.get("cliente", "")).strip() not in clientes_permitidos:
+            return False, f"No tienes acceso al cliente '{valores_clave.get('cliente')}'."
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
                 where_sql = " AND ".join(f"{c} = %s" for c in clave)
                 cur.execute(f"DELETE FROM {tabla} WHERE {where_sql}", tuple(valores_clave[c] for c in clave))
             conn.commit()
+            registrar_auditoria(usuario, "Eliminar registro de catálogo",
+                                 f"Tabla {tabla} · {', '.join(f'{c}={valores_clave[c]}' for c in clave)}")
             return True, "OK"
         except Exception as e:
             conn.rollback()
@@ -590,15 +801,30 @@ def leer_catalogo_actual(tabla, columnas):
         return pd.read_sql_query(f"SELECT {', '.join(columnas)} FROM {tabla}", conn)
 
 
-def sincronizar_catalogo(tabla, columnas, clave, df_nuevo):
+def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_permitidos=None):
     """Sincroniza un catálogo contra un DataFrame (Excel subido o editado en pantalla):
     agrega registros nuevos, actualiza los que cambiaron (upsert), y borra los que ya
     no aparecen — EXCEPTO si están en uso en otra tabla (Camiones, Viajes), en cuyo
     caso Postgres bloquea ESE borrado puntual (llave foránea) y seguimos con el resto,
-    avisando al final cuáles no se pudieron quitar."""
+    avisando al final cuáles no se pudieron quitar.
+
+    Si `clientes_permitidos` no es None (alguien con acceso limitado a ciertos
+    clientes, ej. un Administrador de Catálogos), la comparación de "qué ya no
+    aparece y hay que borrar" se hace SOLO contra las filas de esos clientes —
+    así es imposible que se toque, ni se borre, un cliente que esa persona ni
+    siquiera puede ver en pantalla."""
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
+                # Si alguien tiene acceso limitado, cualquier fila que venga en el
+                # archivo/tabla debe ser de un cliente permitido — si no, la
+                # rechazamos aquí mismo, antes de tocar la base de datos.
+                if clientes_permitidos is not None and "cliente" in columnas:
+                    fuera_de_alcance = {str(row["cliente"]).strip() for _, row in df_nuevo.iterrows()
+                                        if str(row["cliente"]).strip() not in clientes_permitidos}
+                    if fuera_de_alcance:
+                        return False, f"No tienes acceso a estos clientes: {', '.join(fuera_de_alcance)}"
+
                 # Si esta tabla tiene columna "cliente", hay que asegurar que esos
                 # clientes ya existan en cat_clientes ANTES de sincronizar — si no,
                 # la llave foránea rechaza cualquier cliente nuevo que venga en el archivo.
@@ -607,7 +833,10 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo):
                     for c in clientes_del_archivo:
                         cur.execute("INSERT INTO cat_clientes (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING", (c,))
 
-                cur.execute(f"SELECT {', '.join(clave)} FROM {tabla}")
+                if clientes_permitidos is not None and "cliente" in columnas:
+                    cur.execute(f"SELECT {', '.join(clave)} FROM {tabla} WHERE cliente = ANY(%s)", (clientes_permitidos,))
+                else:
+                    cur.execute(f"SELECT {', '.join(clave)} FROM {tabla}")
                 claves_actuales = {tuple(str(v) for v in row) for row in cur.fetchall()}
                 claves_nuevas = {tuple(str(row[c]).strip() for c in clave) for _, row in df_nuevo.iterrows()}
 
@@ -633,6 +862,7 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo):
                     cur.execute(query, tuple(row[c] for c in columnas))
 
             conn.commit()
+            registrar_auditoria(usuario, "Sincronizar catálogo (Excel/tabla)", f"Tabla {tabla} · {len(df_nuevo)} fila(s)")
             if no_borrables:
                 return True, f"⚠️ Guardado, pero esto sigue existiendo porque está en uso en Camiones o Viajes: {', '.join(no_borrables)}"
             return True, "OK"
@@ -718,6 +948,7 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                          dest.get("tipo_pago", "Local"))
                     )
             conn.commit()
+            registrar_auditoria(usuario, "Crear viaje", f"Viaje {id_viaje_str} · Cliente {cliente} · Placa {placa}")
             return True, id_viaje_str
         except psycopg2.IntegrityError as e:
             conn.rollback()
@@ -831,7 +1062,7 @@ def obtener_reporte_retornable(fecha_inicio, fecha_fin, cliente="Todos"):
                 SUM(COALESCE(d.roles_devueltos, 0)) AS "Roles Retornados",
                 SUM(d.tarimas) AS "Tarimas Enviadas",
                 SUM(COALESCE(d.tarimas_devueltas, 0)) AS "Tarimas Retornadas",
-                SUM(COALESCE(d.pacas_carton_devueltas, 0)) AS "Pacas Cartón Retornadas"
+                SUM(COALESCE(d.pacas_carton_devueltas, 0)) AS "Pacas de Cartón Retornadas"
             FROM destinos d
             JOIN viajes v ON v.id = d.viaje_id
             WHERE v.estado != 'Anulado'
@@ -903,13 +1134,14 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
                         "WHERE viaje_id = %s", (viaje_id,)
                     )
             conn.commit()
+            registrar_auditoria(usuario, "Anular viaje", f"Viaje ID {viaje_id} · Motivo: {motivo}")
             return True, "OK"
         except Exception as e:
             conn.rollback()
             return False, str(e)
 
 
-def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados, marchamo_regreso_viaje):
+def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados, marchamo_regreso_viaje, usuario_editor):
     """Corrige los datos de un viaje ya guardado (solo permitido mientras esté
     'Pendiente de Liquidar'). destinos_actualizados es una lista de dicts con el
     id de cada destino y sus campos corregidos. El Marchamo de Regreso es UNO solo
@@ -945,6 +1177,7 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                          d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"], d["id"])
                     )
             conn.commit()
+            registrar_auditoria(usuario_editor, "Editar viaje", f"Viaje ID {viaje_id} · Placa {placa}")
             return True, "OK"
         except Exception as e:
             conn.rollback()
@@ -1001,9 +1234,11 @@ def generar_hoja_control_html(viaje, destinos):
         bloques_destino += f"""
         <div class="destino-card">
             <div class="destino-header">
-                <span class="destino-num">{idx}</span> {d['tienda']}
-                <span class="marchamo-inline">🔒 {d['marchamo_ida']}</span>
-                {badge_complemento}
+                <div class="destino-header-izq">
+                    <span class="destino-num">{idx}</span> {d['tienda']}
+                    <span class="marchamo-inline">🔒 {d['marchamo_ida']}</span>
+                    {badge_complemento}
+                </div>
                 {badge_regreso}
             </div>
             <div class="destino-body">
@@ -1025,7 +1260,7 @@ def generar_hoja_control_html(viaje, destinos):
                 <div class="material-devuelto">
                     <div class="etiqueta">{"DEVUELTO POR LA TIENDA (LIQUIDADO)" if esta_liquidado else "DEVUELTO POR LA TIENDA (LLENAR A MANO)"}</div>
                     <div class="grid-encabezados">
-                        <span>ROLES</span><span>TARIMAS</span><span>PACAS CARTÓN</span>
+                        <span>ROLES</span><span>TARIMAS</span><span>PACAS DE CARTÓN</span>
                     </div>
                     <div class="material-grid">{devuelto_boxes}
                     </div>
@@ -1063,14 +1298,17 @@ def generar_hoja_control_html(viaje, destinos):
         .titulo-destinos {{ background: #0B4A32; color: white; padding: 3px 10px; font-weight: bold;
                              border-radius: 4px; margin-bottom: 6px; font-size: 12px; }}
         .destino-card {{ border: 1px solid #ccc; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
-        .destino-header {{ background: #eef6ef; padding: 4px 10px; font-weight: bold; position: relative; font-size: 12px; }}
-        .destino-num {{ background: #0B4A32; color: white; border-radius: 50%; padding: 1px 7px; margin-right: 5px; font-size: 11px; }}
-        .marchamo-inline {{ margin-left: 10px; font-size: 11px; font-weight: 600; color: #0B4A32;
+        .destino-header {{ background: #eef6ef; padding: 4px 10px; font-weight: bold; font-size: 12px;
+                            display: flex; align-items: center; justify-content: space-between;
+                            flex-wrap: wrap; gap: 6px; }}
+        .destino-header-izq {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }}
+        .destino-num {{ background: #0B4A32; color: white; border-radius: 50%; padding: 1px 7px; font-size: 11px; }}
+        .marchamo-inline {{ font-size: 11px; font-weight: 600; color: #0B4A32;
                              background: #fff; border: 1px solid #0B4A32; border-radius: 4px; padding: 1px 8px; }}
-        .badge-regreso {{ float: right; background: #B5622E; color: white; padding: 3px 12px;
-                           border-radius: 4px; font-size: 13px; font-weight: bold; }}
+        .badge-regreso {{ background: #B5622E; color: white; padding: 3px 12px;
+                           border-radius: 4px; font-size: 13px; font-weight: bold; white-space: nowrap; }}
         .badge-complemento {{ background: #7A3E1D; color: white; padding: 1px 8px;
-                               border-radius: 4px; font-size: 10px; margin-left: 6px; }}
+                               border-radius: 4px; font-size: 10px; }}
         .destino-body {{ display: flex; }}
         .material-enviado, .material-devuelto {{ flex: 1; padding: 5px 8px; }}
         .material-devuelto {{ border-left: 2px dashed #ccc; }}
@@ -1132,7 +1370,7 @@ def generar_hoja_control_html(viaje, destinos):
         <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
         {bloques_destino}
         <div class="footer">
-            <span>Hoja generada por el sistema Control de Ruta · Ransa</span>
+            <span>Hoja generada por el sistema Control de Ruta · Ransa · Ideado por Ángel Arriaza</span>
             <span>Sellar y entregar al finalizar el viaje para su liquidación.</span>
         </div>
     </div>
@@ -1161,6 +1399,7 @@ def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
                     (usuario, fecha_hoy, hora_hoy, viaje_id)
                 )
             conn.commit()
+            registrar_auditoria(usuario, "Liquidar viaje", f"Viaje ID {viaje_id}")
             return True, "OK"
         except Exception as e:
             conn.rollback()
@@ -1198,9 +1437,10 @@ except Exception as e:
     st.stop()
 
 # --- PANTALLA 1: LOGIN ---
-# Todavía no valida contraseña (eso queda pendiente para cuando resolvamos
-# seguridad de verdad), pero exige un clic físico explícito para entrar — no
-# avanza solo. Sirve como primera barrera visual mientras estamos en User Test.
+# Usuario y contraseña reales: la contraseña se valida contra un hash seguro
+# guardado en la base de datos (nunca en texto plano). El campo de usuario es
+# de texto libre, no una lista desplegable, para no exponer a cualquier
+# visitante qué nombres de usuario existen en el sistema.
 if not st.session_state.get("login_confirmado"):
     st.markdown("""
         <div class="ransa-topbar" style="justify-content:center;">
@@ -1214,27 +1454,87 @@ if not st.session_state.get("login_confirmado"):
     with col_centro:
         with st.container(border=True):
             st.markdown("#### :material/lock: Iniciar Sesión")
-            usuario_login = st.selectbox("Usuario", list(st.session_state.catalogos["usuarios"].keys()))
-            st.caption(f"Perfil: **{st.session_state.catalogos['usuarios'][usuario_login]}**")
+            usuario_login = st.text_input("Usuario")
+            password_login = st.text_input("Contraseña", type="password")
             if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
-                st.session_state["usuario_activo_fijo"] = usuario_login
-                st.session_state["login_confirmado"] = True
-                st.rerun()
-    st.caption("⚠️ Validación de usuario simulada — falta la contraseña real, pendiente para cuando resolvamos seguridad.")
+                resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
+                if resultado_login:
+                    st.session_state["usuario_activo_fijo"] = usuario_login.strip()
+                    st.session_state["perfil_activo_fijo"] = resultado_login["perfil"]
+                    st.session_state["debe_cambiar_password"] = resultado_login["debe_cambiar_password"]
+                    st.session_state["login_confirmado"] = True
+                    st.rerun()
+                else:
+                    st.error("❌ Usuario o contraseña incorrectos.")
     st.stop()
 
 usuario_activo = st.session_state["usuario_activo_fijo"]
-perfil_activo = st.session_state.catalogos["usuarios"][usuario_activo]
+perfil_activo = st.session_state["perfil_activo_fijo"]
+
+# --- PANTALLA 1B: Cambio de contraseña obligatorio (primer ingreso, o tras un
+# restablecimiento). No se puede pasar de aquí sin poner una contraseña nueva.
+if st.session_state.get("debe_cambiar_password"):
+    st.markdown("""
+        <div class="ransa-topbar" style="justify-content:center;">
+            <div style="text-align:center;">
+                <div class="titulo">:material/key: Cambio de Contraseña Obligatorio</div>
+                <div class="subtitulo">Define una contraseña nueva para continuar</div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    col_izq2, col_centro2, col_der2 = st.columns([1, 1.2, 1])
+    with col_centro2:
+        with st.container(border=True):
+            nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres)", type="password", key="nueva_pw_1")
+            nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="nueva_pw_2")
+            if st.button(":material/check: Guardar Contraseña", use_container_width=True):
+                if len(nueva1) < 8:
+                    st.error("❌ La contraseña debe tener al menos 8 caracteres.")
+                elif nueva1 != nueva2:
+                    st.error("❌ Las dos contraseñas no coinciden.")
+                else:
+                    ok, msg = establecer_password(usuario_activo, nueva1, forzar_cambio_siguiente=False)
+                    if ok:
+                        st.session_state["debe_cambiar_password"] = False
+                        st.success("✅ Contraseña actualizada.")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Error: {msg}")
+    st.stop()
 
 st.sidebar.success(f"👤 **{usuario_activo}**")
 st.sidebar.caption(f"Perfil: {perfil_activo}")
+with st.sidebar.expander(":material/key: Cambiar mi contraseña"):
+    pw_actual = st.text_input("Contraseña actual", type="password", key="pw_actual_sidebar")
+    pw_nueva1 = st.text_input("Nueva contraseña", type="password", key="pw_nueva1_sidebar")
+    pw_nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="pw_nueva2_sidebar")
+    if st.button("Actualizar Contraseña", key="btn_pw_sidebar"):
+        if not _credenciales_validas(usuario_activo, pw_actual):
+            st.error("❌ La contraseña actual no es correcta.")
+        elif len(pw_nueva1) < 8:
+            st.error("❌ La nueva contraseña debe tener al menos 8 caracteres.")
+        elif pw_nueva1 != pw_nueva2:
+            st.error("❌ Las dos contraseñas nuevas no coinciden.")
+        else:
+            ok, msg = establecer_password(usuario_activo, pw_nueva1, forzar_cambio_siguiente=False)
+            if ok:
+                st.success("✅ Contraseña actualizada.")
+            else:
+                st.error(f"❌ Error: {msg}")
 if st.sidebar.button(":material/logout: Cerrar Sesión"):
     st.session_state["login_confirmado"] = False
     st.session_state["config_bloqueada"] = False
-    del st.session_state["usuario_activo_fijo"]
-    for k in ("cliente_activo_fijo", "cd_origen_fijo"):
+    for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password", "cliente_activo_fijo", "cd_origen_fijo"):
         st.session_state.pop(k, None)
     st.rerun()
+
+# Supervisor solo administra usuarios, y Administrador de Catálogos trabaja con
+# varios clientes a la vez desde Catálogos — ninguno de los dos necesita fijar
+# un solo Cliente/CD por sesión, así que se saltan esa pantalla.
+if perfil_activo in ("Supervisor", "Administrador de Catálogos"):
+    st.session_state["config_bloqueada"] = True
+    st.session_state.setdefault("cliente_activo_fijo", "")
+    st.session_state.setdefault("cd_origen_fijo", "")
 
 # --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
 # cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
@@ -1302,12 +1602,13 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 st.markdown("---")
 
-tab1, tab2, tab5, tab3, tab4 = st.tabs([
+tab1, tab2, tab5, tab3, tab4, tab6 = st.tabs([
     ":material/local_shipping: Despacho (Salidas)",
     ":material/receipt_long: Recepción (Liquidaciones)",
     ":material/edit_document: Gestión de Viajes",
     ":material/bar_chart: Reportes",
-    ":material/settings: Catálogos"
+    ":material/settings: Catálogos",
+    ":material/manage_accounts: Usuarios"
 ])
 
 # ==========================================
@@ -1832,7 +2133,7 @@ with tab5:
                         aux_idx = aux_disp.index(viaje_g["auxiliar"]) if viaje_g["auxiliar"] in aux_disp else 0
                         auxiliar_edit = st.selectbox("Auxiliar", aux_disp, index=aux_idx, key=f"edit_aux_{viaje_g['id']}")
 
-                        st.markdown("##### Datos por tienda")
+                        st.markdown("##### DATOS POR TIENDA")
                         destinos_editados = []
                         for d in sorted(destinos_g, key=lambda x: x["orden"]):
                             tiendas_opciones = list(tiendas_cliente_g.keys())
@@ -1871,7 +2172,7 @@ with tab5:
                             })
                             st.markdown("---")
 
-                        st.markdown("##### Cierre del Viaje")
+                        st.markdown("##### CIERRE DEL VIAJE")
                         marchamo_regreso_actual_g = next((d["marchamo_regreso"] for d in destinos_g if d["marchamo_regreso"]), "")
                         marchamo_regreso_edit = st.text_input(
                             "Marchamo de Regreso (único para todo el viaje — se valida en la última tienda)",
@@ -1883,7 +2184,8 @@ with tab5:
                                 st.error("❌ El Marchamo de Regreso es obligatorio.")
                             else:
                                 ok, msg = editar_viaje(viaje_g["id"], placa_edit, transportista_edit, piloto_edit,
-                                                       auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip())
+                                                       auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip(),
+                                                       usuario_activo)
                                 if ok:
                                     st.success(f"Viaje {viaje_g['id_viaje']} corregido.")
                                     del st.session_state["viaje_gestion"]
@@ -2058,10 +2360,10 @@ with tab3:
                 columnas_por_material = {
                     "Todos": ["Cliente", "Tienda", "Roles Enviados", "Roles Retornados", "Roles Saldo en Tienda",
                               "Tarimas Enviadas", "Tarimas Retornadas", "Tarimas Saldo en Tienda",
-                              "Pacas Cartón Retornadas"],
+                              "Pacas de Cartón Retornadas"],
                     "Roles": ["Cliente", "Tienda", "Roles Enviados", "Roles Retornados", "Roles Saldo en Tienda"],
                     "Tarimas": ["Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas", "Tarimas Saldo en Tienda"],
-                    "Pacas de Cartón": ["Cliente", "Tienda", "Pacas Cartón Retornadas"],
+                    "Pacas de Cartón": ["Cliente", "Tienda", "Pacas de Cartón Retornadas"],
                 }
                 df_mostrar_r = df_ret[columnas_por_material[material_sel]]
 
@@ -2071,7 +2373,7 @@ with tab3:
                 if material_sel in ("Todos", "Tarimas"):
                     kcol2.metric("Total Tarimas en Tiendas", int(df_ret["Tarimas Saldo en Tienda"].sum()))
                 if material_sel in ("Todos", "Pacas de Cartón"):
-                    kcol3.metric("Total Pacas Cartón Retornadas", int(df_ret["Pacas Cartón Retornadas"].sum()))
+                    kcol3.metric("Total Pacas de Cartón Retornadas", int(df_ret["Pacas de Cartón Retornadas"].sum()))
 
                 st.dataframe(df_mostrar_r, use_container_width=True, height=420)
 
@@ -2102,17 +2404,31 @@ with tab3:
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
 with tab4:
-    if perfil_activo != "Administrador":
-        st.info("Solo el perfil Administrador puede gestionar catálogos.")
+    if perfil_activo not in ["Administrador", "Administrador de Catálogos"]:
+        st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
     else:
         st.header(":material/settings: Gestión de Catálogos")
-        st.caption("Descarga la plantilla, llénala en Excel y súbela para reemplazar ese catálogo. "
-                    "Los demás catálogos no se tocan.")
 
-        catalogo_sel = st.selectbox("Catálogo a gestionar", list(CATALOGOS_CONFIG.keys()))
+        if perfil_activo == "Administrador":
+            catalogos_disponibles = list(CATALOGOS_CONFIG.keys())
+            mis_clientes = None  # sin restricción
+            st.caption("Descarga la plantilla, llénala en Excel y súbela para actualizar ese catálogo.")
+        else:
+            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Acceso Usuario → Cliente"]
+            mis_clientes = clientes_permitidos_para(usuario_activo, perfil_activo)
+            st.caption(f"Como Administrador de Catálogos, solo ves y editas datos de: **{', '.join(mis_clientes) or '(ningún cliente asignado)'}**. "
+                       "Los catálogos compartidos (Pilotos, Camiones, Transportistas, Rendimiento) los administra Administrador.")
+            if not mis_clientes:
+                st.warning("🚫 Todavía no tienes ningún cliente asignado — pídele a un Administrador que te dé acceso "
+                           "desde la pestaña de Usuarios.")
+                st.stop()
+
+        catalogo_sel = st.selectbox("Catálogo a gestionar", catalogos_disponibles)
         config = CATALOGOS_CONFIG[catalogo_sel]
         columnas_mostrar = config["columnas"] + config.get("solo_lectura", [])
         df_actual_completo = leer_catalogo_actual(config["tabla"], columnas_mostrar)
+        if mis_clientes is not None and "cliente" in config["columnas"]:
+            df_actual_completo = df_actual_completo[df_actual_completo["cliente"].isin(mis_clientes)]
         df_actual = df_actual_completo[config["columnas"]]  # sin las de solo lectura, para el resto de la lógica
 
         st.markdown("#### :material/table_edit: Edición rápida en tabla")
@@ -2128,7 +2444,7 @@ with tab4:
             if faltan.any():
                 st.error(f"❌ Hay fila(s) sin llenar la llave ({', '.join(config['clave'])}). Complétalas o bórralas antes de guardar.")
             else:
-                ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_editado[config["columnas"]])
+                ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_editado[config["columnas"]], usuario_activo, mis_clientes)
                 if ok:
                     st.success("✅ Tabla actualizada.")
                     if msg != "OK":
@@ -2156,18 +2472,32 @@ with tab4:
             if col == "cliente":
                 # Selector en vez de texto libre: evita que cada persona escriba el
                 # mismo cliente con variaciones distintas (typos, mayúsculas, espacios).
-                clientes_existentes = sorted(st.session_state.catalogos["clientes_lista"])
-                cliente_elegido = st.selectbox(
-                    "Cliente", clientes_existentes + [NUEVO_CLIENTE_OPCION], key=f"campo_{catalogo_sel}_cliente_sel"
-                )
-                if cliente_elegido == NUEVO_CLIENTE_OPCION:
-                    valores_form["cliente"] = st.text_input("Nombre del cliente nuevo", key=f"campo_{catalogo_sel}_cliente_nuevo")
+                # Si hay alcance limitado (Administrador de Catálogos), solo puede
+                # elegir entre SUS clientes, y no puede crear uno nuevo.
+                if mis_clientes is not None:
+                    clientes_existentes = sorted(mis_clientes)
+                    valores_form["cliente"] = st.selectbox("Cliente", clientes_existentes, key=f"campo_{catalogo_sel}_cliente_sel")
                 else:
-                    valores_form["cliente"] = cliente_elegido
+                    clientes_existentes = sorted(st.session_state.catalogos["clientes_lista"])
+                    cliente_elegido = st.selectbox(
+                        "Cliente", clientes_existentes + [NUEVO_CLIENTE_OPCION], key=f"campo_{catalogo_sel}_cliente_sel"
+                    )
+                    if cliente_elegido == NUEVO_CLIENTE_OPCION:
+                        valores_form["cliente"] = st.text_input("Nombre del cliente nuevo", key=f"campo_{catalogo_sel}_cliente_nuevo")
+                    else:
+                        valores_form["cliente"] = cliente_elegido
             elif col == "usuario" and catalogo_sel != "Usuarios":
                 # En "Acceso Usuario → Cliente" el usuario debe ser uno que ya
-                # exista en el catálogo de Usuarios, no texto libre.
-                usuarios_existentes = sorted(st.session_state.catalogos["usuarios"].keys())
+                # exista en el catálogo de Usuarios, no texto libre. Si quien
+                # gestiona tiene alcance limitado, solo puede dar acceso a cuentas
+                # Operador/Liquidador — nunca a otro Administrador de Catálogos,
+                # Supervisor, o Administrador.
+                if mis_clientes is not None:
+                    usuarios_existentes = sorted(
+                        u for u, p in st.session_state.catalogos["usuarios"].items() if p in ("Operador", "Liquidador")
+                    )
+                else:
+                    usuarios_existentes = sorted(st.session_state.catalogos["usuarios"].keys())
                 valores_form["usuario"] = st.selectbox("Usuario", usuarios_existentes, key=f"campo_{catalogo_sel}_usuario_sel")
             elif col == "tipo" and catalogo_sel == "Rendimiento por Camión":
                 # Los tonelajes válidos son los que ya existen en el catálogo de
@@ -2201,9 +2531,11 @@ with tab4:
             else:
                 # Si el registro trae un cliente que todavía no existe en el catálogo
                 # de Clientes, hay que crearlo primero — si no, la llave foránea lo rechaza.
-                if "cliente" in valores_form and catalogo_sel != "Clientes":
-                    agregar_o_actualizar_registro("cat_clientes", ["nombre"], ["nombre"], {"nombre": valores_form["cliente"]})
-                ok, msg = agregar_o_actualizar_registro(config["tabla"], config["columnas"], config["clave"], valores_form)
+                # (Solo aplica cuando NO hay alcance limitado — un Administrador de
+                # Catálogos nunca puede crear un cliente nuevo.)
+                if "cliente" in valores_form and catalogo_sel != "Clientes" and mis_clientes is None:
+                    agregar_o_actualizar_registro("cat_clientes", ["nombre"], ["nombre"], {"nombre": valores_form["cliente"]}, usuario_activo)
+                ok, msg = agregar_o_actualizar_registro(config["tabla"], config["columnas"], config["clave"], valores_form, usuario_activo, mis_clientes)
                 if ok:
                     st.success("✅ Registro guardado.")
                     st.session_state.catalogos = cargar_catalogos_desde_db()
@@ -2217,7 +2549,7 @@ with tab4:
             registro_borrar = st.selectbox("Selecciona el registro a eliminar", opciones_borrar, key=f"del_sel_{catalogo_sel}")
             if st.button(":material/delete: Eliminar Registro Seleccionado", key=f"del_btn_{catalogo_sel}"):
                 valores_clave = dict(zip(config["clave"], registro_borrar.split(" | ")))
-                ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave)
+                ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave, usuario_activo, mis_clientes)
                 if ok:
                     st.success("✅ Registro eliminado.")
                     st.session_state.catalogos = cargar_catalogos_desde_db()
@@ -2255,7 +2587,7 @@ with tab4:
                                f"'{catalogo_sel}': {len(df_actual)} registro(s) actuales → {len(df_nuevo)} en el archivo.")
                     confirmar = st.checkbox("Confirmo este cambio", key=f"conf_{catalogo_sel}")
                     if st.button("🔄 Actualizar Catálogo", disabled=not confirmar):
-                        ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_nuevo)
+                        ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_nuevo, usuario_activo, mis_clientes)
                         if ok:
                             st.success(f"✅ Catálogo '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s).")
                             if msg != "OK":
@@ -2266,3 +2598,153 @@ with tab4:
                             st.error(f"❌ Error al actualizar: {msg}")
             except Exception as e:
                 st.error(f"❌ No se pudo leer el archivo: {e}")
+
+# ==========================================
+# MÓDULO 6: GESTIÓN DE USUARIOS — Administrador ve y administra a todos;
+# Supervisor solo ve/administra cuentas Operador y Liquidador (no puede tocar
+# Administrador ni crear otro Supervisor).
+# ==========================================
+with tab6:
+    if perfil_activo not in ["Administrador", "Supervisor"]:
+        st.info("Tu perfil no tiene acceso a la gestión de usuarios.")
+    else:
+        st.header(":material/manage_accounts: Gestión de Usuarios")
+
+        if perfil_activo == "Administrador":
+            perfiles_visibles = None  # ve todos
+            perfiles_asignables = ["Administrador", "Administrador de Catálogos", "Operador", "Liquidador", "Supervisor"]
+            st.caption("Ves y administras todas las cuentas.")
+        else:
+            perfiles_visibles = ["Operador", "Liquidador"]
+            perfiles_asignables = ["Operador", "Liquidador"]
+            st.caption("Como Supervisor, solo ves y administras cuentas Operador y Liquidador.")
+
+        st.markdown("#### Usuarios actuales")
+        usuarios_lista = listar_usuarios_gestion(perfiles_visibles)
+        if usuarios_lista:
+            df_usuarios = pd.DataFrame(usuarios_lista)
+            df_usuarios["activo"] = df_usuarios["activo"].map({True: "✅ Activo", False: "🚫 Desactivado"})
+            df_usuarios["debe_cambiar_password"] = df_usuarios["debe_cambiar_password"].map({True: "Sí", False: "No"})
+            df_usuarios.columns = ["Usuario", "Perfil", "Estado", "Debe Cambiar Contraseña", "Creado Por"]
+            st.dataframe(df_usuarios, use_container_width=True, height=250)
+        else:
+            st.caption("No hay usuarios para mostrar.")
+
+        st.markdown("---")
+        st.markdown("#### :material/person_add: Crear usuario nuevo")
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            nuevo_usuario = st.text_input("Nombre de usuario", key="nuevo_usuario_gestion")
+        with nc2:
+            nuevo_perfil = st.selectbox("Perfil", perfiles_asignables, key="nuevo_perfil_gestion")
+        if st.button(":material/person_add: Crear Usuario", key="btn_crear_usuario"):
+            if not nuevo_usuario.strip():
+                st.warning("Escribe un nombre de usuario.")
+            else:
+                ok, resultado = crear_usuario(nuevo_usuario.strip(), nuevo_perfil, usuario_activo)
+                if ok:
+                    st.success(f"✅ Usuario '{nuevo_usuario.strip()}' creado.")
+                    st.info(f"🔑 Contraseña temporal (cópiala y pásasela — no se vuelve a mostrar): **{resultado}**")
+                    st.caption("Quedará forzado a cambiarla en su primer ingreso.")
+                    st.session_state.catalogos = cargar_catalogos_desde_db()
+                else:
+                    st.error(f"❌ Error: {resultado}")
+
+        st.markdown("---")
+        st.markdown("#### :material/key: Restablecer contraseña")
+        usuarios_gestionables = [u["usuario"] for u in usuarios_lista]
+        if usuarios_gestionables:
+            usuario_reset = st.selectbox("Usuario", usuarios_gestionables, key="usuario_reset_gestion")
+            if st.button(":material/key: Generar Nueva Contraseña Temporal", key="btn_reset_password"):
+                password_temp = generar_password_temporal()
+                ok, msg = establecer_password(usuario_reset, password_temp, forzar_cambio_siguiente=True, cambiado_por=usuario_activo)
+                if ok:
+                    st.success(f"✅ Contraseña restablecida para '{usuario_reset}'.")
+                    st.info(f"🔑 Contraseña temporal (cópiala y pásasela): **{password_temp}**")
+                    st.caption("Quedará forzado a cambiarla en su próximo ingreso.")
+                else:
+                    st.error(f"❌ Error: {msg}")
+        else:
+            st.caption("No hay usuarios disponibles para restablecer.")
+
+        st.markdown("---")
+        st.markdown("#### :material/toggle_on: Activar / Desactivar cuenta")
+        if usuarios_gestionables:
+            usuario_toggle = st.selectbox("Usuario", usuarios_gestionables, key="usuario_toggle_gestion")
+            estado_actual = next((u["activo"] for u in usuarios_lista if u["usuario"] == usuario_toggle), True)
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                if estado_actual and st.button(":material/block: Desactivar Cuenta", key="btn_desactivar"):
+                    ok, msg = cambiar_estado_usuario(usuario_toggle, False, usuario_activo)
+                    if ok:
+                        st.success(f"Cuenta de '{usuario_toggle}' desactivada.")
+                        st.session_state.catalogos = cargar_catalogos_desde_db()
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Error: {msg}")
+            with tc2:
+                if not estado_actual and st.button(":material/check_circle: Reactivar Cuenta", key="btn_reactivar"):
+                    ok, msg = cambiar_estado_usuario(usuario_toggle, True, usuario_activo)
+                    if ok:
+                        st.success(f"Cuenta de '{usuario_toggle}' reactivada.")
+                        st.session_state.catalogos = cargar_catalogos_desde_db()
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Error: {msg}")
+
+        if perfil_activo == "Administrador":
+            st.markdown("---")
+            st.markdown("#### :material/history: Bitácora de Auditoría")
+            st.caption("Quién hizo qué y cuándo — viajes creados/editados/anulados/liquidados, cambios en "
+                       "catálogos, y eventos de usuarios (incluye intentos de login fallidos).")
+            acol1, acol2, acol3, acol4 = st.columns([1, 1, 1.3, 0.7])
+            with acol1:
+                fecha_ini_aud = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key="fecha_ini_aud")
+            with acol2:
+                fecha_fin_aud = st.date_input("Hasta", value=ahora().date(), key="fecha_fin_aud")
+            with acol3:
+                usuarios_aud = ["Todos"] + sorted(st.session_state.catalogos["usuarios"].keys())
+                usuario_filtro_aud = st.selectbox("Usuario", usuarios_aud, key="usuario_filtro_aud")
+            with acol4:
+                st.write("")
+                generar_aud = st.button(":material/search: Ver", use_container_width=True, key="btn_ver_auditoria")
+
+            if generar_aud:
+                st.session_state["df_auditoria"] = obtener_auditoria(fecha_ini_aud, fecha_fin_aud, usuario_filtro_aud)
+
+            df_aud = st.session_state.get("df_auditoria")
+            if df_aud is not None:
+                if df_aud.empty:
+                    st.info("No hay actividad registrada en ese rango de fechas.")
+                else:
+                    st.dataframe(df_aud, use_container_width=True, height=380)
+                    acol_e1, acol_e2 = st.columns(2)
+                    with acol_e1:
+                        st.download_button(
+                            ":material/download: Exportar a Excel",
+                            data=exportar_excel(df_aud),
+                            file_name=f"auditoria_{fecha_ini_aud}_a_{fecha_fin_aud}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True, key="excel_aud"
+                        )
+                    with acol_e2:
+                        st.download_button(
+                            ":material/download: Exportar a CSV",
+                            data=df_aud.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"auditoria_{fecha_ini_aud}_a_{fecha_fin_aud}.csv",
+                            mime="text/csv",
+                            use_container_width=True, key="csv_aud"
+                        )
+            else:
+                st.info("Elige el rango de fechas y presiona 'Ver'.")
+
+# ==========================================
+# PIE DE PÁGINA DE LA HERRAMIENTA (visible en toda la app)
+# ==========================================
+st.markdown("---")
+st.markdown(
+    "<div style='text-align:center; color:#5B6169; font-size:12px; padding:8px 0;'>"
+    "Ransa · Sistema de Control de Ruta · Ideado por Ángel Arriaza"
+    "</div>",
+    unsafe_allow_html=True
+)
