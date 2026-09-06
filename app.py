@@ -123,7 +123,54 @@ st.markdown("""
 
         /* Reduce el padding superior por defecto de Streamlit para que la topbar quede pegada arriba */
         .block-container { padding-top: 1.6rem; }
-    </style>
+
+        /* --- Inputs, selects, textareas: look de producto moderno, no de formulario
+           de los 2000s --- */
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stTextArea"] textarea,
+        div[data-baseweb="select"] > div {
+            border-radius: 8px !important;
+            border-color: var(--gris-borde) !important;
+            font-size: 14px !important;
+        }
+        div[data-testid="stTextInput"] input:focus,
+        div[data-testid="stNumberInput"] input:focus,
+        div[data-testid="stTextArea"] textarea:focus,
+        div[data-baseweb="select"] > div:focus-within {
+            border-color: var(--ransa-verde) !important;
+            box-shadow: 0 0 0 2px rgba(0, 105, 62, 0.15) !important;
+        }
+        label[data-testid="stWidgetLabel"] p {
+            font-size: 13px !important;
+            font-weight: 600 !important;
+            color: var(--gris-texto) !important;
+        }
+
+        /* Toggle en verde de marca en vez del rojo/azul por defecto */
+        div[data-testid="stToggle"] label div[data-checked="true"] {
+            background-color: var(--ransa-verde) !important;
+        }
+
+        /* Expanders con el mismo look de tarjeta que el resto de la app */
+        div[data-testid="stExpander"] {
+            border: 1px solid var(--gris-borde) !important;
+            border-radius: 10px !important;
+            box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+        }
+
+        /* Alertas con acento de color a la izquierda, look más "SaaS" */
+        div[data-testid="stAlertContentSuccess"] { border-left: 4px solid #16794C; padding-left: 10px; }
+        div[data-testid="stAlertContentInfo"] { border-left: 4px solid #2563AE; padding-left: 10px; }
+        div[data-testid="stAlertContentWarning"] { border-left: 4px solid #B7791F; padding-left: 10px; }
+        div[data-testid="stAlertContentError"] { border-left: 4px solid #C53030; padding-left: 10px; }
+
+        /* Encabezados de sección con un poco más de aire */
+        h3, h4 { margin-top: 0.6rem; }
+
+        /* Dataframes con esquinas redondeadas consistentes */
+        div[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; border: 1px solid var(--gris-borde); }
+        </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
@@ -221,8 +268,16 @@ def init_db():
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_clientes_tiendas (
-                cliente TEXT, tienda TEXT, km REAL, galones_base REAL,
+                cliente TEXT, tienda TEXT, km REAL,
                 PRIMARY KEY (cliente, tienda)
+            )
+        """)
+        # El diésel ya NO se calcula con un galonaje fijo por tienda: depende del
+        # rendimiento (km por galón) de cada tipo de camión, así que un viaje en una
+        # unidad de 5 Ton consume distinto que uno de 10 Ton a la misma distancia.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_rendimiento_camion (
+                tipo TEXT PRIMARY KEY, km_por_galon REAL
             )
         """)
         cur.execute("""
@@ -231,6 +286,12 @@ def init_db():
             )
         """)
         cur.execute("CREATE TABLE IF NOT EXISTS cat_usuarios (usuario TEXT PRIMARY KEY, perfil TEXT)")
+        # Qué clientes puede ver/trabajar cada usuario (excepto Administrador, que ve todos).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_usuario_clientes (
+                usuario TEXT, cliente TEXT, PRIMARY KEY (usuario, cliente)
+            )
+        """)
         conn.commit()
 
         # Sembrar datos de ejemplo SOLO la primera vez (tablas vacías), para que la
@@ -250,12 +311,16 @@ def init_db():
                  ("C-789GHI", "20 Ton", "Flota Interna", "Luis Martínez", "José Hernández")]
             )
             cur.executemany(
-                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km, galones_base) VALUES (%s,%s,%s,%s)",
-                [("Dollarcity", "Dollarcity Zona 10", 15.5, 3.5),
-                 ("Dollarcity", "Dollarcity Mixco", 32.0, 7.0),
-                 ("UniSuper", "UniSuper Central", 22.1, 5.0),
-                 ("UniSuper Importados", "UniSuper Importados Norte", 18.0, 4.0),
-                 ("UniSuper LTX", "UniSuper LTX Sur", 45.3, 10.0)]
+                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km) VALUES (%s,%s,%s)",
+                [("Dollarcity", "Dollarcity Zona 10", 15.5),
+                 ("Dollarcity", "Dollarcity Mixco", 32.0),
+                 ("UniSuper", "UniSuper Central", 22.1),
+                 ("UniSuper Importados", "UniSuper Importados Norte", 18.0),
+                 ("UniSuper LTX", "UniSuper LTX Sur", 45.3)]
+            )
+            cur.executemany(
+                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon) VALUES (%s,%s)",
+                [("5 Ton", 8.0), ("10 Ton", 6.0), ("20 Ton", 4.0)]
             )
             cur.executemany(
                 "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s)",
@@ -267,6 +332,13 @@ def init_db():
             cur.executemany(
                 "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s)",
                 [("Admin_Logistica", "Administrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
+            )
+            # Por defecto, los usuarios de ejemplo (no-Administrador) ven todos los
+            # clientes sembrados, para no romper nada mientras ajustas los accesos reales.
+            cur.executemany(
+                "INSERT INTO cat_usuario_clientes (usuario, cliente) VALUES (%s,%s)",
+                [(u, c) for u in ("Op_Salidas", "Liq_Transporte")
+                 for c in ("Dollarcity", "UniSuper", "UniSuper Importados", "UniSuper LTX")]
             )
             conn.commit()
 
@@ -291,15 +363,23 @@ def cargar_catalogos_desde_db():
         camiones = {r["placa"]: {"tipo": r["tipo"], "transportista": r["transportista"],
                                   "piloto": r["piloto"], "auxiliar": r["auxiliar"]} for r in cur.fetchall()}
 
-        cur.execute("SELECT cliente, tienda, km, galones_base FROM cat_clientes_tiendas ORDER BY cliente, tienda")
+        cur.execute("SELECT cliente, tienda, km FROM cat_clientes_tiendas ORDER BY cliente, tienda")
         clientes = {}
         for r in cur.fetchall():
-            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "galones_base": r["galones_base"]}
+            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"]}
+
+        cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion")
+        rendimiento = {r["tipo"]: r["km_por_galon"] for r in cur.fetchall()}
 
         cur.execute("SELECT cliente, cd FROM cat_cds_por_cliente ORDER BY cliente, cd")
         cds_por_cliente = {}
         for r in cur.fetchall():
             cds_por_cliente.setdefault(r["cliente"], []).append(r["cd"])
+
+        cur.execute("SELECT usuario, cliente FROM cat_usuario_clientes")
+        usuario_clientes = {}
+        for r in cur.fetchall():
+            usuario_clientes.setdefault(r["usuario"], []).append(r["cliente"])
 
         return {
             "usuarios": usuarios,
@@ -308,8 +388,35 @@ def cargar_catalogos_desde_db():
             "auxiliares": auxiliares,
             "camiones": camiones,
             "clientes": clientes,
-            "cds_por_cliente": cds_por_cliente
+            "rendimiento": rendimiento,
+            "cds_por_cliente": cds_por_cliente,
+            "usuario_clientes": usuario_clientes
         }
+
+
+def clientes_permitidos_para(usuario, perfil):
+    """Administrador ve todos los clientes; cualquier otro perfil solo ve los
+    clientes que tenga asignados en el catálogo de accesos."""
+    todos = list(st.session_state.catalogos["clientes"].keys())
+    if perfil == "Administrador":
+        return todos
+    return [c for c in st.session_state.catalogos["usuario_clientes"].get(usuario, []) if c in todos]
+
+
+def actualizar_default_camion(placa, piloto, auxiliar):
+    """Cada vez que se guarda un viaje, el camión 'aprende' el piloto/auxiliar
+    usado esta vez y lo deja como default para la próxima — así no siempre hay
+    que asignarlo a mano, pero se puede seguir cambiando cuando haga falta."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE cat_camiones SET piloto=%s, auxiliar=%s WHERE placa=%s",
+                    (piloto, auxiliar, placa)
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()  # si falla, no es crítico — el viaje ya se guardó bien
 
 
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
@@ -320,11 +427,15 @@ CATALOGOS_CONFIG = {
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"], "clave": ["nombre"], "numericas": []},
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"],
                  "clave": ["placa"], "numericas": []},
-    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "km", "galones_base"],
-                           "clave": ["cliente", "tienda"], "numericas": ["km", "galones_base"]},
+    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "km"],
+                           "clave": ["cliente", "tienda"], "numericas": ["km"]},
+    "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
+                               "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"],
                         "clave": ["cliente", "cd"], "numericas": []},
     "Usuarios": {"tabla": "cat_usuarios", "columnas": ["usuario", "perfil"], "clave": ["usuario"], "numericas": []},
+    "Acceso Usuario → Cliente": {"tabla": "cat_usuario_clientes", "columnas": ["usuario", "cliente"],
+                                 "clave": ["usuario", "cliente"], "numericas": []},
 }
 
 
@@ -599,7 +710,6 @@ def generar_hoja_control_html(viaje, destinos):
     de Ransa, pero al imprimir (@media print) los fondos de color se vuelven blancos
     y solo quedan bordes negros, para que salga limpia en una impresora blanco y negro."""
     marchamo_ida_general = destinos[0]["marchamo_ida"] if destinos else ""
-    marchamo_regreso = next((d["marchamo_regreso"] for d in destinos if d["marchamo_regreso"]), "")
     es_cliente_unisuper = viaje["cliente"].startswith("UniSuper")
 
     bloques_destino = ""
@@ -643,22 +753,32 @@ def generar_hoja_control_html(viaje, destinos):
                         <div class="material-box"><b>{d['tarimas']}</b><span>TARIMAS</span></div>
                         {material_cajas}
                     </div>
-                    <div class="sub-info">No. de Pedidos: <b>{pedidos_txt}</b></div>
+                    <div class="sub-info sub-info-grande">No. de Pedidos: <b>{pedidos_txt}</b></div>
                     {documentos_html}
                     {incidencia_html}
+                    <div class="sello-area">
+                        <span class="etiqueta">SELLO DE TIENDA</span>
+                        <div class="sello-espacio"></div>
+                    </div>
                 </div>
                 <div class="material-devuelto">
                     <div class="etiqueta">DEVUELTO POR LA TIENDA (LLENAR A MANO)</div>
+                    <div class="grid-encabezados">
+                        <span>ROLES</span><span>TARIMAS</span><span>PACAS CARTÓN</span>
+                    </div>
                     <div class="material-grid">
-                        <div class="material-box vacio"><span>ROLES</span></div>
-                        <div class="material-box vacio"><span>TARIMAS</span></div>
-                        <div class="material-box vacio"><span>PACAS CARTÓN</span></div>
+                        <div class="material-box vacio"></div>
+                        <div class="material-box vacio"></div>
+                        <div class="material-box vacio"></div>
                     </div>
                     <div class="etiqueta" style="margin-top:10px;">CONTROL DE TIEMPOS (LLENAR A MANO)</div>
+                    <div class="grid-encabezados">
+                        <span>LLEGADA</span><span>INICIO DESCARGA</span><span>SALIDA</span>
+                    </div>
                     <div class="material-grid">
-                        <div class="material-box vacio"><span>HORA LLEGADA</span></div>
-                        <div class="material-box vacio"><span>INICIO DESCARGA</span></div>
-                        <div class="material-box vacio"><span>HORA SALIDA</span></div>
+                        <div class="material-box vacio"></div>
+                        <div class="material-box vacio"></div>
+                        <div class="material-box vacio"></div>
                     </div>
                 </div>
             </div>
@@ -682,18 +802,13 @@ def generar_hoja_control_html(viaje, destinos):
         .dato label {{ display: block; font-size: 9px; color: #666; text-transform: uppercase; }}
         .dato span {{ font-size: 12px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
         .dato-blanco span {{ border-bottom: 1px dashed #999; min-height: 14px; }}
-        .marchamo-retorno-box {{
-            background: #FFF4EC; border: 2px solid #E8804A; color: #A63603;
-            font-size: 14px; font-weight: bold; text-align: center;
-            padding: 5px; border-radius: 6px; margin-bottom: 8px;
-        }}
         .titulo-destinos {{ background: #00693E; color: white; padding: 3px 10px; font-weight: bold;
                              border-radius: 4px; margin-bottom: 6px; font-size: 12px; }}
         .destino-card {{ border: 1px solid #ccc; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
         .destino-header {{ background: #eef6ef; padding: 4px 10px; font-weight: bold; position: relative; font-size: 12px; }}
         .destino-num {{ background: #00693E; color: white; border-radius: 50%; padding: 1px 7px; margin-right: 5px; font-size: 11px; }}
-        .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 1px 8px;
-                           border-radius: 4px; font-size: 10px; }}
+        .badge-regreso {{ float: right; background: #E8804A; color: white; padding: 3px 12px;
+                           border-radius: 4px; font-size: 13px; font-weight: bold; }}
         .badge-complemento {{ background: #A63603; color: white; padding: 1px 8px;
                                border-radius: 4px; font-size: 10px; margin-left: 6px; }}
         .destino-body {{ display: flex; }}
@@ -706,6 +821,11 @@ def generar_hoja_control_html(viaje, destinos):
         .material-box.vacio {{ min-height: 22px; }}
         .material-box span {{ font-size: 8px; color: #666; }}
         .sub-info {{ font-size: 10px; margin-top: 3px; }}
+        .sub-info-grande {{ font-size: 13px; margin-top: 5px; font-weight: 600; }}
+        .grid-encabezados {{ display: flex; gap: 5px; margin-top: 4px; }}
+        .grid-encabezados span {{ flex: 1; text-align: center; font-size: 8px; color: #666; text-transform: uppercase; }}
+        .sello-area {{ margin-top: 10px; }}
+        .sello-espacio {{ min-height: 46px; }}
         .incidencia {{ font-size: 10px; margin-top: 3px; color: #b34700; }}
         .footer {{ display: flex; justify-content: space-between; font-size: 9px; color: #999; margin-top: 10px; }}
         .btn-imprimir {{ background: #00693E; color: white; border: none; padding: 10px 20px;
@@ -718,7 +838,6 @@ def generar_hoja_control_html(viaje, destinos):
             .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
             .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
             .badge-complemento {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
-            .marchamo-retorno-box {{ background: #fff !important; color: #000 !important; border: 2px solid #000; padding: 3px; }}
             .material-box {{ border: 1px solid #000; }}
             .destino-card {{ break-inside: avoid; }}
         }}
@@ -736,7 +855,6 @@ def generar_hoja_control_html(viaje, destinos):
                    por <b>{viaje['usuario_creador']}</b></p>
             </div>
         </div>
-        {f'<div class="marchamo-retorno-box">🔄 MARCHAMO DE RETORNO: <b>{marchamo_regreso}</b></div>' if marchamo_regreso else ''}
         <div class="datos-grid">
             <div class="dato"><label>No. de Viaje</label><span>{viaje['id_viaje']}</span></div>
             <div class="dato"><label>Cliente</label><span>{viaje['cliente']}</span></div>
@@ -869,7 +987,14 @@ if not st.session_state.get("config_bloqueada"):
             </div>
         </div>
     """, unsafe_allow_html=True)
-    cliente_activo_sel = st.sidebar.selectbox("🎯 Cliente", list(st.session_state.catalogos["clientes"].keys()))
+
+    clientes_disp = clientes_permitidos_para(usuario_activo, perfil_activo)
+    if not clientes_disp:
+        st.error("🚫 Tu usuario no tiene ningún cliente asignado. Pídele a un Administrador que te "
+                 "dé acceso desde la pestaña de Catálogos ('Acceso Usuario → Cliente').")
+        st.stop()
+
+    cliente_activo_sel = st.sidebar.selectbox("🎯 Cliente", clientes_disp)
 
     cds_disponibles = st.session_state.catalogos["cds_por_cliente"].get(cliente_activo_sel, [])
     if len(cds_disponibles) <= 1:
@@ -987,8 +1112,15 @@ with tab1:
                 with col_pedido:
                     pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
                 km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
-                gal_t = tiendas_cliente[tienda]["galones_base"] if tienda else 0.0
-                st.caption(f"Distancia: {km_t} KM | Diésel: {gal_t} Gal")
+                rendimiento_camion = st.session_state.catalogos["rendimiento"].get(cap_pred)
+                if tienda and rendimiento_camion:
+                    gal_t = round(km_t / rendimiento_camion, 2)
+                    st.caption(f"Distancia: {km_t} KM | Diésel estimado ({cap_pred}, {rendimiento_camion} km/gal): {gal_t} Gal")
+                elif tienda:
+                    gal_t = 0.0
+                    st.caption(f"Distancia: {km_t} KM | ⚠️ Sin rendimiento configurado para '{cap_pred}' — agrégalo en Catálogos.")
+                else:
+                    gal_t = 0.0
 
                 es_complemento = st.toggle(
                     "¿Es complemento? (el resto de un pedido que no cupo en un viaje anterior)",
@@ -1141,6 +1273,10 @@ with tab1:
                 )
                 if ok:
                     st.success(f"✅ Viaje {resultado} guardado correctamente.")
+                    # El camión "aprende" el piloto/auxiliar usado esta vez, para
+                    # que la próxima vez ya salga como default (se puede cambiar).
+                    actualizar_default_camion(placa, piloto_final, auxiliar_final)
+                    st.session_state.catalogos = cargar_catalogos_desde_db()
                     st.session_state.num_destinos = 1
                     st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
                     st.session_state["ultimo_viaje_guardado"] = resultado
@@ -1404,6 +1540,11 @@ with tab4:
                     valores_form["cliente"] = st.text_input("Nombre del cliente nuevo", key=f"campo_{catalogo_sel}_cliente_nuevo")
                 else:
                     valores_form["cliente"] = cliente_elegido
+            elif col == "usuario" and catalogo_sel != "Usuarios":
+                # En "Acceso Usuario → Cliente" el usuario debe ser uno que ya
+                # exista en el catálogo de Usuarios, no texto libre.
+                usuarios_existentes = sorted(st.session_state.catalogos["usuarios"].keys())
+                valores_form["usuario"] = st.selectbox("Usuario", usuarios_existentes, key=f"campo_{catalogo_sel}_usuario_sel")
             elif col in config["numericas"]:
                 valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
             else:
