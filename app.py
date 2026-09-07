@@ -153,6 +153,22 @@ st.markdown("""
             background-color: var(--gris-fondo);
             border-right: 1px solid var(--gris-borde);
         }
+        /* Menos espacio vertical entre elementos del sidebar, para minimizar el
+           scroll — sobre todo en pantallas anchas donde el sidebar es angosto
+           pero alto. */
+        section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {
+            gap: 0.35rem;
+        }
+        section[data-testid="stSidebar"] hr {
+            margin: 0.35rem 0 !important;
+        }
+        section[data-testid="stSidebar"] .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 1rem;
+        }
+        section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] {
+            margin-top: -0.3rem;
+        }
 
         /* Alertas (success/info/warning/error) con bordes redondeados consistentes */
         div[data-testid="stAlert"] { border-radius: 8px; }
@@ -270,9 +286,12 @@ def get_conn():
     )
 
 
+@st.cache_resource
 def init_db():
-    """Crea las tablas si no existen todavía. Se puede correr las veces que sea:
-    no borra ni duplica nada si las tablas ya están creadas."""
+    """Crea las tablas si no existen todavía. Con @st.cache_resource, Streamlit
+    la ejecuta UNA sola vez por servidor (no en cada clic de cada usuario) —
+    esto es lo que evita que dos sesiones intenten crear las mismas llaves
+    foráneas al mismo tiempo y choquen entre sí (deadlock)."""
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS contadores (
@@ -1587,8 +1606,9 @@ if not st.session_state.get("config_bloqueada"):
 
     cds_disponibles = st.session_state.catalogos["cds_por_cliente"].get(cliente_activo_sel, [])
     if len(cds_disponibles) <= 1:
+        # Un solo CD posible: se toma como elegido, sin mostrar nada — no hace
+        # falta pedirle confirmación al usuario por algo que no tiene otra opción.
         cd_origen_sel = cds_disponibles[0] if cds_disponibles else ""
-        st.sidebar.info(f"CD Origen (único, automático): **{cd_origen_sel}**")
     else:
         cd_origen_sel = st.sidebar.selectbox("CD Origen", cds_disponibles)
 
