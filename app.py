@@ -1082,6 +1082,29 @@ def obtener_reporte_retornable(fecha_inicio, fecha_fin, cliente="Todos"):
         return df
 
 
+def obtener_reporte_retornable_por_fecha(fecha_inicio, fecha_fin, cliente="Todos"):
+    """Detalle día por día: en cada fecha del viaje, cuánto se envió y cuánto se
+    retornó de cada material, por tienda. Todo queda bajo la fecha del viaje
+    (no la de liquidación) para que no haya confusión al leerlo día a día —
+    el retorno solo tiene valor una vez que ese viaje ya se liquidó, pero se
+    reporta en la misma fila que su envío."""
+    with closing(get_conn()) as conn:
+        query = """
+            SELECT v.fecha_creacion AS "Fecha", v.cliente AS "Cliente", d.tienda AS "Tienda",
+                   SUM(d.roles) AS "Roles Enviados",
+                   SUM(COALESCE(d.roles_devueltos, 0)) AS "Roles Retornados",
+                   SUM(d.tarimas) AS "Tarimas Enviadas",
+                   SUM(COALESCE(d.tarimas_devueltas, 0)) AS "Tarimas Retornadas",
+                   SUM(COALESCE(d.pacas_carton_devueltas, 0)) AS "Pacas de Cartón Retornadas"
+            FROM destinos d JOIN viajes v ON v.id = d.viaje_id
+            WHERE v.estado != 'Anulado' AND v.fecha_creacion BETWEEN %s AND %s
+              AND (%s = 'Todos' OR v.cliente = %s)
+            GROUP BY v.fecha_creacion, v.cliente, d.tienda
+            ORDER BY v.cliente, d.tienda, v.fecha_creacion
+        """
+        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+
+
 def buscar_viajes(valor_busqueda):
     """Busca viajes por coincidencia PARCIAL (no exacta) de No. de Viaje, Marchamo de
     Ida (de cualquiera de sus destinos), o Placa. Devuelve una lista (puede tener
@@ -2359,6 +2382,7 @@ with tab3:
         generar_r = st.button(":material/search: Generar", key="btn_generar_ret_rep")
         if generar_r:
             st.session_state["df_retornable"] = obtener_reporte_retornable(fecha_ini_r, fecha_fin_r, cliente_reporte_r)
+            st.session_state["df_retornable_fecha"] = obtener_reporte_retornable_por_fecha(fecha_ini_r, fecha_fin_r, cliente_reporte_r)
 
         df_ret = st.session_state.get("df_retornable")
         if df_ret is not None:
@@ -2383,25 +2407,62 @@ with tab3:
                 if material_sel in ("Todos", "Pacas de Cartón"):
                     kcol3.metric("Total Pacas de Cartón Retornadas", int(df_ret["Pacas de Cartón Retornadas"].sum()))
 
-                st.dataframe(df_mostrar_r, use_container_width=True, height=420)
+                st.markdown("##### Resumen del rango completo")
+                st.dataframe(df_mostrar_r, use_container_width=True, height=300)
 
                 ecol1, ecol2 = st.columns(2)
                 with ecol1:
                     st.download_button(
-                        ":material/download: Exportar a Excel",
+                        ":material/download: Exportar Resumen a Excel",
                         data=exportar_excel(df_mostrar_r),
-                        file_name=f"retornable_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
+                        file_name=f"retornable_resumen_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True, key="excel_ret_rep"
                     )
                 with ecol2:
                     st.download_button(
-                        ":material/download: Exportar a CSV",
+                        ":material/download: Exportar Resumen a CSV",
                         data=df_mostrar_r.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"retornable_{fecha_ini_r}_a_{fecha_fin_r}.csv",
+                        file_name=f"retornable_resumen_{fecha_ini_r}_a_{fecha_fin_r}.csv",
                         mime="text/csv",
                         use_container_width=True, key="csv_ret_rep"
                     )
+
+                st.markdown("---")
+                st.markdown("##### Detalle día por día")
+                st.caption("Cada fila es la fecha en que salió el viaje: lo enviado ese día, y lo retornado "
+                           "de ese mismo viaje (el retorno solo tiene valor una vez que ya se liquidó).")
+                df_fecha = st.session_state.get("df_retornable_fecha")
+                if df_fecha is None or df_fecha.empty:
+                    st.info("No hay movimientos día por día en ese rango.")
+                else:
+                    columnas_fecha_por_material = {
+                        "Todos": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados",
+                                  "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas"],
+                        "Roles": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados"],
+                        "Tarimas": ["Fecha", "Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas"],
+                        "Pacas de Cartón": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas"],
+                    }
+                    df_fecha_mostrar = df_fecha[columnas_fecha_por_material[material_sel]]
+                    st.dataframe(df_fecha_mostrar, use_container_width=True, height=380)
+
+                    fcol1, fcol2 = st.columns(2)
+                    with fcol1:
+                        st.download_button(
+                            ":material/download: Exportar Detalle a Excel",
+                            data=exportar_excel(df_fecha_mostrar),
+                            file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True, key="excel_ret_rep_fecha"
+                        )
+                    with fcol2:
+                        st.download_button(
+                            ":material/download: Exportar Detalle a CSV",
+                            data=df_fecha_mostrar.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.csv",
+                            mime="text/csv",
+                            use_container_width=True, key="csv_ret_rep_fecha"
+                        )
         else:
             st.info("Elige el rango de fechas, cliente y material, y presiona Generar.")
     else:
