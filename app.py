@@ -1354,8 +1354,8 @@ def generar_hoja_control_html(viaje, destinos):
                             flex-wrap: wrap; gap: 6px; }}
         .destino-header-izq {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }}
         .destino-num {{ background: #0B4A32; color: white; border-radius: 50%; padding: 1px 7px; font-size: 11px; }}
-        .marchamo-inline {{ font-size: 11px; font-weight: 600; color: #0B4A32;
-                             background: #fff; border: 1px solid #0B4A32; border-radius: 4px; padding: 1px 8px; }}
+        .marchamo-inline {{ font-size: 13px; font-weight: bold; color: #0B4A32;
+                             background: #fff; border: 1px solid #0B4A32; border-radius: 4px; padding: 3px 12px; }}
         .badge-regreso {{ background: #B5622E; color: white; padding: 3px 12px;
                            border-radius: 4px; font-size: 13px; font-weight: bold; white-space: nowrap; }}
         .badge-complemento {{ background: #7A3E1D; color: white; padding: 1px 8px;
