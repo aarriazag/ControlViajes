@@ -843,55 +843,56 @@ def leer_catalogo_actual(tabla, columnas):
         return pd.read_sql_query(f"SELECT {', '.join(columnas)} FROM {tabla}", conn)
 
 
-def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_permitidos=None):
-    """Sincroniza un catálogo contra un DataFrame (Excel subido o editado en pantalla):
-    agrega registros nuevos, actualiza los que cambiaron (upsert), y borra los que ya
-    no aparecen — EXCEPTO si están en uso en otra tabla (Camiones, Viajes), en cuyo
-    caso Postgres bloquea ESE borrado puntual (llave foránea) y seguimos con el resto,
-    avisando al final cuáles no se pudieron quitar.
+def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_permitidos=None, permitir_borrado=False):
+    """Agrega/actualiza (upsert) los registros del DataFrame. Por defecto NUNCA
+    borra nada — así quedó la carga masiva por Excel, para que un archivo
+    incompleto jamás pueda perder datos sin que nadie se dé cuenta.
 
-    Si `clientes_permitidos` no es None (alguien con acceso limitado a ciertos
-    clientes, ej. un Administrador de Catálogos), la comparación de "qué ya no
-    aparece y hay que borrar" se hace SOLO contra las filas de esos clientes —
-    así es imposible que se toque, ni se borre, un cliente que esa persona ni
-    siquiera puede ver en pantalla."""
+    `permitir_borrado=True` es solo para la tabla editable en pantalla, donde
+    la persona ve la fila que está quitando antes de guardar — ahí sí es un
+    borrado deliberado y visible. Aun con permitir_borrado=True, el borrado
+    se limita a los clientes que aparecen en `df_nuevo` (nunca a todo lo que
+    el usuario podría ver), y respeta las llaves foráneas: si algo está en
+    uso en Camiones o Viajes, Postgres bloquea ESE borrado puntual y se sigue
+    con el resto, avisando al final qué no se pudo quitar."""
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
-                # Si alguien tiene acceso limitado, cualquier fila que venga en el
-                # archivo/tabla debe ser de un cliente permitido — si no, la
-                # rechazamos aquí mismo, antes de tocar la base de datos.
                 if clientes_permitidos is not None and "cliente" in columnas:
                     fuera_de_alcance = {str(row["cliente"]).strip() for _, row in df_nuevo.iterrows()
                                         if str(row["cliente"]).strip() not in clientes_permitidos}
                     if fuera_de_alcance:
                         return False, f"No tienes acceso a estos clientes: {', '.join(fuera_de_alcance)}"
 
-                # Si esta tabla tiene columna "cliente", hay que asegurar que esos
-                # clientes ya existan en cat_clientes ANTES de sincronizar — si no,
-                # la llave foránea rechaza cualquier cliente nuevo que venga en el archivo.
                 if "cliente" in columnas and tabla != "cat_clientes":
                     clientes_del_archivo = {str(row["cliente"]).strip() for _, row in df_nuevo.iterrows() if str(row["cliente"]).strip()}
                     for c in clientes_del_archivo:
                         cur.execute("INSERT INTO cat_clientes (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING", (c,))
 
-                if clientes_permitidos is not None and "cliente" in columnas:
-                    cur.execute(f"SELECT {', '.join(clave)} FROM {tabla} WHERE cliente = ANY(%s)", (clientes_permitidos,))
-                else:
-                    cur.execute(f"SELECT {', '.join(clave)} FROM {tabla}")
-                claves_actuales = {tuple(str(v) for v in row) for row in cur.fetchall()}
-                claves_nuevas = {tuple(str(row[c]).strip() for c in clave) for _, row in df_nuevo.iterrows()}
-
                 no_borrables = []
-                for fila_clave in claves_actuales - claves_nuevas:
-                    cur.execute("SAVEPOINT sp_borrado")
-                    try:
-                        where_sql = " AND ".join(f"{c} = %s" for c in clave)
-                        cur.execute(f"DELETE FROM {tabla} WHERE {where_sql}", fila_clave)
-                        cur.execute("RELEASE SAVEPOINT sp_borrado")
-                    except Exception:
-                        cur.execute("ROLLBACK TO SAVEPOINT sp_borrado")
-                        no_borrables.append(" / ".join(fila_clave))
+                if permitir_borrado:
+                    # El borrado se limita a los clientes que aparecen EN el
+                    # dataframe que se está guardando — nunca a todo lo que el
+                    # usuario podría ver — así una tabla filtrada a un cliente
+                    # jamás borra datos de otro cliente que ni siquiera se veía.
+                    if "cliente" in columnas:
+                        clientes_en_pantalla = sorted({str(row["cliente"]).strip() for _, row in df_nuevo.iterrows() if str(row["cliente"]).strip()})
+                        if clientes_permitidos is not None:
+                            clientes_en_pantalla = [c for c in clientes_en_pantalla if c in clientes_permitidos]
+                        cur.execute(f"SELECT {', '.join(clave)} FROM {tabla} WHERE cliente = ANY(%s)", (clientes_en_pantalla,))
+                    else:
+                        cur.execute(f"SELECT {', '.join(clave)} FROM {tabla}")
+                    claves_actuales = {tuple(str(v) for v in fila) for fila in cur.fetchall()}
+                    claves_nuevas = {tuple(str(row[c]).strip() for c in clave) for _, row in df_nuevo.iterrows()}
+                    for fila_clave in claves_actuales - claves_nuevas:
+                        cur.execute("SAVEPOINT sp_borrado")
+                        try:
+                            where_sql = " AND ".join(f"{c} = %s" for c in clave)
+                            cur.execute(f"DELETE FROM {tabla} WHERE {where_sql}", fila_clave)
+                            cur.execute("RELEASE SAVEPOINT sp_borrado")
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT sp_borrado")
+                            no_borrables.append(" / ".join(fila_clave))
 
                 cols_sql = ", ".join(columnas)
                 placeholders = ", ".join(["%s"] * len(columnas))
@@ -908,6 +909,38 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
             if no_borrables:
                 return True, f"⚠️ Guardado, pero esto sigue existiendo porque está en uso en Camiones o Viajes: {', '.join(no_borrables)}"
             return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+def contar_borrado_masivo(tabla, columna_cliente, cliente_valor):
+    """Solo lectura: cuántas filas coinciden con lo que se va a borrar — para
+    mostrarlo ANTES de que la persona confirme nada."""
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        if columna_cliente is None or cliente_valor == "TODO EL CATÁLOGO":
+            cur.execute(f"SELECT COUNT(*) FROM {tabla}")
+        else:
+            cur.execute(f"SELECT COUNT(*) FROM {tabla} WHERE {columna_cliente} = %s", (cliente_valor,))
+        return cur.fetchone()[0]
+
+
+def borrar_masivo(tabla, columna_cliente, cliente_valor, usuario):
+    """Borrado masivo de verdad — solo para Administrador, y solo tras
+    confirmación explícita en la pantalla. Si algo está en uso en otra tabla
+    (Camiones, Viajes) y bloquea el DELETE por llave foránea, no se aplica
+    ningún borrado parcial silencioso: se avisa el error tal cual."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                if columna_cliente is None or cliente_valor == "TODO EL CATÁLOGO":
+                    cur.execute(f"DELETE FROM {tabla}")
+                else:
+                    cur.execute(f"DELETE FROM {tabla} WHERE {columna_cliente} = %s", (cliente_valor,))
+                borrados = cur.rowcount
+            conn.commit()
+            registrar_auditoria(usuario, "BORRADO MASIVO", f"Tabla {tabla} · alcance: {cliente_valor} · {borrados} fila(s) borradas")
+            return True, borrados
         except Exception as e:
             conn.rollback()
             return False, str(e)
@@ -1117,18 +1150,22 @@ def obtener_reporte_retornable_por_fecha(fecha_inicio, fecha_fin, cliente="Todos
         return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
-def buscar_viajes(valor_busqueda):
+def buscar_viajes(valor_busqueda, clientes_permitidos=None):
     """Busca viajes por coincidencia PARCIAL (no exacta) de No. de Viaje, Marchamo de
     Ida (de cualquiera de sus destinos), o Placa. Devuelve una lista (puede tener
-    más de un resultado si el texto buscado coincide con varios viajes)."""
+    más de un resultado si el texto buscado coincide con varios viajes).
+    Si `clientes_permitidos` no es None, solo devuelve viajes de esos clientes —
+    así nadie encuentra, ni por accidente, un viaje de un cliente que no le
+    corresponde (Administrador pasa None y ve todo)."""
     valor = f"%{valor_busqueda.strip()}%"
     with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT DISTINCT v.* FROM viajes v
-            WHERE v.id_viaje ILIKE %s OR v.placa ILIKE %s
-               OR EXISTS (SELECT 1 FROM destinos d WHERE d.viaje_id = v.id AND d.marchamo_ida ILIKE %s)
+            WHERE (v.id_viaje ILIKE %s OR v.placa ILIKE %s
+               OR EXISTS (SELECT 1 FROM destinos d WHERE d.viaje_id = v.id AND d.marchamo_ida ILIKE %s))
+              AND (%s::text[] IS NULL OR v.cliente = ANY(%s))
             ORDER BY v.id DESC LIMIT 20
-        """, (valor, valor, valor))
+        """, (valor, valor, valor, clientes_permitidos, clientes_permitidos))
         return cur.fetchall()
 
 
@@ -1138,16 +1175,18 @@ def obtener_destinos_de_viaje(viaje_id):
         return cur.fetchall()
 
 
-def filtrar_viajes(estado="Todos", placa="Todas", limite=50):
+def filtrar_viajes(estado="Todos", placa="Todas", limite=50, clientes_permitidos=None):
     """Filtro rápido por Estado y/o Placa, para encontrar viajes sin tener que
-    escribir un texto exacto de búsqueda."""
+    escribir un texto exacto de búsqueda. Igual que buscar_viajes(), respeta
+    `clientes_permitidos` si se pasa."""
     with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT * FROM viajes
             WHERE (%s = 'Todos' OR estado = %s)
               AND (%s = 'Todas' OR placa = %s)
+              AND (%s::text[] IS NULL OR cliente = ANY(%s))
             ORDER BY id DESC LIMIT %s
-        """, (estado, estado, placa, placa, limite))
+        """, (estado, estado, placa, placa, clientes_permitidos, clientes_permitidos, limite))
         return cur.fetchall()
 
 
@@ -1579,14 +1618,6 @@ if st.sidebar.button(":material/logout: Cerrar Sesión"):
         st.session_state.pop(k, None)
     st.rerun()
 
-# Supervisor solo administra usuarios, y Administrador de Catálogos trabaja con
-# varios clientes a la vez desde Catálogos — ninguno de los dos necesita fijar
-# un solo Cliente/CD por sesión, así que se saltan esa pantalla.
-if perfil_activo in ("Supervisor", "Administrador de Catálogos"):
-    st.session_state["config_bloqueada"] = True
-    st.session_state.setdefault("cliente_activo_fijo", "")
-    st.session_state.setdefault("cd_origen_fijo", "")
-
 # --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
 # cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
 # jornada alguien cambie sin querer el cliente/CD y se mezclen viajes).
@@ -1667,7 +1698,7 @@ tab1, tab2, tab5, tab3, tab4, tab6 = st.tabs([
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
 with tab1:
-    if perfil_activo in ["Administrador", "Operador"]:
+    if perfil_activo in ["Administrador", "Operador", "Supervisor"]:
         st.header(":material/local_shipping: Creación de Viaje")
         st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
 
@@ -1972,7 +2003,7 @@ with tab1:
 # MÓDULO 2: LIQUIDACIONES
 # ==========================================
 with tab2:
-    if perfil_activo in ["Administrador", "Liquidador"]:
+    if perfil_activo in ["Administrador", "Liquidador", "Supervisor"]:
         st.header(":material/receipt_long: Liquidación de Viajes")
         st.caption("Registra lo que el camión trajo de regreso de cada tienda. Las cajas no se devuelven.")
 
@@ -1990,7 +2021,8 @@ with tab2:
                 filtrar_click = st.button(":material/filter_alt: Filtrar", use_container_width=True, key="btn_filtrar_liq")
 
             if filtrar_click:
-                st.session_state["filtrados_liq"] = filtrar_viajes(filtro_estado_liq, filtro_placa_liq)
+                mis_clientes_liq = None if perfil_activo == "Administrador" else clientes_permitidos_para(usuario_activo, perfil_activo)
+                st.session_state["filtrados_liq"] = filtrar_viajes(filtro_estado_liq, filtro_placa_liq, clientes_permitidos=mis_clientes_liq)
 
             filtrados = st.session_state.get("filtrados_liq", [])
             if not filtrados:
@@ -2019,7 +2051,8 @@ with tab2:
 
         if buscar:
             if valor_busqueda.strip():
-                resultados = buscar_viajes(valor_busqueda)
+                mis_clientes_liq2 = None if perfil_activo == "Administrador" else clientes_permitidos_para(usuario_activo, perfil_activo)
+                resultados = buscar_viajes(valor_busqueda, clientes_permitidos=mis_clientes_liq2)
                 st.session_state["resultados_busqueda_liq"] = resultados
                 st.session_state.pop("viaje_liq", None)
                 st.session_state.pop("destinos_liq", None)
@@ -2116,7 +2149,8 @@ with tab5:
     if perfil_activo in ["Administrador", "Operador"]:
         st.header(":material/edit_document: Gestión de Viajes")
         if perfil_activo == "Operador":
-            st.caption("Puedes corregir o anular únicamente los viajes que tú mismo creaste. "
+            st.caption("Puedes corregir o anular cualquier viaje de los clientes que tengas asignados "
+                       "(no solo los que tú mismo creaste — para que un turno pueda corregir lo del otro). "
                        "Un viaje Liquidado ya no se puede editar — solo anular.")
         else:
             st.caption("Corrige datos de un viaje ya guardado, o anúlalo. Un viaje Liquidado ya no se puede "
@@ -2133,7 +2167,8 @@ with tab5:
 
         if buscar_g:
             if valor_busqueda_g.strip():
-                st.session_state["resultados_gestion"] = buscar_viajes(valor_busqueda_g)
+                mis_clientes_g = None if perfil_activo == "Administrador" else clientes_permitidos_para(usuario_activo, perfil_activo)
+                st.session_state["resultados_gestion"] = buscar_viajes(valor_busqueda_g, clientes_permitidos=mis_clientes_g)
                 st.session_state.pop("viaje_gestion", None)
                 st.session_state.pop("destinos_gestion", None)
             else:
@@ -2174,10 +2209,12 @@ with tab5:
             if st.button("🖨️ Ver / Reimprimir Hoja de Control", key=f"hoja_gestion_{viaje_g['id']}"):
                 components.html(generar_hoja_control_html(viaje_g, destinos_g), height=900, scrolling=True)
 
-            es_propietario = (perfil_activo == "Administrador") or (viaje_g["usuario_creador"] == usuario_activo)
+            # Antes esto era "solo lo que tú mismo creaste" — se cambió porque tu
+            # operación trabaja por turnos (uno despacha, el otro corrige o cierra),
+            # así que ahora se valida por acceso al Cliente, no por autoría.
+            es_propietario = (perfil_activo == "Administrador") or (viaje_g["cliente"] in clientes_permitidos_para(usuario_activo, perfil_activo))
             if not es_propietario:
-                st.warning("🚫 Este viaje lo creó otro usuario — como Operador, solo puedes editar o anular "
-                           "los viajes que tú mismo generaste.")
+                st.warning("🚫 No tienes acceso al cliente de este viaje, así que no lo puedes editar ni anular.")
             elif viaje_g["estado"] == "Anulado":
                 st.error(f"🚫 Este viaje ya fue anulado el {viaje_g['fecha_anulacion']} por "
                          f"{viaje_g['usuario_anulo']}. Motivo: {viaje_g['motivo_anulacion']}. No hay más acciones disponibles.")
@@ -2476,7 +2513,7 @@ with tab3:
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
 with tab4:
-    if perfil_activo not in ["Administrador", "Administrador de Catálogos"]:
+    if perfil_activo not in ["Administrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
     else:
         st.header(":material/settings: Gestión de Catálogos")
@@ -2486,15 +2523,23 @@ with tab4:
             mis_clientes = None  # sin restricción
             st.caption("Descarga la plantilla, llénala en Excel y súbela para actualizar ese catálogo.")
         else:
-            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Acceso Usuario → Cliente"]
+            # El Supervisor administra Camiones también — pero OJO: Camiones no
+            # tiene una columna "cliente" en la base de datos (un camión no
+            # pertenece a un solo cliente, se asigna viaje por viaje), así que
+            # ese catálogo específico NO se puede filtrar por cliente todavía.
+            # Un Supervisor ve/edita TODOS los camiones, no solo "los suyos".
+            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Camiones", "Acceso Usuario → Cliente"]
             mis_clientes = clientes_permitidos_para(usuario_activo, perfil_activo)
-            st.caption(f"Como Administrador de Catálogos, solo ves y editas datos de: **{', '.join(mis_clientes) or '(ningún cliente asignado)'}**. "
-                       "Los catálogos compartidos (Pilotos, Camiones, Transportistas, Rendimiento) los administra Administrador.")
+            st.caption(f"Ves y editas Clientes/Tiendas/CDs solo de: **{', '.join(mis_clientes) or '(ningún cliente asignado)'}**. "
+                       "El catálogo de Camiones es compartido entre todos los clientes (no se puede filtrar por "
+                       "cliente todavía), así que ahí ves la flota completa.")
             if not mis_clientes:
                 st.warning("🚫 Todavía no tienes ningún cliente asignado — pídele a un Administrador que te dé acceso "
                            "desde la pestaña de Usuarios.")
                 st.stop()
 
+        # Camiones no tiene columna "cliente" en la base de datos — las funciones
+        # de guardado ya lo detectan solas y no aplican ningún filtro en ese caso.
         catalogo_sel = st.selectbox("Catálogo a gestionar", catalogos_disponibles)
         config = CATALOGOS_CONFIG[catalogo_sel]
         columnas_mostrar = config["columnas"] + config.get("solo_lectura", [])
@@ -2516,7 +2561,7 @@ with tab4:
             if faltan.any():
                 st.error(f"❌ Hay fila(s) sin llenar la llave ({', '.join(config['clave'])}). Complétalas o bórralas antes de guardar.")
             else:
-                ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_editado[config["columnas"]], usuario_activo, mis_clientes)
+                ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_editado[config["columnas"]], usuario_activo, mis_clientes, permitir_borrado=True)
                 if ok:
                     st.success("✅ Tabla actualizada.")
                     if msg != "OK":
@@ -2544,7 +2589,7 @@ with tab4:
             if col == "cliente":
                 # Selector en vez de texto libre: evita que cada persona escriba el
                 # mismo cliente con variaciones distintas (typos, mayúsculas, espacios).
-                # Si hay alcance limitado (Administrador de Catálogos), solo puede
+                # Si hay alcance limitado (Supervisor), solo puede
                 # elegir entre SUS clientes, y no puede crear uno nuevo.
                 if mis_clientes is not None:
                     clientes_existentes = sorted(mis_clientes)
@@ -2562,7 +2607,7 @@ with tab4:
                 # En "Acceso Usuario → Cliente" el usuario debe ser uno que ya
                 # exista en el catálogo de Usuarios, no texto libre. Si quien
                 # gestiona tiene alcance limitado, solo puede dar acceso a cuentas
-                # Operador/Liquidador — nunca a otro Administrador de Catálogos,
+                # Operador/Liquidador — nunca a otro Supervisor,
                 # Supervisor, o Administrador.
                 if mis_clientes is not None:
                     usuarios_existentes = sorted(
@@ -2656,11 +2701,10 @@ with tab4:
                 else:
                     st.markdown("#### Vista previa de lo que se va a cargar")
                     st.dataframe(df_nuevo[config["columnas"]], use_container_width=True)
-                    st.warning(f"⚠️ Esto agrega/actualiza los registros del archivo, y borra los que ya no "
-                               f"aparecen en él (salvo que estén en uso en Camiones o Viajes) — "
-                               f"'{catalogo_sel}': {len(df_actual)} registro(s) actuales → {len(df_nuevo)} en el archivo.")
-                    confirmar = st.checkbox("Confirmo este cambio", key=f"conf_{catalogo_sel}")
-                    if st.button("🔄 Actualizar Catálogo", disabled=not confirmar):
+                    st.info(f"Esto agrega los registros nuevos y actualiza los que ya existan (por su llave) — "
+                            f"nunca borra nada. '{catalogo_sel}': {len(df_actual)} registro(s) actuales, "
+                            f"{len(df_nuevo)} en el archivo.")
+                    if st.button("🔄 Actualizar Catálogo"):
                         ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_nuevo, usuario_activo, mis_clientes)
                         if ok:
                             st.success(f"✅ Catálogo '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s).")
@@ -2672,6 +2716,40 @@ with tab4:
                             st.error(f"❌ Error al actualizar: {msg}")
             except Exception as e:
                 st.error(f"❌ No se pudo leer el archivo: {e}")
+
+        # ---- Borrado Masivo — SOLO Administrador ----
+        if perfil_activo == "Administrador":
+            st.markdown("---")
+            with st.expander("🗑️ Zona de Riesgo — Borrado Masivo (solo Administrador)"):
+                st.error("Esto borra de verdad, en bloque, y no se puede deshacer. Úsalo solo para limpiar "
+                         "datos de prueba o un cliente que ya no corresponde.")
+                catalogo_borrar = st.selectbox("Catálogo", list(CATALOGOS_CONFIG.keys()), key="catalogo_borrar_masivo")
+                config_borrar = CATALOGOS_CONFIG[catalogo_borrar]
+                tiene_cliente = "cliente" in config_borrar["columnas"]
+
+                if tiene_cliente:
+                    clientes_en_tabla = sorted(leer_catalogo_actual(config_borrar["tabla"], ["cliente"])["cliente"].unique().tolist())
+                    alcance_opciones = clientes_en_tabla + ["TODO EL CATÁLOGO"]
+                else:
+                    alcance_opciones = ["TODO EL CATÁLOGO"]
+                alcance_sel = st.selectbox("Alcance", alcance_opciones, key="alcance_borrar_masivo")
+
+                cantidad = contar_borrado_masivo(config_borrar["tabla"], "cliente" if tiene_cliente else None, alcance_sel)
+                if cantidad == 0:
+                    st.caption("No hay registros que coincidan — nada que borrar.")
+                else:
+                    st.warning(f"⚠️ Esto va a borrar **{cantidad} registro(s)** de '{catalogo_borrar}'"
+                               f"{' del cliente ' + alcance_sel if alcance_sel != 'TODO EL CATÁLOGO' else ' — EL CATÁLOGO COMPLETO'}.")
+                    frase_esperada = f"BORRAR {catalogo_borrar.upper()}"
+                    confirmacion = st.text_input(f"Escribe exactamente: {frase_esperada}", key="confirmacion_borrar_masivo")
+                    if st.button(":material/delete_forever: Borrar Definitivamente", disabled=(confirmacion.strip() != frase_esperada)):
+                        ok, resultado = borrar_masivo(config_borrar["tabla"], "cliente" if tiene_cliente else None, alcance_sel, usuario_activo)
+                        if ok:
+                            st.success(f"✅ Se borraron {resultado} registro(s) de '{catalogo_borrar}'.")
+                            st.session_state.catalogos = cargar_catalogos_desde_db()
+                            st.rerun()
+                        else:
+                            st.error(f"❌ No se pudo borrar (probablemente algo ahí está en uso en Camiones o Viajes): {resultado}")
 
 # ==========================================
 # MÓDULO 6: GESTIÓN DE USUARIOS — Administrador ve y administra a todos;
@@ -2686,7 +2764,7 @@ with tab6:
 
         if perfil_activo == "Administrador":
             perfiles_visibles = None  # ve todos
-            perfiles_asignables = ["Administrador", "Administrador de Catálogos", "Operador", "Liquidador", "Supervisor"]
+            perfiles_asignables = ["Administrador", "Operador", "Liquidador", "Supervisor"]
             st.caption("Ves y administras todas las cuentas.")
         else:
             perfiles_visibles = ["Operador", "Liquidador"]
