@@ -194,7 +194,12 @@ st.markdown("""
         }
 
         /* Reduce el padding superior por defecto de Streamlit para que la topbar quede pegada arriba */
-        .block-container { padding-top: 1.6rem; }
+        .block-container { padding-top: 0.8rem; }
+        /* Quita la barra de color ("decoración") que Streamlit pone arriba por
+           defecto — es el espacio vacío/resaltado que sobra encima del contenido.
+           El menú de los 3 puntos (⋮) se queda intacto, solo se quita esa franja. */
+        div[data-testid="stDecoration"] { display: none; }
+        header[data-testid="stHeader"] { height: 2.2rem; background: transparent; }
 
         /* --- Inputs, selects, textareas: look de producto moderno, no de formulario
            de los 2000s --- */
@@ -260,6 +265,20 @@ st.markdown("""
         div.stButton > button[kind="primary"]:hover {
             background-color: #14181c !important;
         }
+
+        /* "Chips" del Resumen de Datos: todos del mismo tamaño, con un toque 3D
+           sutil (borde + sombra + resalte superior), sin llegar a verse pesado. */
+        .resumen-chip {
+            background: var(--gris-fondo);
+            border: 0.5px solid var(--gris-borde);
+            border-radius: 10px;
+            padding: 8px 6px;
+            text-align: center;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.6);
+            height: 100%;
+        }
+        .resumen-chip-label { font-size: 11px; color: var(--gris-medio); }
+        .resumen-chip-valor { font-size: 17px; font-weight: 600; color: var(--gris-texto); }
         </style>
 """, unsafe_allow_html=True)
 
@@ -898,7 +917,9 @@ init_db()
 
 
 def marchamo_ya_usado(marchamo, cur):
-    cur.execute("SELECT 1 FROM destinos WHERE marchamo_ida = %s", (marchamo,))
+    """Un marchamo no se debe repetir sin importar si ya se usó como Marchamo de
+    Ida o de Regreso en cualquier otro destino — es el mismo sello físico."""
+    cur.execute("SELECT 1 FROM destinos WHERE marchamo_ida = %s OR marchamo_regreso = %s", (marchamo, marchamo))
     return cur.fetchone() is not None
 
 
@@ -942,6 +963,10 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                     if marchamo_ya_usado(dest["marchamo_ida"], cur):
                         conn.rollback()
                         return False, f"El marchamo '{dest['marchamo_ida']}' ya fue usado en otro viaje."
+                marchamo_regreso_viaje = destinos_viaje[-1]["marchamo_regreso"] if destinos_viaje else ""
+                if marchamo_regreso_viaje and marchamo_ya_usado(marchamo_regreso_viaje, cur):
+                    conn.rollback()
+                    return False, f"El marchamo de regreso '{marchamo_regreso_viaje}' ya fue usado en otro viaje."
 
                 id_viaje_str = siguiente_correlativo(cliente, cur)
                 fecha_hoy = ahora().strftime("%Y-%m-%d")
@@ -1069,38 +1094,6 @@ def obtener_reporte_liquidaciones(fecha_inicio, fecha_fin, cliente="Todos"):
         return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
-def obtener_reporte_retornable(fecha_inicio, fecha_fin, cliente="Todos"):
-    """Kardex de material retornable (Roles, Tarimas, Pacas de Cartón) por tienda:
-    cuánto se envió, cuánto ha regresado, y cuánto debería seguir en la tienda.
-    Los retornos solo cuentan si el viaje ya está Liquidado — mientras esté
-    Pendiente, ese material sigue contando como "en tienda" (correcto: todavía
-    no se ha confirmado su regreso). Las cajas NO son retornables, por eso no
-    aparecen aquí."""
-    with closing(get_conn()) as conn:
-        query = """
-            SELECT
-                v.cliente AS "Cliente",
-                d.tienda AS "Tienda",
-                SUM(d.roles) AS "Roles Enviados",
-                SUM(COALESCE(d.roles_devueltos, 0)) AS "Roles Retornados",
-                SUM(d.tarimas) AS "Tarimas Enviadas",
-                SUM(COALESCE(d.tarimas_devueltas, 0)) AS "Tarimas Retornadas",
-                SUM(COALESCE(d.pacas_carton_devueltas, 0)) AS "Pacas de Cartón Retornadas"
-            FROM destinos d
-            JOIN viajes v ON v.id = d.viaje_id
-            WHERE v.estado != 'Anulado'
-              AND v.fecha_creacion BETWEEN %s AND %s
-              AND (%s = 'Todos' OR v.cliente = %s)
-            GROUP BY v.cliente, d.tienda
-            ORDER BY v.cliente, d.tienda
-        """
-        df = pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
-        if not df.empty:
-            df["Roles Saldo en Tienda"] = df["Roles Enviados"] - df["Roles Retornados"]
-            df["Tarimas Saldo en Tienda"] = df["Tarimas Enviadas"] - df["Tarimas Retornadas"]
-        return df
-
-
 def obtener_reporte_retornable_por_fecha(fecha_inicio, fecha_fin, cliente="Todos"):
     """Detalle día por día: en cada fecha del viaje, cuánto se envió y cuánto se
     retornó de cada material, por tienda. Todo queda bajo la fecha del viaje
@@ -1207,6 +1200,18 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                         conn.rollback()
                         return False, f"El marchamo '{d['marchamo_ida']}' ya está en uso en otro destino."
 
+                # Lo mismo para el Marchamo de Regreso: no debe chocar con el de
+                # otro viaje (excluyendo los destinos de este mismo viaje).
+                if marchamo_regreso_viaje:
+                    ids_de_este_viaje = [d["id"] for d in destinos_actualizados]
+                    cur.execute(
+                        "SELECT 1 FROM destinos WHERE (marchamo_ida = %s OR marchamo_regreso = %s) AND id != ALL(%s)",
+                        (marchamo_regreso_viaje, marchamo_regreso_viaje, ids_de_este_viaje)
+                    )
+                    if cur.fetchone():
+                        conn.rollback()
+                        return False, f"El marchamo de regreso '{marchamo_regreso_viaje}' ya está en uso en otro viaje."
+
                 cur.execute(
                     "UPDATE viajes SET placa=%s, transportista=%s, piloto=%s, auxiliar=%s WHERE id=%s",
                     (placa, transportista, piloto, auxiliar, viaje_id)
@@ -1282,7 +1287,7 @@ def generar_hoja_control_html(viaje, destinos):
             <div class="destino-header">
                 <div class="destino-header-izq">
                     <span class="destino-num">{idx}</span> {d['tienda']}
-                    <span class="marchamo-inline">🔒 {d['marchamo_ida']}</span>
+                    <span class="marchamo-inline">Marchamo: {d['marchamo_ida']}</span>
                     {badge_complemento}
                 </div>
                 {badge_regreso}
@@ -1857,6 +1862,19 @@ with tab1:
                     st.session_state.num_destinos += 1
                     st.rerun()
 
+                st.markdown("---")
+                cc1, cc2 = st.columns([2, 1])
+                with cc1:
+                    marchamo_regreso_viaje = st.text_input(
+                        ":material/lock: Marchamo de Regreso (obligatorio, se cierra al terminar la última tienda)",
+                        key=f"mreg_final_{run}", placeholder="Marchamo de Regreso"
+                    )
+                if destinos_viaje:
+                    destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
+                with cc2:
+                    st.write("")
+                    guardar_click = st.button(":material/print: Generar Viaje e Imprimir", use_container_width=True, type="primary")
+
         with col_side:
             with st.container(border=True):
                 st.markdown("##### :material/summarize: RESUMEN DE DATOS")
@@ -1866,12 +1884,19 @@ with tab1:
                 cantidad_tiendas = len(destinos_viaje)
                 distancia_total = round(sum(d["km"] for d in destinos_viaje), 1)
 
-                mcol1, mcol2 = st.columns(2)
-                mcol1.metric("Cajas", total_cajas)
-                mcol2.metric("Tarimas", total_tarimas)
-                mcol1.metric("Roles", total_roles)
-                mcol2.metric("Cantidad de Tiendas", cantidad_tiendas)
-                mcol1.metric("Distancia Total (KM)", distancia_total)
+                resumen_items = [
+                    ("Cajas", total_cajas), ("Tarimas", total_tarimas),
+                    ("Roles", total_roles), ("Tiendas", cantidad_tiendas),
+                ]
+                rcols = st.columns(len(resumen_items))
+                for rcol, (etiqueta, valor) in zip(rcols, resumen_items):
+                    with rcol:
+                        st.markdown(
+                            f'<div class="resumen-chip"><div class="resumen-chip-label">{etiqueta}</div>'
+                            f'<div class="resumen-chip-valor">{valor}</div></div>',
+                            unsafe_allow_html=True
+                        )
+                st.caption(f":material/route: Distancia total: {distancia_total} KM")
 
                 st.markdown("---")
                 st.caption(":material/preview: VISTA PREVIA — HOJA DE SALIDA")
@@ -1886,22 +1911,13 @@ with tab1:
                             st.markdown(f":material/lock: **Marchamo Regreso:** {marchamo_regreso_actual}")
                         st.markdown("---")
 
-        st.markdown("---")
-        with st.container(border=True):
-            st.markdown("##### :material/lock: CIERRE DEL VIAJE")
-            st.caption("Marchamo de Regreso — se coloca cuando ya se cerraron todas las tiendas.")
-            cc1, cc2 = st.columns([2, 1])
-            with cc1:
-                marchamo_regreso_viaje = st.text_input("Marchamo de REGRESO (obligatorio)", key=f"mreg_final_{run}", label_visibility="collapsed", placeholder="Marchamo de Regreso")
-            if destinos_viaje:
-                destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
-            with cc2:
-                guardar_click = st.button(":material/print: Generar Viaje e Imprimir", use_container_width=True, type="primary")
-
         if guardar_click:
             marchamos_vacios = any(not d["marchamo_ida"] for d in destinos_viaje)
             marchamos_repetidos_en_form = len([d["marchamo_ida"] for d in destinos_viaje]) != len(
                 set(d["marchamo_ida"] for d in destinos_viaje)
+            )
+            marchamo_regreso_choca_en_form = marchamo_regreso_viaje.strip() and any(
+                d["marchamo_ida"] == marchamo_regreso_viaje.strip() for d in destinos_viaje
             )
 
             if not placa or len(destinos_viaje) == 0:
@@ -1912,6 +1928,8 @@ with tab1:
                 st.error("❌ Error: Hay marchamos de ida repetidos dentro de este mismo viaje.")
             elif not marchamo_regreso_viaje.strip():
                 st.error("❌ Error: El Marchamo de Regreso es obligatorio para cerrar el circuito.")
+            elif marchamo_regreso_choca_en_form:
+                st.error("❌ Error: El Marchamo de Regreso no puede ser igual a un Marchamo de Ida de este mismo viaje.")
             else:
                 ok, resultado = guardar_viaje(
                     cliente=cliente_activo,
@@ -2401,88 +2419,53 @@ with tab3:
 
         generar_r = st.button(":material/search: Generar", key="btn_generar_ret_rep")
         if generar_r:
-            st.session_state["df_retornable"] = obtener_reporte_retornable(fecha_ini_r, fecha_fin_r, cliente_reporte_r)
             st.session_state["df_retornable_fecha"] = obtener_reporte_retornable_por_fecha(fecha_ini_r, fecha_fin_r, cliente_reporte_r)
 
-        df_ret = st.session_state.get("df_retornable")
-        if df_ret is not None:
-            if df_ret.empty:
+        df_fecha = st.session_state.get("df_retornable_fecha")
+        if df_fecha is not None:
+            if df_fecha.empty:
                 st.info("No hay movimientos en ese rango de fechas para ese cliente.")
             else:
-                columnas_por_material = {
-                    "Todos": ["Cliente", "Tienda", "Roles Enviados", "Roles Retornados", "Roles Saldo en Tienda",
-                              "Tarimas Enviadas", "Tarimas Retornadas", "Tarimas Saldo en Tienda",
-                              "Pacas de Cartón Retornadas"],
-                    "Roles": ["Cliente", "Tienda", "Roles Enviados", "Roles Retornados", "Roles Saldo en Tienda"],
-                    "Tarimas": ["Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas", "Tarimas Saldo en Tienda"],
-                    "Pacas de Cartón": ["Cliente", "Tienda", "Pacas de Cartón Retornadas"],
-                }
-                df_mostrar_r = df_ret[columnas_por_material[material_sel]]
-
                 kcol1, kcol2, kcol3 = st.columns(3)
                 if material_sel in ("Todos", "Roles"):
-                    kcol1.metric("Total Roles en Tiendas", int(df_ret["Roles Saldo en Tienda"].sum()))
+                    saldo_roles = int(df_fecha["Roles Enviados"].sum() - df_fecha["Roles Retornados"].sum())
+                    kcol1.metric("Total Roles en Tiendas", saldo_roles)
                 if material_sel in ("Todos", "Tarimas"):
-                    kcol2.metric("Total Tarimas en Tiendas", int(df_ret["Tarimas Saldo en Tienda"].sum()))
+                    saldo_tarimas = int(df_fecha["Tarimas Enviadas"].sum() - df_fecha["Tarimas Retornadas"].sum())
+                    kcol2.metric("Total Tarimas en Tiendas", saldo_tarimas)
                 if material_sel in ("Todos", "Pacas de Cartón"):
-                    kcol3.metric("Total Pacas de Cartón Retornadas", int(df_ret["Pacas de Cartón Retornadas"].sum()))
-
-                st.markdown("##### Resumen del rango completo")
-                st.dataframe(df_mostrar_r, use_container_width=True, height=300)
-
-                ecol1, ecol2 = st.columns(2)
-                with ecol1:
-                    st.download_button(
-                        ":material/download: Exportar Resumen a Excel",
-                        data=exportar_excel(df_mostrar_r),
-                        file_name=f"retornable_resumen_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key="excel_ret_rep"
-                    )
-                with ecol2:
-                    st.download_button(
-                        ":material/download: Exportar Resumen a CSV",
-                        data=df_mostrar_r.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"retornable_resumen_{fecha_ini_r}_a_{fecha_fin_r}.csv",
-                        mime="text/csv",
-                        use_container_width=True, key="csv_ret_rep"
-                    )
+                    kcol3.metric("Total Pacas de Cartón Retornadas", int(df_fecha["Pacas de Cartón Retornadas"].sum()))
 
                 st.markdown("---")
-                st.markdown("##### Detalle día por día")
                 st.caption("Cada fila es la fecha en que salió el viaje: lo enviado ese día, y lo retornado "
                            "de ese mismo viaje (el retorno solo tiene valor una vez que ya se liquidó).")
-                df_fecha = st.session_state.get("df_retornable_fecha")
-                if df_fecha is None or df_fecha.empty:
-                    st.info("No hay movimientos día por día en ese rango.")
-                else:
-                    columnas_fecha_por_material = {
-                        "Todos": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados",
-                                  "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas"],
-                        "Roles": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados"],
-                        "Tarimas": ["Fecha", "Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas"],
-                        "Pacas de Cartón": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas"],
-                    }
-                    df_fecha_mostrar = df_fecha[columnas_fecha_por_material[material_sel]]
-                    st.dataframe(df_fecha_mostrar, use_container_width=True, height=380)
+                columnas_fecha_por_material = {
+                    "Todos": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados",
+                              "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas"],
+                    "Roles": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados"],
+                    "Tarimas": ["Fecha", "Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas"],
+                    "Pacas de Cartón": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas"],
+                }
+                df_fecha_mostrar = df_fecha[columnas_fecha_por_material[material_sel]]
+                st.dataframe(df_fecha_mostrar, use_container_width=True, height=420)
 
-                    fcol1, fcol2 = st.columns(2)
-                    with fcol1:
-                        st.download_button(
-                            ":material/download: Exportar Detalle a Excel",
-                            data=exportar_excel(df_fecha_mostrar),
-                            file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True, key="excel_ret_rep_fecha"
-                        )
-                    with fcol2:
-                        st.download_button(
-                            ":material/download: Exportar Detalle a CSV",
-                            data=df_fecha_mostrar.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.csv",
-                            mime="text/csv",
-                            use_container_width=True, key="csv_ret_rep_fecha"
-                        )
+                fcol1, fcol2 = st.columns(2)
+                with fcol1:
+                    st.download_button(
+                        ":material/download: Exportar a Excel",
+                        data=exportar_excel(df_fecha_mostrar),
+                        file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key="excel_ret_rep_fecha"
+                    )
+                with fcol2:
+                    st.download_button(
+                        ":material/download: Exportar a CSV",
+                        data=df_fecha_mostrar.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.csv",
+                        mime="text/csv",
+                        use_container_width=True, key="csv_ret_rep_fecha"
+                    )
         else:
             st.info("Elige el rango de fechas, cliente y material, y presiona Generar.")
     else:
