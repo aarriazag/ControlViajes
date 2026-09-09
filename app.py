@@ -437,28 +437,32 @@ def init_db():
         """)
         conn.commit()
 
-        # Sembrar datos de ejemplo SOLO la primera vez (tablas vacías), para que la
-        # app no quede sin catálogos apenas se activa esta versión.
+        # Sembrar datos de ejemplo — cada INSERT usa ON CONFLICT DO NOTHING, así
+        # que es seguro que este bloque corra más de una vez (por ejemplo, si un
+        # Borrado Masivo deja alguna de estas tablas en cero: eso no debe hacer
+        # que se vuelvan a sembrar TODAS, chocando con lo que sí sigue ahí).
         cur.execute("SELECT COUNT(*) FROM cat_clientes_tiendas")
         if cur.fetchone()[0] == 0:
-            cur.executemany("INSERT INTO cat_transportistas (nombre) VALUES (%s)",
+            cur.executemany("INSERT INTO cat_transportistas (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
                              [("Transportes Express",), ("Logística del Norte",), ("Flota Interna",)])
-            cur.executemany("INSERT INTO cat_pilotos (nombre) VALUES (%s)",
+            cur.executemany("INSERT INTO cat_pilotos (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
                              [("Juan Pérez",), ("María Rodríguez",), ("Luis Martínez",), ("Andrés Custodio",)])
-            cur.executemany("INSERT INTO cat_auxiliares (nombre) VALUES (%s)",
+            cur.executemany("INSERT INTO cat_auxiliares (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
                              [("Carlos López",), ("Pedro Gómez",), ("José Hernández",), ("Ramiro Ruiz",)])
             cur.executemany(
-                "INSERT INTO cat_camiones (placa, tipo, transportista, piloto, auxiliar) VALUES (%s,%s,%s,%s,%s)",
+                "INSERT INTO cat_camiones (placa, tipo, transportista, piloto, auxiliar) VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (placa) DO NOTHING",
                 [("C-123ABC", "5 Ton", "Transportes Express", "Juan Pérez", "Carlos López"),
                  ("C-456DEF", "10 Ton", "Logística del Norte", "María Rodríguez", "Pedro Gómez"),
                  ("C-789GHI", "20 Ton", "Flota Interna", "Luis Martínez", "José Hernández")]
             )
             cur.executemany(
-                "INSERT INTO cat_clientes (nombre) VALUES (%s)",
+                "INSERT INTO cat_clientes (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
                 [("Dollarcity",), ("UniSuper",), ("UniSuper Importados",), ("UniSuper LTX",)]
             )
             cur.executemany(
-                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km) VALUES (%s,%s,%s)",
+                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km) VALUES (%s,%s,%s) "
+                "ON CONFLICT (cliente, tienda) DO NOTHING",
                 [("Dollarcity", "Dollarcity Zona 10", 15.5),
                  ("Dollarcity", "Dollarcity Mixco", 32.0),
                  ("UniSuper", "UniSuper Central", 22.1),
@@ -466,24 +470,24 @@ def init_db():
                  ("UniSuper LTX", "UniSuper LTX Sur", 45.3)]
             )
             cur.executemany(
-                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon) VALUES (%s,%s)",
+                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon) VALUES (%s,%s) ON CONFLICT (tipo) DO NOTHING",
                 [("5 Ton", 8.0), ("10 Ton", 6.0), ("20 Ton", 4.0)]
             )
             cur.executemany(
-                "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s)",
+                "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s) ON CONFLICT (cliente, cd) DO NOTHING",
                 [("Dollarcity", "CD Barcenas"), ("Dollarcity", "CD Central"),
                  ("UniSuper", "CD Barcenas"),
                  ("UniSuper Importados", "CD Barcenas"),
                  ("UniSuper LTX", "CD Barcenas")]
             )
             cur.executemany(
-                "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s)",
+                "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s) ON CONFLICT (usuario) DO NOTHING",
                 [("Admin_Logistica", "Administrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
             )
             # Por defecto, los usuarios de ejemplo (no-Administrador) ven todos los
             # clientes sembrados, para no romper nada mientras ajustas los accesos reales.
             cur.executemany(
-                "INSERT INTO cat_usuario_clientes (usuario, cliente) VALUES (%s,%s)",
+                "INSERT INTO cat_usuario_clientes (usuario, cliente) VALUES (%s,%s) ON CONFLICT (usuario, cliente) DO NOTHING",
                 [(u, c) for u in ("Op_Salidas", "Liq_Transporte")
                  for c in ("Dollarcity", "UniSuper", "UniSuper Importados", "UniSuper LTX")]
             )
@@ -1745,10 +1749,18 @@ with tab1:
                     st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
                 with col_pil:
                     pilotos = st.session_state.catalogos["pilotos"]
-                    piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
+                    if pilotos:
+                        piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
+                    else:
+                        st.warning("Sin pilotos en el catálogo.")
+                        piloto_final = ""
                 with col_aux:
                     auxiliares = st.session_state.catalogos["auxiliares"]
-                    auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
+                    if auxiliares:
+                        auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
+                    else:
+                        st.warning("Sin auxiliares en el catálogo.")
+                        auxiliar_final = ""
 
             cd_origen_final = cd_origen_fijo
 
@@ -1963,6 +1975,8 @@ with tab1:
 
             if not placa or len(destinos_viaje) == 0:
                 st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
+            elif not piloto_final or not auxiliar_final:
+                st.error("❌ Error: Falta seleccionar Piloto y/o Auxiliar (revisa que el catálogo tenga al menos uno cargado).")
             elif marchamos_vacios:
                 st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
             elif marchamos_repetidos_en_form:
@@ -2235,25 +2249,41 @@ with tab5:
                         tiendas_cliente_g = st.session_state.catalogos["clientes"].get(viaje_g["cliente"], {})
 
                         placas_disp = list(st.session_state.catalogos["camiones"].keys())
-                        placa_idx = placas_disp.index(viaje_g["placa"]) if viaje_g["placa"] in placas_disp else 0
-                        placa_edit = st.selectbox("Placa", placas_disp, index=placa_idx, key=f"edit_placa_{viaje_g['id']}")
+                        if placas_disp:
+                            placa_idx = placas_disp.index(viaje_g["placa"]) if viaje_g["placa"] in placas_disp else 0
+                            placa_edit = st.selectbox("Placa", placas_disp, index=placa_idx, key=f"edit_placa_{viaje_g['id']}")
+                        else:
+                            st.warning(f"Catálogo de Camiones vacío — se mantiene la placa actual: {viaje_g['placa']}")
+                            placa_edit = viaje_g["placa"]
                         datos_cam = st.session_state.catalogos["camiones"].get(placa_edit, {})
                         transportista_edit = datos_cam.get("transportista", viaje_g["transportista"])
 
                         pilotos_disp = st.session_state.catalogos["pilotos"]
-                        pil_idx = pilotos_disp.index(viaje_g["piloto"]) if viaje_g["piloto"] in pilotos_disp else 0
-                        piloto_edit = st.selectbox("Piloto", pilotos_disp, index=pil_idx, key=f"edit_piloto_{viaje_g['id']}")
+                        if pilotos_disp:
+                            pil_idx = pilotos_disp.index(viaje_g["piloto"]) if viaje_g["piloto"] in pilotos_disp else 0
+                            piloto_edit = st.selectbox("Piloto", pilotos_disp, index=pil_idx, key=f"edit_piloto_{viaje_g['id']}")
+                        else:
+                            st.warning(f"Catálogo de Pilotos vacío — se mantiene el piloto actual: {viaje_g['piloto']}")
+                            piloto_edit = viaje_g["piloto"]
 
                         aux_disp = st.session_state.catalogos["auxiliares"]
-                        aux_idx = aux_disp.index(viaje_g["auxiliar"]) if viaje_g["auxiliar"] in aux_disp else 0
-                        auxiliar_edit = st.selectbox("Auxiliar", aux_disp, index=aux_idx, key=f"edit_aux_{viaje_g['id']}")
+                        if aux_disp:
+                            aux_idx = aux_disp.index(viaje_g["auxiliar"]) if viaje_g["auxiliar"] in aux_disp else 0
+                            auxiliar_edit = st.selectbox("Auxiliar", aux_disp, index=aux_idx, key=f"edit_aux_{viaje_g['id']}")
+                        else:
+                            st.warning(f"Catálogo de Auxiliares vacío — se mantiene el auxiliar actual: {viaje_g['auxiliar']}")
+                            auxiliar_edit = viaje_g["auxiliar"]
 
                         st.markdown("##### DATOS POR TIENDA")
                         destinos_editados = []
                         for d in sorted(destinos_g, key=lambda x: x["orden"]):
                             tiendas_opciones = list(tiendas_cliente_g.keys())
-                            tienda_idx = tiendas_opciones.index(d["tienda"]) if d["tienda"] in tiendas_opciones else 0
-                            tienda_e = st.selectbox("Tienda", tiendas_opciones, index=tienda_idx, key=f"etienda_{d['id']}")
+                            if tiendas_opciones:
+                                tienda_idx = tiendas_opciones.index(d["tienda"]) if d["tienda"] in tiendas_opciones else 0
+                                tienda_e = st.selectbox("Tienda", tiendas_opciones, index=tienda_idx, key=f"etienda_{d['id']}")
+                            else:
+                                st.warning(f"Este cliente no tiene tiendas cargadas — se mantiene: {d['tienda']}")
+                                tienda_e = d["tienda"]
                             e1, e2, e3 = st.columns(3)
                             with e1:
                                 roles_e = st.number_input("Roles", min_value=0, step=1, value=d["roles"], key=f"eroles_{d['id']}")
@@ -2634,7 +2664,11 @@ with tab4:
                     )
                 else:
                     usuarios_existentes = sorted(st.session_state.catalogos["usuarios"].keys())
-                valores_form["usuario"] = st.selectbox("Usuario", usuarios_existentes, key=f"campo_{catalogo_sel}_usuario_sel")
+                if usuarios_existentes:
+                    valores_form["usuario"] = st.selectbox("Usuario", usuarios_existentes, key=f"campo_{catalogo_sel}_usuario_sel")
+                else:
+                    st.warning("No hay usuarios disponibles para asignar todavía — créalos primero en la pestaña Usuarios.")
+                    valores_form["usuario"] = ""
             elif col == "tipo" and catalogo_sel == "Rendimiento por Camión":
                 # Los tonelajes válidos son los que ya existen en el catálogo de
                 # Camiones — así se evitan variantes como "5 Ton", "5 T", "05 Ton".
