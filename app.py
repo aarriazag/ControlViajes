@@ -609,8 +609,12 @@ def cargar_catalogos_desde_db():
 
 def clientes_permitidos_para(usuario, perfil):
     """Administrador ve todos los clientes; cualquier otro perfil solo ve los
-    clientes que tenga asignados en el catálogo de accesos."""
-    todos = list(st.session_state.catalogos["clientes"].keys())
+    clientes que tenga asignados en el catálogo de accesos.
+    OJO: 'todos' se saca de la lista real de clientes (cat_clientes), NO de
+    qué clientes tienen tiendas cargadas — si un cliente se queda sin ninguna
+    tienda (por ejemplo, tras un Borrado Masivo), sigue siendo un cliente
+    válido y la gente no debería perder el acceso a él por eso."""
+    todos = st.session_state.catalogos["clientes_lista"]
     if perfil == "Administrador":
         return todos
     return [c for c in st.session_state.catalogos["usuario_clientes"].get(usuario, []) if c in todos]
@@ -1704,8 +1708,14 @@ with tab1:
 
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
         marchamo_regreso_actual = st.session_state.get(f"mreg_final_{run}", "")
-        tiendas_cliente = st.session_state.catalogos["clientes"][cliente_activo]
+        tiendas_cliente = st.session_state.catalogos["clientes"].get(cliente_activo, {})
         es_cliente_unisuper = cliente_activo.startswith("UniSuper")
+
+        if not tiendas_cliente:
+            st.warning(f"⚠️ El cliente **{cliente_activo}** todavía no tiene ninguna tienda cargada en el "
+                       "catálogo de Clientes y Tiendas — no se puede despachar sin al menos una. "
+                       "Pídele a un Administrador o Supervisor que las cargue en la pestaña Catálogos.")
+            st.stop()
 
         col_main, col_side = st.columns([2.2, 1], gap="medium")
 
@@ -2518,6 +2528,14 @@ with tab4:
     else:
         st.header(":material/settings: Gestión de Catálogos")
 
+        # Mensaje de resultado de la última acción — se guarda antes del rerun()
+        # para que sobreviva a la recarga y de verdad se alcance a leer, en vez
+        # de aparecer y desaparecer en el mismo instante.
+        flash = st.session_state.pop("flash_catalogos", None)
+        if flash:
+            tipo, mensaje = flash
+            getattr(st, tipo)(mensaje)
+
         if perfil_activo == "Administrador":
             catalogos_disponibles = list(CATALOGOS_CONFIG.keys())
             mis_clientes = None  # sin restricción
@@ -2563,13 +2581,14 @@ with tab4:
             else:
                 ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_editado[config["columnas"]], usuario_activo, mis_clientes, permitir_borrado=True)
                 if ok:
-                    st.success("✅ Tabla actualizada.")
+                    texto = "✅ Tabla actualizada correctamente."
                     if msg != "OK":
-                        st.warning(msg)
+                        texto += f"\n\n⚠️ {msg}"
+                    st.session_state["flash_catalogos"] = ("success", texto)
                     st.session_state.catalogos = cargar_catalogos_desde_db()
                     st.rerun()
                 else:
-                    st.error(f"❌ Error: {msg}")
+                    st.error(f"❌ Error, no se guardó nada: {msg}")
         st.caption(f"{len(df_actual)} registro(s) actualmente.")
         st.download_button(
             ":material/download: Descargar datos actuales (Excel)",
@@ -2650,17 +2669,17 @@ with tab4:
             else:
                 # Si el registro trae un cliente que todavía no existe en el catálogo
                 # de Clientes, hay que crearlo primero — si no, la llave foránea lo rechaza.
-                # (Solo aplica cuando NO hay alcance limitado — un Administrador de
-                # Catálogos nunca puede crear un cliente nuevo.)
+                # (Solo aplica cuando NO hay alcance limitado — un Supervisor nunca
+                # puede crear un cliente nuevo por su cuenta.)
                 if "cliente" in valores_form and catalogo_sel != "Clientes" and mis_clientes is None:
                     agregar_o_actualizar_registro("cat_clientes", ["nombre"], ["nombre"], {"nombre": valores_form["cliente"]}, usuario_activo)
                 ok, msg = agregar_o_actualizar_registro(config["tabla"], config["columnas"], config["clave"], valores_form, usuario_activo, mis_clientes)
                 if ok:
-                    st.success("✅ Registro guardado.")
+                    st.session_state["flash_catalogos"] = ("success", "✅ Registro guardado correctamente.")
                     st.session_state.catalogos = cargar_catalogos_desde_db()
                     st.rerun()
                 else:
-                    st.error(f"❌ Error: {msg}")
+                    st.error(f"❌ Error, no se guardó nada: {msg}")
 
         if not df_actual.empty:
             st.markdown("#### 🗑️ Eliminar un registro")
@@ -2670,11 +2689,11 @@ with tab4:
                 valores_clave = dict(zip(config["clave"], registro_borrar.split(" | ")))
                 ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave, usuario_activo, mis_clientes)
                 if ok:
-                    st.success("✅ Registro eliminado.")
+                    st.session_state["flash_catalogos"] = ("success", "✅ Registro eliminado correctamente.")
                     st.session_state.catalogos = cargar_catalogos_desde_db()
                     st.rerun()
                 else:
-                    st.error(f"❌ Error: {msg}")
+                    st.error(f"❌ Error, no se pudo eliminar (probablemente está en uso en otra tabla): {msg}")
 
         st.markdown("---")
         st.markdown("#### 📤 Carga masiva (Excel)")
@@ -2707,13 +2726,15 @@ with tab4:
                     if st.button("🔄 Actualizar Catálogo"):
                         ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_nuevo, usuario_activo, mis_clientes)
                         if ok:
-                            st.success(f"✅ Catálogo '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s).")
+                            texto = f"✅ Carga masiva completada: '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s)."
                             if msg != "OK":
-                                st.warning(msg)
+                                texto += f"\n\n⚠️ {msg}"
+                            st.session_state["flash_catalogos"] = ("success", texto)
                             st.session_state.catalogos = cargar_catalogos_desde_db()
                             st.rerun()
                         else:
-                            st.error(f"❌ Error al actualizar: {msg}")
+                            st.session_state["flash_catalogos"] = ("error", f"❌ La carga masiva tuvo errores y no se aplicó ningún cambio: {msg}")
+                            st.rerun()
             except Exception as e:
                 st.error(f"❌ No se pudo leer el archivo: {e}")
 
@@ -2745,11 +2766,12 @@ with tab4:
                     if st.button(":material/delete_forever: Borrar Definitivamente", disabled=(confirmacion.strip() != frase_esperada)):
                         ok, resultado = borrar_masivo(config_borrar["tabla"], "cliente" if tiene_cliente else None, alcance_sel, usuario_activo)
                         if ok:
-                            st.success(f"✅ Se borraron {resultado} registro(s) de '{catalogo_borrar}'.")
+                            st.session_state["flash_catalogos"] = ("success", f"✅ Borrado masivo completado: se borraron {resultado} registro(s) de '{catalogo_borrar}'.")
                             st.session_state.catalogos = cargar_catalogos_desde_db()
                             st.rerun()
                         else:
-                            st.error(f"❌ No se pudo borrar (probablemente algo ahí está en uso en Camiones o Viajes): {resultado}")
+                            st.session_state["flash_catalogos"] = ("error", f"❌ El borrado masivo falló, no se borró nada (probablemente algo ahí está en uso en Camiones o Viajes): {resultado}")
+                            st.rerun()
 
 # ==========================================
 # MÓDULO 6: GESTIÓN DE USUARIOS — Administrador ve y administra a todos;
