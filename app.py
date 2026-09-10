@@ -680,10 +680,13 @@ def establecer_password(usuario, password_nueva, forzar_cambio_siguiente=False, 
             return False, str(e)
 
 
-def crear_usuario(usuario, perfil, creado_por):
+def crear_usuario(usuario, perfil, creado_por, clientes=None):
     """Crea un usuario nuevo con una contraseña temporal generada al azar
     (se le muestra una sola vez a quien lo crea, para que se la pase a la persona).
-    Queda forzado a cambiarla en su primer ingreso."""
+    Queda forzado a cambiarla en su primer ingreso.
+    `clientes`: lista de clientes a los que se le da acceso EN EL MISMO PASO —
+    así no puede quedar un usuario creado sin ningún cliente asignado, que es
+    justo lo que lo deja atorado en 'no tienes ningún cliente asignado'."""
     password_temp = generar_password_temporal()
     salt, hashed = hash_password(password_temp)
     with closing(get_conn()) as conn:
@@ -694,8 +697,14 @@ def crear_usuario(usuario, perfil, creado_por):
                     "debe_cambiar_password, creado_por) VALUES (%s,%s,%s,%s,TRUE,TRUE,%s)",
                     (usuario, perfil, hashed, salt, creado_por)
                 )
+                for cliente in (clientes or []):
+                    cur.execute(
+                        "INSERT INTO cat_usuario_clientes (usuario, cliente) VALUES (%s,%s) "
+                        "ON CONFLICT (usuario, cliente) DO NOTHING",
+                        (usuario, cliente)
+                    )
             conn.commit()
-            registrar_auditoria(creado_por, "Crear usuario", f"Usuario nuevo: {usuario} · Perfil: {perfil}")
+            registrar_auditoria(creado_por, "Crear usuario", f"Usuario nuevo: {usuario} · Perfil: {perfil} · Clientes: {', '.join(clientes or []) or '(ninguno)'}")
             return True, password_temp
         except Exception as e:
             conn.rollback()
@@ -1047,7 +1056,8 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                          dest.get("tipo_pago", "Local"))
                     )
             conn.commit()
-            registrar_auditoria(usuario, "Crear viaje", f"Viaje {id_viaje_str} · Cliente {cliente} · Placa {placa}")
+            orden_tiendas = " → ".join(f"{i+1}) {d['tienda']}" for i, d in enumerate(destinos_viaje))
+            registrar_auditoria(usuario, "Crear viaje", f"Viaje {id_viaje_str} · Cliente {cliente} · Placa {placa} · Orden de paradas: {orden_tiendas}")
             return True, id_viaje_str
         except psycopg2.IntegrityError as e:
             conn.rollback()
@@ -1294,7 +1304,8 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                          d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"], d["id"])
                     )
             conn.commit()
-            registrar_auditoria(usuario_editor, "Editar viaje", f"Viaje ID {viaje_id} · Placa {placa}")
+            orden_tiendas_edit = " → ".join(f"{d['orden']}) {d['tienda']}" for d in sorted(destinos_actualizados, key=lambda x: x["orden"]))
+            registrar_auditoria(usuario_editor, "Editar viaje", f"Viaje ID {viaje_id} · Placa {placa} · Orden de paradas: {orden_tiendas_edit}")
             return True, "OK"
         except Exception as e:
             conn.rollback()
@@ -2880,13 +2891,25 @@ with tab6:
             nuevo_usuario = st.text_input("Nombre de usuario", key="nuevo_usuario_gestion")
         with nc2:
             nuevo_perfil = st.selectbox("Perfil", perfiles_asignables, key="nuevo_perfil_gestion")
+
+        clientes_para_ofrecer = sorted(clientes_permitidos_para(usuario_activo, perfil_activo)) if perfil_activo != "Administrador" \
+            else sorted(st.session_state.catalogos["clientes_lista"])
+        if nuevo_perfil != "Administrador":
+            st.caption("Los clientes se asignan aquí mismo — un usuario sin ningún cliente asignado se queda "
+                       "atorado al entrar, así que ya no se puede crear uno sin elegir al menos uno.")
+            nuevos_clientes = st.multiselect("Clientes con acceso", clientes_para_ofrecer, key="nuevos_clientes_gestion")
+        else:
+            nuevos_clientes = []  # Administrador ve todos los clientes automáticamente, no hace falta asignarle nada
+
         if st.button(":material/person_add: Crear Usuario", key="btn_crear_usuario"):
             if not nuevo_usuario.strip():
                 st.warning("Escribe un nombre de usuario.")
+            elif nuevo_perfil != "Administrador" and not nuevos_clientes:
+                st.error("❌ Debes asignarle al menos un cliente — si no, el usuario queda sin poder entrar a trabajar.")
             else:
-                ok, resultado = crear_usuario(nuevo_usuario.strip(), nuevo_perfil, usuario_activo)
+                ok, resultado = crear_usuario(nuevo_usuario.strip(), nuevo_perfil, usuario_activo, nuevos_clientes)
                 if ok:
-                    st.success(f"✅ Usuario '{nuevo_usuario.strip()}' creado.")
+                    st.success(f"✅ Usuario '{nuevo_usuario.strip()}' creado, con acceso a: {', '.join(nuevos_clientes) or 'todos los clientes (Administrador)'}.")
                     st.info(f"🔑 Contraseña temporal (cópiala y pásasela — no se vuelve a mostrar): **{resultado}**")
                     st.caption("Quedará forzado a cambiarla en su primer ingreso.")
                     st.session_state.catalogos = cargar_catalogos_desde_db()
