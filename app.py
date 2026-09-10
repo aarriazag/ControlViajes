@@ -560,7 +560,7 @@ def cargar_catalogos_desde_db():
     """Lee las 6 tablas de catálogos y arma el mismo diccionario que antes vivía
     quemado en el código, para que el resto de la app no tenga que cambiar nada."""
     with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT usuario, perfil FROM cat_usuarios")
+        cur.execute("SELECT usuario, perfil FROM cat_usuarios ORDER BY usuario")
         usuarios = {r["usuario"]: r["perfil"] for r in cur.fetchall()}
 
         cur.execute("SELECT nombre FROM cat_transportistas ORDER BY nombre")
@@ -581,7 +581,7 @@ def cargar_catalogos_desde_db():
         for r in cur.fetchall():
             clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "clasificacion": r["clasificacion"] or "Local"}
 
-        cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion")
+        cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion ORDER BY tipo")
         rendimiento = {r["tipo"]: r["km_por_galon"] for r in cur.fetchall()}
 
         cur.execute("SELECT cliente, cd FROM cat_cds_por_cliente ORDER BY cliente, cd")
@@ -589,7 +589,7 @@ def cargar_catalogos_desde_db():
         for r in cur.fetchall():
             cds_por_cliente.setdefault(r["cliente"], []).append(r["cd"])
 
-        cur.execute("SELECT usuario, cliente FROM cat_usuario_clientes")
+        cur.execute("SELECT usuario, cliente FROM cat_usuario_clientes ORDER BY usuario, cliente")
         usuario_clientes = {}
         for r in cur.fetchall():
             usuario_clientes.setdefault(r["usuario"], []).append(r["cliente"])
@@ -622,6 +622,16 @@ def clientes_permitidos_para(usuario, perfil):
     if perfil == "Administrador":
         return todos
     return [c for c in st.session_state.catalogos["usuario_clientes"].get(usuario, []) if c in todos]
+
+
+def cuenta_sigue_activa(usuario):
+    """Revisa el estado 'activo' de la cuenta contra la base de datos — se usa
+    en CADA acción (no solo al iniciar sesión), para que desactivar a alguien
+    lo saque de la app de inmediato, aunque ya tuviera una sesión abierta."""
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT activo FROM cat_usuarios WHERE usuario = %s", (usuario,))
+        row = cur.fetchone()
+        return bool(row and row[0])
 
 
 def _credenciales_validas(usuario, password):
@@ -1202,16 +1212,21 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
     """Marca el viaje como Anulado (no lo borra, queda como registro para auditoría).
     Por defecto libera los marchamos de sus destinos para que puedan reutilizarse en
     otro viaje, ya que un viaje anulado normalmente significa un error de digitación,
-    no un marchamo físicamente gastado. Esto es ajustable con liberar_marchamos=False."""
+    no un marchamo físicamente gastado. Esto es ajustable con liberar_marchamos=False.
+    Si el viaje YA estaba Anulado, no hace nada — evita doblar el sufijo del marchamo
+    y perder el motivo/fecha de la anulación original."""
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
                 fecha_hoy = ahora().strftime("%Y-%m-%d %H:%M:%S")
                 cur.execute(
                     "UPDATE viajes SET estado='Anulado', usuario_anulo=%s, "
-                    "fecha_anulacion=%s, motivo_anulacion=%s WHERE id=%s",
+                    "fecha_anulacion=%s, motivo_anulacion=%s WHERE id=%s AND estado != 'Anulado'",
                     (usuario, fecha_hoy, motivo, viaje_id)
                 )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return False, "Este viaje ya estaba Anulado — alguien más lo anuló mientras tenías esta pantalla abierta."
                 if liberar_marchamos:
                     # Libera los marchamos poniéndolos como usados-pero-anulados con un
                     # sufijo único, para que marchamo_ya_usado() ya no los bloquee.
@@ -1260,9 +1275,13 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                         return False, f"El marchamo de regreso '{marchamo_regreso_viaje}' ya está en uso en otro viaje."
 
                 cur.execute(
-                    "UPDATE viajes SET placa=%s, transportista=%s, piloto=%s, auxiliar=%s WHERE id=%s",
+                    "UPDATE viajes SET placa=%s, transportista=%s, piloto=%s, auxiliar=%s "
+                    "WHERE id=%s AND estado = 'Pendiente de Liquidar'",
                     (placa, transportista, piloto, auxiliar, viaje_id)
                 )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return False, "Este viaje ya no está 'Pendiente de Liquidar' — alguien más lo liquidó o anuló mientras tenías esta pantalla abierta, así que ya no se puede editar."
                 destino_final_id = max(destinos_actualizados, key=lambda d: d["orden"])["id"]
                 for d in destinos_actualizados:
                     marchamo_regreso_d = marchamo_regreso_viaje if d["id"] == destino_final_id else None
@@ -1479,7 +1498,9 @@ def generar_hoja_control_html(viaje, destinos):
 
 def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
     """Registra lo que el camión trajo de regreso por cada destino y marca el viaje como Liquidado.
-    destinos_actualizados: lista de dicts con id, roles_devueltos, tarimas_devueltas, pacas_carton_devueltas."""
+    destinos_actualizados: lista de dicts con id, roles_devueltos, tarimas_devueltas, pacas_carton_devueltas.
+    Solo aplica si el viaje SIGUE Pendiente de Liquidar en este momento — si alguien más
+    ya lo liquidó o anuló mientras esta pantalla estaba abierta, no se pisa nada."""
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
@@ -1493,9 +1514,13 @@ def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
                 hora_hoy = ahora().strftime("%H:%M:%S")
                 cur.execute(
                     "UPDATE viajes SET estado='Liquidado', usuario_liquido=%s, "
-                    "fecha_liquidacion=%s, hora_liquidacion=%s WHERE id=%s",
+                    "fecha_liquidacion=%s, hora_liquidacion=%s "
+                    "WHERE id=%s AND estado='Pendiente de Liquidar'",
                     (usuario, fecha_hoy, hora_hoy, viaje_id)
                 )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return False, "Este viaje ya no está 'Pendiente de Liquidar' — alguien más lo liquidó o anuló mientras tenías esta pantalla abierta. Refresca y revisa su estado actual."
             conn.commit()
             registrar_auditoria(usuario, "Liquidar viaje", f"Viaje ID {viaje_id}")
             return True, "OK"
@@ -1568,6 +1593,16 @@ if not st.session_state.get("login_confirmado"):
 
 usuario_activo = st.session_state["usuario_activo_fijo"]
 perfil_activo = st.session_state["perfil_activo_fijo"]
+
+# Se revisa en CADA acción, no solo al entrar — así, si un Administrador
+# desactiva esta cuenta mientras ya está trabajando, se cierra la sesión de
+# inmediato en vez de esperar a que la persona cierre sesión por su cuenta.
+if not cuenta_sigue_activa(usuario_activo):
+    st.error("🚫 Tu cuenta fue desactivada. Contacta a un Administrador si crees que es un error.")
+    for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password",
+              "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo"):
+        st.session_state.pop(k, None)
+    st.stop()
 
 # --- PANTALLA 1B: Cambio de contraseña obligatorio (primer ingreso, o tras un
 # restablecimiento). No se puede pasar de aquí sin poner una contraseña nueva.
@@ -2692,7 +2727,7 @@ with tab4:
             elif col == "clasificacion":
                 valores_form["clasificacion"] = st.selectbox("Clasificación (Local/Departamental)", ["Local", "Departamental"], key=f"campo_{catalogo_sel}_clasificacion_sel")
             elif col in config["numericas"]:
-                valores_form[col] = st.number_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+                valores_form[col] = st.number_input(col.replace("_", " ").title(), min_value=0.0, step=1.0, key=f"campo_{catalogo_sel}_{col}")
             else:
                 valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
         guardar_registro = st.button(":material/save: Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
