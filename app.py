@@ -14,6 +14,14 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import closing
 
+# --- VERSIÓN DE LA APP ---
+# Formato estándar Mayor.Menor.Parche:
+#   Parche  (el último número) = cambios chiquitos/estéticos (ej. 1.4.2 → 1.4.3)
+#   Menor   (el de en medio)   = funciones o reportes nuevos, sin romper nada existente (ej. 1.4.9 → 1.5.0)
+#   Mayor   (el primero)       = cambio de fondo en cómo funciona la herramienta (ej. 1.9.4 → 2.0.0)
+# Se actualiza a mano en cada entrega — no se calcula solo.
+VERSION_APP = "1.0.0"
+
 # Configuración de la página web con estilo e identidad corporativa
 st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon="🚚")
 
@@ -1113,7 +1121,7 @@ def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
                 cam.tipo AS "Tonelaje",
                 v.transportista AS "Transportista",
                 tr.razon_social AS "Razón Social",
-                ag.bultos AS "Bultos (Cajas)"
+                ag.bultos AS "Bultos"
             FROM viajes v
             JOIN agregado ag ON ag.viaje_id = v.id
             JOIN mas_lejano ml ON ml.viaje_id = v.id
@@ -1337,7 +1345,7 @@ def generar_hoja_control_html(viaje, destinos):
         incidencia_txt = d["incidencias"] or ""
         incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
         material_cajas = (
-            f'<div class="material-box"><b>{d["cajas"]}</b><span>CAJAS</span></div>'
+            f'<div class="material-box"><b>{d["cajas"]}</b><span>BULTOS</span></div>'
             if not d["es_complemento"] else ""
         )
         documentos_html = (
@@ -1377,7 +1385,7 @@ def generar_hoja_control_html(viaje, destinos):
                         <div class="material-box"><b>{d['tarimas']}</b><span>TARIMAS</span></div>
                         {material_cajas}
                     </div>
-                    <div class="sub-info sub-info-grande">No. de Pedidos: <b>{pedidos_txt}</b></div>
+                    <div class="sub-info sub-info-grande">No. de Despachos: <b>{pedidos_txt}</b></div>
                     {documentos_html}
                     {incidencia_html}
                     <div class="sello-area">
@@ -1498,7 +1506,7 @@ def generar_hoja_control_html(viaje, destinos):
         <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
         {bloques_destino}
         <div class="footer">
-            <span>Hoja generada por el sistema Control de Ruta · Ransa</span>
+            <span>Hoja generada por el sistema Control de Ruta · Ransa · v{VERSION_APP}</span>
             <span>Sellar y entregar al finalizar el viaje para su liquidación.</span>
         </div>
     </div>
@@ -1858,17 +1866,17 @@ with tab1:
                             if not es_complemento:
                                 fp1, fp2, fp3 = st.columns([1.6, 1, 1])
                                 with fp1:
-                                    pedido_codigo = st.text_input("No. de Pedido", key=f"cod_pedido_{run}_{i}_{subrun}")
+                                    pedido_codigo = st.text_input("No. de Despacho", key=f"cod_pedido_{run}_{i}_{subrun}")
                                 with fp2:
-                                    pedido_cajas = st.number_input("Cajas del pedido", min_value=0, step=1, value=None, placeholder="0", key=f"cajas_pedido_{run}_{i}_{subrun}") or 0
+                                    pedido_cajas = st.number_input("Bultos del despacho", min_value=0, step=1, value=None, placeholder="0", key=f"cajas_pedido_{run}_{i}_{subrun}") or 0
                                 with fp3:
                                     st.write("")
-                                    agregar_pedido = st.button(":material/add: Agregar Pedido", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
+                                    agregar_pedido = st.button(":material/add: Agregar Despacho", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
                                 if agregar_pedido:
                                     if not pedido_codigo.strip():
-                                        st.warning("Escribe un número de pedido antes de agregarlo.")
+                                        st.warning("Escribe un número de despacho antes de agregarlo.")
                                     elif pedido_cajas <= 0:
-                                        st.warning("⚠️ Ese pedido no tiene cajas — indica cuántas cajas trae antes de agregarlo.")
+                                        st.warning("⚠️ Ese despacho no tiene bultos — indica cuántos bultos trae antes de agregarlo.")
                                     else:
                                         cajas_wms = validar_pedido_wms(pedido_codigo.strip())
                                         lista_pedidos.append({
@@ -1894,12 +1902,12 @@ with tab1:
                             mf1, mf2, mf3, mf4 = st.columns(4)
                             with mf1:
                                 if es_complemento:
-                                    st.number_input("Cajas Totales", value=0, disabled=True, key=f"c_disabled_{run}_{i}")
+                                    st.number_input("Bultos Totales", value=0, disabled=True, key=f"c_disabled_{run}_{i}")
                                 elif lista_pedidos:
                                     cajas_total = sum(p["cajas"] for p in lista_pedidos)
-                                    st.number_input("Cajas Totales", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
+                                    st.number_input("Bultos Totales", value=cajas_total, disabled=True, key=f"c_calc_{run}_{i}")
                                 else:
-                                    cajas_total = st.number_input("Cajas Totales", min_value=0, step=1, value=None, placeholder="0", key=f"c_{run}_{i}") or 0
+                                    cajas_total = st.number_input("Bultos Totales", min_value=0, step=1, value=None, placeholder="0", key=f"c_{run}_{i}") or 0
                             with mf2:
                                 tarimas = st.number_input("Tarimas", min_value=0, step=1, value=None, placeholder="0", key=f"tar_{run}_{i}") or 0
                             with mf3:
@@ -1984,7 +1992,7 @@ with tab1:
                 distancia_total = round(sum(d["km"] for d in destinos_viaje), 1)
 
                 resumen_items = [
-                    ("Cajas", total_cajas), ("Tarimas", total_tarimas),
+                    ("Bultos", total_cajas), ("Tarimas", total_tarimas),
                     ("Roles", total_roles), ("Tiendas", cantidad_tiendas),
                 ]
                 rcols = st.columns(len(resumen_items))
@@ -2005,7 +2013,7 @@ with tab1:
                     for idx, d in enumerate(destinos_viaje, start=1):
                         st.markdown(f"**{idx}. {d['tienda'] or '—'}**")
                         st.caption(f"Marchamo Ida: {d['marchamo_ida'] or '—'}")
-                        st.caption(f"Tarimas: {d['tarimas']} · Roles: {d['roles']} · Cajas: {d['cajas']}")
+                        st.caption(f"Tarimas: {d['tarimas']} · Roles: {d['roles']} · Bultos: {d['cajas']}")
                         if idx == len(destinos_viaje) and marchamo_regreso_actual:
                             st.markdown(f":material/lock: **Marchamo Regreso:** {marchamo_regreso_actual}")
                         st.markdown("---")
@@ -2057,12 +2065,12 @@ with tab1:
 
         if st.session_state.get("ultimo_viaje_guardado"):
             st.markdown("---")
-            if st.button(f"🖨️ Ver Hoja de Control del viaje {st.session_state['ultimo_viaje_guardado']}"):
-                resultados = buscar_viajes(st.session_state["ultimo_viaje_guardado"])
-                if resultados:
-                    v = resultados[0]
-                    d = obtener_destinos_de_viaje(v["id"])
-                    components.html(generar_hoja_control_html(v, d), height=900, scrolling=True)
+            st.success(f"✅ Viaje {st.session_state['ultimo_viaje_guardado']} generado — revisa la Hoja de Control abajo e imprímela si corresponde.")
+            resultados = buscar_viajes(st.session_state["ultimo_viaje_guardado"])
+            if resultados:
+                v = resultados[0]
+                d = obtener_destinos_de_viaje(v["id"])
+                components.html(generar_hoja_control_html(v, d), height=900, scrolling=True)
 
         st.markdown("### 🕒 Últimos viajes registrados")
         st.dataframe(obtener_viajes_recientes(), use_container_width=True, height=280)
@@ -2336,7 +2344,7 @@ with tab5:
                             with e2:
                                 tarimas_e = st.number_input("Tarimas", min_value=0, step=1, value=d["tarimas"], key=f"etarimas_{d['id']}")
                             with e3:
-                                cajas_e = st.number_input("Cajas", min_value=0, step=1, value=d["cajas"], key=f"ecajas_{d['id']}")
+                                cajas_e = st.number_input("Bultos", min_value=0, step=1, value=d["cajas"], key=f"ecajas_{d['id']}")
                             mida_e = st.text_input("Marchamo Ida", value=d["marchamo_ida"], key=f"emida_{d['id']}")
                             dc1, dc2, dc3, dc4 = st.columns(4)
                             with dc1:
@@ -2415,7 +2423,7 @@ with tab5:
 # ==========================================
 with tab3:
     reporte_sel = st.selectbox(
-        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable", "Cajas por Camión (próximamente)"]
+        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable", "Bultos por Camión (próximamente)"]
     )
 
     if reporte_sel == "Bitácora de Viajes":
@@ -3010,7 +3018,7 @@ with tab6:
 st.markdown("---")
 st.markdown(
     "<div style='text-align:center; color:#5B6169; font-size:12px; padding:8px 0;'>"
-    "Ransa · Sistema de Control de Ruta · Ideado por Ángel Arriaza"
+    f"Ransa · Sistema de Control de Ruta · v{VERSION_APP} · Ideado por Ángel Arriaza"
     "</div>",
     unsafe_allow_html=True
 )
