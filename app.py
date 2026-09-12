@@ -1477,6 +1477,22 @@ def obtener_destinos_de_viaje(viaje_id):
         return cur.fetchall()
 
 
+def buscar_viajes(valor_busqueda, clientes_permitidos=None):
+    """Búsqueda libre por No. de Viaje, Marchamo de Ida o Placa — no hace falta
+    escribirlo completo (usa coincidencia parcial, tipo 'contiene'). Respeta
+    `clientes_permitidos` si se pasa, igual que filtrar_viajes()."""
+    patron = f"%{str(valor_busqueda).strip()}%"
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT DISTINCT v.* FROM viajes v
+            LEFT JOIN destinos d ON d.viaje_id = v.id
+            WHERE (v.id_viaje ILIKE %s OR v.placa ILIKE %s OR d.marchamo_ida ILIKE %s)
+              AND (%s::text[] IS NULL OR v.cliente = ANY(%s))
+            ORDER BY v.id DESC LIMIT 50
+        """, (patron, patron, patron, clientes_permitidos, clientes_permitidos))
+        return cur.fetchall()
+
+
 def filtrar_viajes(estado="Todos", placa="Todas", limite=50, clientes_permitidos=None):
     """Filtro rápido por Estado y/o Placa, para encontrar viajes sin tener que
     escribir un texto exacto de búsqueda. Igual que buscar_viajes(), respeta
