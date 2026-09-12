@@ -87,6 +87,69 @@ def registrar_auditoria(usuario, accion, detalle=""):
     except Exception as e:
         print(f"[auditoria] No se pudo registrar: {e}")
 
+
+_MARCADOR_ERROR_TECNICO = "⚠️TECNICO⚠️"
+
+
+def _error_tecnico(e, contexto=""):
+    """Se usa DENTRO del except de las funciones que hablan con la base de
+    datos. Nunca se le entrega el mensaje crudo de la excepción a nadie —
+    pero SÍ se muestra, a cualquier rol, en qué parte de la app pasó y de qué
+    tipo de error se trata (eso no expone nada sensible, y hace que una
+    simple captura de pantalla ya traiga con qué empezar a revisar, sin
+    depender de que alguien entre a Render). El texto completo de la
+    excepción se manda siempre a la consola del servidor."""
+    fecha_hora = ahora().strftime("%Y-%m-%d %H:%M:%S")
+    tipo_error = type(e).__name__
+    print(f"[ERROR {fecha_hora}] {contexto} ({tipo_error}): {e}")
+    return f"{_MARCADOR_ERROR_TECNICO}{fecha_hora}||{contexto}||{tipo_error}::{e}"
+
+
+@st.dialog("⚠️ Este viaje ya cambió")
+def _dialog_conflicto_concurrencia(mensaje):
+    """Ventana emergente para cuando dos personas trabajan el mismo viaje casi
+    al mismo tiempo — es fácil que este aviso se pierda si solo aparece hasta
+    abajo de una pantalla larga, así que aquí sí interrumpe de verdad."""
+    st.warning(mensaje)
+    st.caption("No es un error del sistema — solo significa que alguien más ya actuó sobre este viaje.")
+    if st.button("Entendido, voy a revisar el viaje de nuevo", use_container_width=True):
+        st.rerun()
+
+
+def mostrar_resultado_error(msg, perfil_activo_usuario=None):
+    """Muestra el resultado de una función de base de datos que falló.
+    Si es un mensaje de negocio normal (ej. 'el marchamo ya existe'), se
+    muestra tal cual — eso el usuario SÍ lo necesita leer completo.
+    Si es un conflicto de dos personas editando el mismo viaje a la vez, se
+    muestra como ventana emergente, para que no se pierda de vista.
+    Si viene marcado como error técnico (_error_tecnico): a CUALQUIER rol se
+    le muestra dónde pasó, de qué tipo fue, y cuándo — pensado para que una
+    simple captura de pantalla, mandada por cualquier persona (no solo un
+    Administrador viéndolo en vivo), ya sea suficiente para empezar a
+    revisarlo sin depender de entrar a Render. El mensaje crudo de la
+    excepción sigue sin mostrarse — eso solo lo ve un Administrador, en un
+    desplegable aparte, por si acaso alguien con ese rol lo está viendo en
+    el momento."""
+    if isinstance(msg, str) and msg.startswith(_MARCADOR_ERROR_TECNICO):
+        resto = msg[len(_MARCADOR_ERROR_TECNICO):]
+        partes, _, detalle_completo = resto.partition("::")
+        try:
+            fecha_hora, contexto, tipo_error = partes.split("||")
+        except ValueError:
+            fecha_hora, contexto, tipo_error = partes, "?", "?"
+        st.error(
+            f"❌ Ocurrió un error al procesar la solicitud.\n\n"
+            f"**Dónde:** `{contexto}`  \n**Tipo:** `{tipo_error}`  \n**Cuándo:** `{fecha_hora}`\n\n"
+            f"Manda una captura de esto tal cual — con esta información ya se puede empezar a revisar."
+        )
+        if perfil_activo_usuario in ("Administrador", "SuperAdministrador"):
+            with st.expander("🔧 Detalle técnico completo (solo Administrador)"):
+                st.code(detalle_completo, language="text")
+    elif isinstance(msg, str) and "alguien más" in msg:
+        _dialog_conflicto_concurrencia(msg)
+    else:
+        st.error(f"❌ {msg}")
+
 # --- SISTEMA DE DISEÑO RANSA ---
 # Paleta: verde corporativo como color de marca, grises neutros para texto y
 # fondos, tarjetas con sombra sutil y tipografía consistente — pensado para que
@@ -395,15 +458,19 @@ def init_db():
         cur.execute("CREATE TABLE IF NOT EXISTS cat_transportistas (nombre TEXT PRIMARY KEY)")
         cur.execute("ALTER TABLE cat_transportistas ADD COLUMN IF NOT EXISTS razon_social TEXT")
         cur.execute("ALTER TABLE cat_transportistas ADD COLUMN IF NOT EXISTS codigo SERIAL")
+        cur.execute("ALTER TABLE cat_transportistas ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_pilotos (nombre TEXT PRIMARY KEY)")
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS codigo SERIAL")
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_auxiliares (nombre TEXT PRIMARY KEY)")
         cur.execute("ALTER TABLE cat_auxiliares ADD COLUMN IF NOT EXISTS codigo SERIAL")
+        cur.execute("ALTER TABLE cat_auxiliares ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_camiones (
                 placa TEXT PRIMARY KEY, tipo TEXT, transportista TEXT, piloto TEXT, auxiliar TEXT
             )
         """)
+        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_clientes_tiendas (
                 cliente TEXT, tienda TEXT, km REAL,
@@ -450,6 +517,7 @@ def init_db():
         # Clientes como catálogo propio (antes solo existían "implícitos" dentro de
         # Clientes y Tiendas) — necesario para poder referenciarlos con llave foránea.
         cur.execute("CREATE TABLE IF NOT EXISTS cat_clientes (id SERIAL, nombre TEXT PRIMARY KEY)")
+        cur.execute("ALTER TABLE cat_clientes ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
         # Bitácora de auditoría: quién hizo qué y cuándo, en toda la app.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS auditoria (
@@ -518,7 +586,7 @@ def init_db():
             )
             cur.executemany(
                 "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s) ON CONFLICT (usuario) DO NOTHING",
-                [("Admin_Logistica", "Administrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
+                [("Admin_Logistica", "SuperAdministrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
             )
             # Por defecto, los usuarios de ejemplo (no-Administrador) ven todos los
             # clientes sembrados, para no romper nada mientras ajustas los accesos reales.
@@ -599,16 +667,16 @@ def cargar_catalogos_desde_db():
         cur.execute("SELECT usuario, perfil FROM cat_usuarios ORDER BY usuario")
         usuarios = {r["usuario"]: r["perfil"] for r in cur.fetchall()}
 
-        cur.execute("SELECT nombre FROM cat_transportistas ORDER BY nombre")
+        cur.execute("SELECT nombre FROM cat_transportistas WHERE activo = TRUE ORDER BY nombre")
         transportistas = [r["nombre"] for r in cur.fetchall()]
 
-        cur.execute("SELECT nombre FROM cat_pilotos ORDER BY nombre")
+        cur.execute("SELECT nombre FROM cat_pilotos WHERE activo = TRUE ORDER BY nombre")
         pilotos = [r["nombre"] for r in cur.fetchall()]
 
-        cur.execute("SELECT nombre FROM cat_auxiliares ORDER BY nombre")
+        cur.execute("SELECT nombre FROM cat_auxiliares WHERE activo = TRUE ORDER BY nombre")
         auxiliares = [r["nombre"] for r in cur.fetchall()]
 
-        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar FROM cat_camiones ORDER BY placa")
+        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar FROM cat_camiones WHERE activo = TRUE ORDER BY placa")
         camiones = {r["placa"]: {"tipo": r["tipo"], "transportista": r["transportista"],
                                   "piloto": r["piloto"], "auxiliar": r["auxiliar"]} for r in cur.fetchall()}
 
@@ -632,6 +700,13 @@ def cargar_catalogos_desde_db():
 
         cur.execute("SELECT nombre FROM cat_clientes ORDER BY nombre")
         clientes_lista = [r["nombre"] for r in cur.fetchall()]
+        # Aparte, solo los activos — para los menús donde se ASIGNA algo nuevo
+        # (Despacho, dar acceso a un usuario, agregar una tienda). Los Reportes
+        # y clientes_permitidos_para() siguen usando clientes_lista completa,
+        # para no perder la posibilidad de consultar el historial de un
+        # cliente que ya se desactivó.
+        cur.execute("SELECT nombre FROM cat_clientes WHERE activo = TRUE ORDER BY nombre")
+        clientes_lista_activos = [r["nombre"] for r in cur.fetchall()]
 
         return {
             "usuarios": usuarios,
@@ -641,6 +716,7 @@ def cargar_catalogos_desde_db():
             "camiones": camiones,
             "clientes": clientes,
             "clientes_lista": clientes_lista,
+            "clientes_lista_activos": clientes_lista_activos,
             "rendimiento": rendimiento,
             "cds_por_cliente": cds_por_cliente,
             "usuario_clientes": usuario_clientes
@@ -655,7 +731,7 @@ def clientes_permitidos_para(usuario, perfil):
     tienda (por ejemplo, tras un Borrado Masivo), sigue siendo un cliente
     válido y la gente no debería perder el acceso a él por eso."""
     todos = st.session_state.catalogos["clientes_lista"]
-    if perfil == "Administrador":
+    if perfil in ("Administrador", "SuperAdministrador"):
         return todos
     return [c for c in st.session_state.catalogos["usuario_clientes"].get(usuario, []) if c in todos]
 
@@ -748,7 +824,7 @@ def establecer_password(usuario, password_nueva, forzar_cambio_siguiente=False, 
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "establecer_password")
 
 
 def crear_usuario(usuario, perfil, creado_por, clientes=None):
@@ -779,7 +855,7 @@ def crear_usuario(usuario, perfil, creado_por, clientes=None):
             return True, password_temp
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "crear_usuario")
 
 
 def cambiar_estado_usuario(usuario, activo, quien_cambia):
@@ -793,7 +869,7 @@ def cambiar_estado_usuario(usuario, activo, quien_cambia):
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "cambiar_estado_usuario")
 
 
 def cambiar_perfil_usuario(usuario, perfil_nuevo, quien_cambia):
@@ -806,7 +882,7 @@ def cambiar_perfil_usuario(usuario, perfil_nuevo, quien_cambia):
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "cambiar_perfil_usuario")
 
 
 def listar_usuarios_gestion(perfiles=None):
@@ -858,16 +934,16 @@ def actualizar_default_camion(placa, piloto, auxiliar):
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
 CATALOGOS_CONFIG = {
-    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre"], "clave": ["nombre"], "numericas": [],
-                "solo_lectura": ["id"]},
-    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social"], "clave": ["nombre"],
-                       "numericas": [], "solo_lectura": ["codigo"]},
-    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre"], "clave": ["nombre"], "numericas": [],
-               "solo_lectura": ["codigo"]},
-    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre"], "clave": ["nombre"], "numericas": [],
-                  "solo_lectura": ["codigo"]},
-    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar"],
-                 "clave": ["placa"], "numericas": []},
+    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
+                "booleanas": ["activo"], "solo_lectura": ["id"]},
+    "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social", "activo"], "clave": ["nombre"],
+                       "numericas": [], "booleanas": ["activo"], "solo_lectura": ["codigo"]},
+    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
+               "booleanas": ["activo"], "solo_lectura": ["codigo"]},
+    "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
+                  "booleanas": ["activo"], "solo_lectura": ["codigo"]},
+    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "activo"],
+                 "clave": ["placa"], "numericas": [], "booleanas": ["activo"]},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"]},
     "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
@@ -881,6 +957,31 @@ CATALOGOS_CONFIG = {
                                  "clave": ["usuario", "cliente"], "numericas": []},
 }
 
+# Lista blanca de tablas/columnas para armar SQL dinámico — capa extra de
+# defensa. Hoy el nombre de tabla/columna SIEMPRE sale de este mismo
+# diccionario (nunca de lo que escribe un usuario, siempre de un menú fijo),
+# pero si algún cambio futuro rompiera esa garantía sin que nadie se diera
+# cuenta, esta validación lo detiene antes de que llegue a la base de datos.
+TABLAS_PERMITIDAS = {cfg["tabla"] for cfg in CATALOGOS_CONFIG.values()}
+COLUMNAS_PERMITIDAS_POR_TABLA = {
+    cfg["tabla"]: set(cfg["columnas"]) | set(cfg.get("solo_lectura", []))
+    for cfg in CATALOGOS_CONFIG.values()
+}
+
+
+def _validar_identificadores_sql(tabla, columnas=None):
+    """Verifica que 'tabla' y cada nombre en 'columnas' estén en la lista
+    blanca antes de usarlos para armar una consulta SQL dinámica. Lanza
+    ValueError si algo no está permitido — nunca deja pasar un nombre que
+    no reconozca."""
+    if tabla not in TABLAS_PERMITIDAS:
+        raise ValueError(f"Tabla no permitida: {tabla!r}")
+    if columnas:
+        permitidas = COLUMNAS_PERMITIDAS_POR_TABLA.get(tabla, set())
+        for c in columnas:
+            if c not in permitidas:
+                raise ValueError(f"Columna no permitida en {tabla!r}: {c!r}")
+
 
 def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clientes_permitidos=None):
     """Inserta un registro nuevo, o lo actualiza si la llave ya existe (upsert),
@@ -890,6 +991,7 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clie
             return False, f"No tienes acceso al cliente '{valores.get('cliente')}'."
     with closing(get_conn()) as conn:
         try:
+            _validar_identificadores_sql(tabla, columnas)
             with conn.cursor() as cur:
                 cols_sql = ", ".join(columnas)
                 placeholders = ", ".join(["%s"] * len(columnas))
@@ -907,7 +1009,34 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clie
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "agregar_o_actualizar_registro")
+
+
+def verificar_uso(tabla, valores_clave):
+    """Revisa en qué otras tablas se usa este registro, ANTES de intentar
+    borrarlo — para poder explicarle a la persona qué lo está bloqueando
+    (ej. '47 viajes'), en vez de solo decirle 'no se pudo'. Es de solo
+    lectura, no cambia nada."""
+    mapa_referencias = {
+        "cat_pilotos": [("cat_camiones", "piloto"), ("viajes", "piloto")],
+        "cat_auxiliares": [("cat_camiones", "auxiliar"), ("viajes", "auxiliar")],
+        "cat_transportistas": [("cat_camiones", "transportista"), ("viajes", "transportista")],
+        "cat_clientes": [("cat_clientes_tiendas", "cliente"), ("cat_cds_por_cliente", "cliente"),
+                         ("cat_usuario_clientes", "cliente"), ("viajes", "cliente")],
+        "cat_camiones": [("viajes", "placa")],
+    }
+    referencias = mapa_referencias.get(tabla, [])
+    if not referencias:
+        return []
+    valor = list(valores_clave.values())[0]
+    resultados = []
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        for tabla_dep, columna_dep in referencias:
+            cur.execute(f"SELECT COUNT(*) FROM {tabla_dep} WHERE {columna_dep} = %s", (valor,))
+            cantidad = cur.fetchone()[0]
+            if cantidad > 0:
+                resultados.append((tabla_dep, cantidad))
+    return resultados
 
 
 def eliminar_registro(tabla, clave, valores_clave, usuario, clientes_permitidos=None):
@@ -916,6 +1045,7 @@ def eliminar_registro(tabla, clave, valores_clave, usuario, clientes_permitidos=
             return False, f"No tienes acceso al cliente '{valores_clave.get('cliente')}'."
     with closing(get_conn()) as conn:
         try:
+            _validar_identificadores_sql(tabla, clave)
             with conn.cursor() as cur:
                 where_sql = " AND ".join(f"{c} = %s" for c in clave)
                 cur.execute(f"DELETE FROM {tabla} WHERE {where_sql}", tuple(valores_clave[c] for c in clave))
@@ -923,9 +1053,14 @@ def eliminar_registro(tabla, clave, valores_clave, usuario, clientes_permitidos=
             registrar_auditoria(usuario, "Eliminar registro de catálogo",
                                  f"Tabla {tabla} · {', '.join(f'{c}={valores_clave[c]}' for c in clave)}")
             return True, "OK"
+        except psycopg2.errors.ForeignKeyViolation:
+            conn.rollback()
+            return False, ("No se puede borrar — todavía está en uso en otra parte del sistema (un camión, "
+                            "un viaje, u otro catálogo lo está referenciando). Usa '🔍 Ver qué está usando esto' "
+                            "para saber exactamente qué lo bloquea.")
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "eliminar_registro")
 
 
 def generar_plantilla_excel(columnas):
@@ -937,6 +1072,7 @@ def generar_plantilla_excel(columnas):
 
 
 def leer_catalogo_actual(tabla, columnas):
+    _validar_identificadores_sql(tabla, columnas)
     with closing(get_conn()) as conn:
         return pd.read_sql_query(f"SELECT {', '.join(columnas)} FROM {tabla}", conn)
 
@@ -955,6 +1091,7 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
     con el resto, avisando al final qué no se pudo quitar."""
     with closing(get_conn()) as conn:
         try:
+            _validar_identificadores_sql(tabla, columnas)
             with conn.cursor() as cur:
                 if clientes_permitidos is not None and "cliente" in columnas:
                     fuera_de_alcance = {str(row["cliente"]).strip() for _, row in df_nuevo.iterrows()
@@ -1009,12 +1146,13 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "sincronizar_catalogo")
 
 
 def contar_borrado_masivo(tabla, columna_cliente, cliente_valor):
     """Solo lectura: cuántas filas coinciden con lo que se va a borrar — para
     mostrarlo ANTES de que la persona confirme nada."""
+    _validar_identificadores_sql(tabla, [columna_cliente] if columna_cliente else None)
     with closing(get_conn()) as conn, conn.cursor() as cur:
         if columna_cliente is None or cliente_valor == "TODO EL CATÁLOGO":
             cur.execute(f"SELECT COUNT(*) FROM {tabla}")
@@ -1024,12 +1162,13 @@ def contar_borrado_masivo(tabla, columna_cliente, cliente_valor):
 
 
 def borrar_masivo(tabla, columna_cliente, cliente_valor, usuario):
-    """Borrado masivo de verdad — solo para Administrador, y solo tras
+    """Borrado masivo de verdad — solo para SuperAdministrador, y solo tras
     confirmación explícita en la pantalla. Si algo está en uso en otra tabla
     (Camiones, Viajes) y bloquea el DELETE por llave foránea, no se aplica
-    ningún borrado parcial silencioso: se avisa el error tal cual."""
+    ningún borrado parcial silencioso: se avisa con un mensaje claro."""
     with closing(get_conn()) as conn:
         try:
+            _validar_identificadores_sql(tabla, [columna_cliente] if columna_cliente else None)
             with conn.cursor() as cur:
                 if columna_cliente is None or cliente_valor == "TODO EL CATÁLOGO":
                     cur.execute(f"DELETE FROM {tabla}")
@@ -1039,9 +1178,13 @@ def borrar_masivo(tabla, columna_cliente, cliente_valor, usuario):
             conn.commit()
             registrar_auditoria(usuario, "BORRADO MASIVO", f"Tabla {tabla} · alcance: {cliente_valor} · {borrados} fila(s) borradas")
             return True, borrados
+        except psycopg2.errors.ForeignKeyViolation:
+            conn.rollback()
+            return False, ("No se pudo borrar nada — al menos un registro de este alcance todavía está en uso "
+                            "en otra tabla (Camiones, Viajes, u otro catálogo). No se aplicó ningún borrado parcial.")
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "borrar_masivo")
 
 
 init_db()
@@ -1132,7 +1275,10 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
             return True, id_viaje_str
         except psycopg2.IntegrityError as e:
             conn.rollback()
-            return False, f"Error de integridad (probablemente un marchamo duplicado): {e}"
+            return False, "Ese marchamo ya está en uso en otro viaje — revisa el número e inténtalo de nuevo."
+        except Exception as e:
+            conn.rollback()
+            return False, _error_tecnico(e, "guardar_viaje")
 
 
 def validar_pedido_wms(pedido_codigo):
@@ -1303,7 +1449,7 @@ def guardar_plan_carga(fecha, filas, usuario):
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "guardar_plan_carga")
 
 
 
@@ -1377,7 +1523,7 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "anular_viaje")
 
 
 def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados, marchamo_regreso_viaje, usuario_editor):
@@ -1437,7 +1583,7 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "editar_viaje")
 
 
 def generar_hoja_control_html(viaje, destinos):
@@ -1675,7 +1821,7 @@ def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
             return True, "OK"
         except Exception as e:
             conn.rollback()
-            return False, str(e)
+            return False, _error_tecnico(e, "liquidar_viaje")
 
 
 # ==========================================
@@ -1705,7 +1851,13 @@ try:
     with closing(get_conn()):
         pass
 except Exception as e:
-    st.sidebar.error(f"🔴 Sin conexión a la base de datos: {e}")
+    # Esto corre ANTES del login — nadie autenticado todavía — así que aquí
+    # nunca se muestra el detalle técnico, solo dónde/cuándo/qué tipo, igual
+    # que el resto de errores — para que una captura de esto ya sirva.
+    fecha_hora_conexion = ahora().strftime("%Y-%m-%d %H:%M:%S")
+    tipo_error_conexion = type(e).__name__
+    print(f"[ERROR {fecha_hora_conexion}] conexion_bd_previo_a_login ({tipo_error_conexion}): {e}")
+    st.sidebar.error(f"🔴 Sin conexión a la base de datos.\n\n**Tipo:** `{tipo_error_conexion}`  \n**Cuándo:** `{fecha_hora_conexion}`")
     st.stop()
 
 # --- PANTALLA 1: LOGIN ---
@@ -1798,7 +1950,7 @@ if st.session_state.get("debe_cambiar_password"):
                         st.success("✅ Contraseña actualizada.")
                         st.rerun()
                     else:
-                        st.error(f"❌ Error: {msg}")
+                        mostrar_resultado_error(msg, perfil_activo)
     st.stop()
 
 st.sidebar.success(f"👤 **{usuario_activo}**")
@@ -1820,7 +1972,7 @@ with st.sidebar.expander(":material/key: Cambiar mi contraseña"):
             if ok:
                 st.success("✅ Contraseña actualizada.")
             else:
-                st.error(f"❌ Error: {msg}")
+                mostrar_resultado_error(msg, perfil_activo)
 if st.sidebar.button(":material/logout: Cerrar Sesión"):
     st.session_state["login_confirmado"] = False
     st.session_state["config_bloqueada"] = False
@@ -1843,9 +1995,16 @@ if not st.session_state.get("config_bloqueada"):
     """, unsafe_allow_html=True)
 
     clientes_disp = clientes_permitidos_para(usuario_activo, perfil_activo)
+    # Aunque el usuario tenga acceso a un cliente, si ese cliente está
+    # Inactivo no debería poder empezar a despachar viajes nuevos para él —
+    # los Reportes y clientes_permitidos_para() sí lo siguen viendo (para no
+    # perder el historial), pero aquí, para EMPEZAR A TRABAJAR, no aplica.
+    clientes_activos_set = set(st.session_state.catalogos["clientes_lista_activos"])
+    clientes_disp = [c for c in clientes_disp if c in clientes_activos_set]
     if not clientes_disp:
-        st.error("🚫 Tu usuario no tiene ningún cliente asignado. Pídele a un Administrador que te "
-                 "dé acceso desde la pestaña de Catálogos ('Acceso Usuario → Cliente').")
+        st.error("🚫 Tu usuario no tiene ningún cliente activo asignado. Pídele a un Administrador que te "
+                 "dé acceso desde la pestaña de Catálogos ('Acceso Usuario → Cliente'), o que reactive el "
+                 "cliente si está marcado como Inactivo.")
         st.stop()
 
     cliente_activo_sel = st.sidebar.selectbox("🎯 Cliente", clientes_disp)
@@ -1908,7 +2067,7 @@ tab1, tab2, tab5, tab3, tab4, tab6 = st.tabs([
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
 with tab1:
-    if perfil_activo in ["Administrador", "Operador", "Supervisor"]:
+    if perfil_activo in ["Administrador", "SuperAdministrador", "Operador", "Supervisor"]:
         st.header(":material/local_shipping: Creación de Viaje")
         st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
 
@@ -2209,7 +2368,7 @@ with tab1:
                     st.session_state["ultimo_viaje_guardado"] = resultado
                     st.rerun()
                 else:
-                    st.error(f"❌ Error: {resultado}")
+                    mostrar_resultado_error(resultado, perfil_activo)
 
         if st.session_state.get("ultimo_viaje_guardado"):
             st.markdown("---")
@@ -2229,7 +2388,7 @@ with tab1:
 # MÓDULO 2: LIQUIDACIONES
 # ==========================================
 with tab2:
-    if perfil_activo in ["Administrador", "Liquidador", "Supervisor"]:
+    if perfil_activo in ["Administrador", "SuperAdministrador", "Liquidador", "Supervisor"]:
         st.header(":material/receipt_long: Liquidación de Viajes")
         st.caption("Registra lo que el camión trajo de regreso de cada tienda. Las cajas no se devuelven.")
 
@@ -2247,7 +2406,7 @@ with tab2:
                 filtrar_click = st.button(":material/filter_alt: Filtrar", use_container_width=True, key="btn_filtrar_liq")
 
             if filtrar_click:
-                mis_clientes_liq = None if perfil_activo == "Administrador" else clientes_permitidos_para(usuario_activo, perfil_activo)
+                mis_clientes_liq = None if perfil_activo in ("Administrador", "SuperAdministrador") else clientes_permitidos_para(usuario_activo, perfil_activo)
                 st.session_state["filtrados_liq"] = filtrar_viajes(filtro_estado_liq, filtro_placa_liq, clientes_permitidos=mis_clientes_liq)
 
             filtrados = st.session_state.get("filtrados_liq", [])
@@ -2277,7 +2436,7 @@ with tab2:
 
         if buscar:
             if valor_busqueda.strip():
-                mis_clientes_liq2 = None if perfil_activo == "Administrador" else clientes_permitidos_para(usuario_activo, perfil_activo)
+                mis_clientes_liq2 = None if perfil_activo in ("Administrador", "SuperAdministrador") else clientes_permitidos_para(usuario_activo, perfil_activo)
                 resultados = buscar_viajes(valor_busqueda, clientes_permitidos=mis_clientes_liq2)
                 st.session_state["resultados_busqueda_liq"] = resultados
                 st.session_state.pop("viaje_liq", None)
@@ -2363,7 +2522,7 @@ with tab2:
                         st.session_state.pop("resultados_busqueda_liq", None)
                         st.rerun()
                     else:
-                        st.error(f"❌ Error al liquidar: {msg}")
+                        mostrar_resultado_error(msg, perfil_activo)
     else:
         st.info("Tu perfil no tiene permisos para liquidar viajes.")
 
@@ -2372,7 +2531,7 @@ with tab2:
 # (disponible mientras no esté ya Anulado). Separado de Liquidaciones a propósito.
 # ==========================================
 with tab5:
-    if perfil_activo in ["Administrador", "Operador"]:
+    if perfil_activo in ["Administrador", "SuperAdministrador", "Operador"]:
         st.header(":material/edit_document: Gestión de Viajes")
         if perfil_activo == "Operador":
             st.caption("Puedes corregir o anular cualquier viaje de los clientes que tengas asignados "
@@ -2393,7 +2552,7 @@ with tab5:
 
         if buscar_g:
             if valor_busqueda_g.strip():
-                mis_clientes_g = None if perfil_activo == "Administrador" else clientes_permitidos_para(usuario_activo, perfil_activo)
+                mis_clientes_g = None if perfil_activo in ("Administrador", "SuperAdministrador") else clientes_permitidos_para(usuario_activo, perfil_activo)
                 st.session_state["resultados_gestion"] = buscar_viajes(valor_busqueda_g, clientes_permitidos=mis_clientes_g)
                 st.session_state.pop("viaje_gestion", None)
                 st.session_state.pop("destinos_gestion", None)
@@ -2438,7 +2597,7 @@ with tab5:
             # Antes esto era "solo lo que tú mismo creaste" — se cambió porque tu
             # operación trabaja por turnos (uno despacha, el otro corrige o cierra),
             # así que ahora se valida por acceso al Cliente, no por autoría.
-            es_propietario = (perfil_activo == "Administrador") or (viaje_g["cliente"] in clientes_permitidos_para(usuario_activo, perfil_activo))
+            es_propietario = (perfil_activo in ("Administrador", "SuperAdministrador")) or (viaje_g["cliente"] in clientes_permitidos_para(usuario_activo, perfil_activo))
             if not es_propietario:
                 st.warning("🚫 No tienes acceso al cliente de este viaje, así que no lo puedes editar ni anular.")
             elif viaje_g["estado"] == "Anulado":
@@ -2541,7 +2700,7 @@ with tab5:
                                     st.session_state.pop("resultados_gestion", None)
                                     st.rerun()
                                 else:
-                                    st.error(f"❌ Error al corregir: {msg}")
+                                    mostrar_resultado_error(msg, perfil_activo)
                 else:
                     st.info("Este viaje ya está Liquidado — no se puede editar, solo anular.")
 
@@ -2562,7 +2721,7 @@ with tab5:
                                 st.session_state.pop("resultados_gestion", None)
                                 st.rerun()
                             else:
-                                st.error(f"❌ Error al anular: {msg}")
+                                mostrar_resultado_error(msg, perfil_activo)
     else:
         st.info("Solo el perfil Administrador puede editar o anular viajes.")
 
@@ -2754,8 +2913,8 @@ with tab3:
         st.caption("Esta es la meta (camiones y bultos por hora) contra la que el Dashboard de indicadores "
                    "compara lo que realmente se va cargando — 'Estatus de Carga de Camiones'. No afecta "
                    "nada dentro de esta app, solo alimenta ese dashboard aparte.")
-        if perfil_activo not in ["Administrador", "Supervisor"]:
-            st.info("Solo Administrador y Supervisor pueden cargar el plan del día.")
+        if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
+            st.info("Solo Administrador, SuperAdministrador y Supervisor pueden cargar el plan del día.")
         else:
             fecha_plan = st.date_input("Fecha del plan", value=ahora().date(), key="fecha_plan_carga")
             plan_actual = obtener_plan_carga(fecha_plan)
@@ -2771,7 +2930,7 @@ with tab3:
                 if ok:
                     st.success(f"✅ Plan de carga del {fecha_plan} guardado.")
                 else:
-                    st.error(f"❌ Error al guardar: {msg}")
+                    mostrar_resultado_error(msg, perfil_activo)
     else:
         st.info("Este reporte todavía no está construido — lo armamos en la próxima ronda.")
 
@@ -2780,7 +2939,7 @@ with tab3:
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
 with tab4:
-    if perfil_activo not in ["Administrador", "Supervisor"]:
+    if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
     else:
         st.header(":material/settings: Gestión de Catálogos")
@@ -2793,7 +2952,7 @@ with tab4:
             tipo, mensaje = flash
             getattr(st, tipo)(mensaje)
 
-        if perfil_activo == "Administrador":
+        if perfil_activo in ("Administrador", "SuperAdministrador"):
             catalogos_disponibles = list(CATALOGOS_CONFIG.keys())
             mis_clientes = None  # sin restricción
             st.caption("Descarga la plantilla, llénala en Excel y súbela para actualizar ese catálogo.")
@@ -2845,7 +3004,7 @@ with tab4:
                     st.session_state.catalogos = cargar_catalogos_desde_db()
                     st.rerun()
                 else:
-                    st.error(f"❌ Error, no se guardó nada: {msg}")
+                    mostrar_resultado_error(msg, perfil_activo)
         st.caption(f"{len(df_actual)} registro(s) actualmente.")
         st.download_button(
             ":material/download: Descargar datos actuales (Excel)",
@@ -2871,7 +3030,7 @@ with tab4:
                     clientes_existentes = sorted(mis_clientes)
                     valores_form["cliente"] = st.selectbox("Cliente", clientes_existentes, key=f"campo_{catalogo_sel}_cliente_sel")
                 else:
-                    clientes_existentes = sorted(st.session_state.catalogos["clientes_lista"])
+                    clientes_existentes = sorted(st.session_state.catalogos["clientes_lista_activos"])
                     cliente_elegido = st.selectbox(
                         "Cliente", clientes_existentes + [NUEVO_CLIENTE_OPCION], key=f"campo_{catalogo_sel}_cliente_sel"
                     )
@@ -2918,6 +3077,9 @@ with tab4:
                 valores_form["transportista"] = st.selectbox("Transportista", transportistas_existentes, key=f"campo_{catalogo_sel}_transportista_sel") if transportistas_existentes else ""
             elif col == "clasificacion":
                 valores_form["clasificacion"] = st.selectbox("Clasificación (Local/Departamental)", ["Local", "Departamental"], key=f"campo_{catalogo_sel}_clasificacion_sel")
+            elif col in config.get("booleanas", []):
+                valores_form[col] = st.checkbox("Activo", value=True, key=f"campo_{catalogo_sel}_{col}",
+                                                  help="Desmárcalo para que ya no aparezca en los menús de Despacho, sin borrar su historial.")
             elif col in config["numericas"]:
                 valores_form[col] = st.number_input(col.replace("_", " ").title(), min_value=0.0, step=1.0, key=f"campo_{catalogo_sel}_{col}")
             else:
@@ -2940,21 +3102,38 @@ with tab4:
                     st.session_state.catalogos = cargar_catalogos_desde_db()
                     st.rerun()
                 else:
-                    st.error(f"❌ Error, no se guardó nada: {msg}")
+                    mostrar_resultado_error(msg, perfil_activo)
 
         if not df_actual.empty:
             st.markdown("#### 🗑️ Eliminar un registro")
             opciones_borrar = df_actual.apply(lambda r: " | ".join(str(r[c]) for c in config["clave"]), axis=1).tolist()
             registro_borrar = st.selectbox("Selecciona el registro a eliminar", opciones_borrar, key=f"del_sel_{catalogo_sel}")
-            if st.button(":material/delete: Eliminar Registro Seleccionado", key=f"del_btn_{catalogo_sel}"):
-                valores_clave = dict(zip(config["clave"], registro_borrar.split(" | ")))
-                ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave, usuario_activo, mis_clientes)
-                if ok:
-                    st.session_state["flash_catalogos"] = ("success", "✅ Registro eliminado correctamente.")
-                    st.session_state.catalogos = cargar_catalogos_desde_db()
-                    st.rerun()
-                else:
-                    st.error(f"❌ Error, no se pudo eliminar (probablemente está en uso en otra tabla): {msg}")
+            valores_clave = dict(zip(config["clave"], registro_borrar.split(" | ")))
+            bcol1, bcol2 = st.columns([1, 1.4])
+            with bcol1:
+                if st.button(":material/delete: Eliminar Registro Seleccionado", key=f"del_btn_{catalogo_sel}"):
+                    ok, msg = eliminar_registro(config["tabla"], config["clave"], valores_clave, usuario_activo, mis_clientes)
+                    if ok:
+                        st.session_state["flash_catalogos"] = ("success", "✅ Registro eliminado correctamente.")
+                        st.session_state.catalogos = cargar_catalogos_desde_db()
+                        st.rerun()
+                    else:
+                        mostrar_resultado_error(msg, perfil_activo)
+            with bcol2:
+                if st.button(":material/search: Ver qué está usando esto", key=f"del_uso_{catalogo_sel}"):
+                    uso = verificar_uso(config["tabla"], valores_clave)
+                    if not uso:
+                        st.success("✅ Nada lo está usando — se puede eliminar sin problema.")
+                    else:
+                        nombres_amigables = {
+                            "cat_camiones": "camión(es)", "viajes": "viaje(s)",
+                            "cat_clientes_tiendas": "tienda(s)", "cat_cds_por_cliente": "CD(s) asignado(s)",
+                            "cat_usuario_clientes": "acceso(s) de usuario",
+                        }
+                        detalle = ", ".join(f"{cantidad} {nombres_amigables.get(t, t)}" for t, cantidad in uso)
+                        st.warning(f"⚠️ No se puede eliminar todavía — está en uso en: {detalle}. "
+                                   f"Si ya no corresponde, considera marcarlo como **Inactivo** en vez de borrarlo, "
+                                   f"para no perder ese historial.")
 
         st.markdown("---")
         st.markdown("#### 📤 Carga masiva (Excel)")
@@ -2997,12 +3176,14 @@ with tab4:
                             st.session_state["flash_catalogos"] = ("error", f"❌ La carga masiva tuvo errores y no se aplicó ningún cambio: {msg}")
                             st.rerun()
             except Exception as e:
-                st.error(f"❌ No se pudo leer el archivo: {e}")
+                mostrar_resultado_error(_error_tecnico(e, "leer_archivo_carga_masiva"), perfil_activo)
 
-        # ---- Borrado Masivo — SOLO Administrador ----
-        if perfil_activo == "Administrador":
+        # ---- Borrado Masivo — SOLO SuperAdministrador. A propósito, "Administrador"
+        # NO tiene esta herramienta — es la única acción de la app que puede tumbar
+        # datos en bloque sin poder revisarlos uno por uno antes de confirmar. ----
+        if perfil_activo == "SuperAdministrador":
             st.markdown("---")
-            with st.expander("🗑️ Zona de Riesgo — Borrado Masivo (solo Administrador)"):
+            with st.expander("🗑️ Zona de Riesgo — Borrado Masivo (solo SuperAdministrador)"):
                 st.error("Esto borra de verdad, en bloque, y no se puede deshacer. Úsalo solo para limpiar "
                          "datos de prueba o un cliente que ya no corresponde.")
                 catalogo_borrar = st.selectbox("Catálogo", list(CATALOGOS_CONFIG.keys()), key="catalogo_borrar_masivo")
@@ -3035,20 +3216,26 @@ with tab4:
                             st.rerun()
 
 # ==========================================
-# MÓDULO 6: GESTIÓN DE USUARIOS — Administrador ve y administra a todos;
-# Supervisor solo ve/administra cuentas Operador y Liquidador (no puede tocar
-# Administrador ni crear otro Supervisor).
+# MÓDULO 6: GESTIÓN DE USUARIOS — SuperAdministrador ve y administra a todos;
+# Administrador administra Operador/Liquidador/Supervisor (no puede tocar
+# cuentas de su mismo nivel o superior); Supervisor solo ve/administra cuentas
+# Operador y Liquidador.
 # ==========================================
 with tab6:
-    if perfil_activo not in ["Administrador", "Supervisor"]:
+    if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de usuarios.")
     else:
         st.header(":material/manage_accounts: Gestión de Usuarios")
 
-        if perfil_activo == "Administrador":
+        if perfil_activo == "SuperAdministrador":
             perfiles_visibles = None  # ve todos
-            perfiles_asignables = ["Administrador", "Operador", "Liquidador", "Supervisor"]
+            perfiles_asignables = ["SuperAdministrador", "Administrador", "Operador", "Liquidador", "Supervisor"]
             st.caption("Ves y administras todas las cuentas.")
+        elif perfil_activo == "Administrador":
+            perfiles_visibles = ["Operador", "Liquidador", "Supervisor"]
+            perfiles_asignables = ["Operador", "Liquidador", "Supervisor"]
+            st.caption("Ves y administras cuentas Operador, Liquidador y Supervisor — no puedes crear ni ver "
+                       "cuentas Administrador o SuperAdministrador.")
         else:
             perfiles_visibles = ["Operador", "Liquidador"]
             perfiles_asignables = ["Operador", "Liquidador"]
@@ -3073,29 +3260,31 @@ with tab6:
         with nc2:
             nuevo_perfil = st.selectbox("Perfil", perfiles_asignables, key="nuevo_perfil_gestion")
 
-        clientes_para_ofrecer = sorted(clientes_permitidos_para(usuario_activo, perfil_activo)) if perfil_activo != "Administrador" \
-            else sorted(st.session_state.catalogos["clientes_lista"])
-        if nuevo_perfil != "Administrador":
+        rol_ve_todos_los_clientes = perfil_activo in ("Administrador", "SuperAdministrador")
+        clientes_para_ofrecer = sorted(st.session_state.catalogos["clientes_lista_activos"]) if rol_ve_todos_los_clientes \
+            else sorted(clientes_permitidos_para(usuario_activo, perfil_activo))
+        nuevo_perfil_ve_todos = nuevo_perfil in ("Administrador", "SuperAdministrador")
+        if not nuevo_perfil_ve_todos:
             st.caption("Los clientes se asignan aquí mismo — un usuario sin ningún cliente asignado se queda "
                        "atorado al entrar, así que ya no se puede crear uno sin elegir al menos uno.")
             nuevos_clientes = st.multiselect("Clientes con acceso", clientes_para_ofrecer, key="nuevos_clientes_gestion")
         else:
-            nuevos_clientes = []  # Administrador ve todos los clientes automáticamente, no hace falta asignarle nada
+            nuevos_clientes = []  # Administrador/SuperAdministrador ven todos los clientes automáticamente
 
         if st.button(":material/person_add: Crear Usuario", key="btn_crear_usuario"):
             if not nuevo_usuario.strip():
                 st.warning("Escribe un nombre de usuario.")
-            elif nuevo_perfil != "Administrador" and not nuevos_clientes:
+            elif not nuevo_perfil_ve_todos and not nuevos_clientes:
                 st.error("❌ Debes asignarle al menos un cliente — si no, el usuario queda sin poder entrar a trabajar.")
             else:
                 ok, resultado = crear_usuario(nuevo_usuario.strip(), nuevo_perfil, usuario_activo, nuevos_clientes)
                 if ok:
-                    st.success(f"✅ Usuario '{nuevo_usuario.strip()}' creado, con acceso a: {', '.join(nuevos_clientes) or 'todos los clientes (Administrador)'}.")
+                    st.success(f"✅ Usuario '{nuevo_usuario.strip()}' creado, con acceso a: {', '.join(nuevos_clientes) or 'todos los clientes'}.")
                     st.info(f"🔑 Contraseña temporal (cópiala y pásasela — no se vuelve a mostrar): **{resultado}**")
                     st.caption("Quedará forzado a cambiarla en su primer ingreso.")
                     st.session_state.catalogos = cargar_catalogos_desde_db()
                 else:
-                    st.error(f"❌ Error: {resultado}")
+                    mostrar_resultado_error(resultado, perfil_activo)
 
         st.markdown("---")
         st.markdown("#### :material/key: Restablecer contraseña")
@@ -3110,7 +3299,7 @@ with tab6:
                     st.info(f"🔑 Contraseña temporal (cópiala y pásasela): **{password_temp}**")
                     st.caption("Quedará forzado a cambiarla en su próximo ingreso.")
                 else:
-                    st.error(f"❌ Error: {msg}")
+                    mostrar_resultado_error(msg, perfil_activo)
         else:
             st.caption("No hay usuarios disponibles para restablecer.")
 
@@ -3128,7 +3317,7 @@ with tab6:
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
                     else:
-                        st.error(f"❌ Error: {msg}")
+                        mostrar_resultado_error(msg, perfil_activo)
             with tc2:
                 if not estado_actual and st.button(":material/check_circle: Reactivar Cuenta", key="btn_reactivar"):
                     ok, msg = cambiar_estado_usuario(usuario_toggle, True, usuario_activo)
@@ -3137,9 +3326,9 @@ with tab6:
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
                     else:
-                        st.error(f"❌ Error: {msg}")
+                        mostrar_resultado_error(msg, perfil_activo)
 
-        if perfil_activo == "Administrador":
+        if perfil_activo in ("Administrador", "SuperAdministrador"):
             st.markdown("---")
             st.markdown("#### :material/history: Bitácora de Auditoría")
             st.caption("Quién hizo qué y cuándo — viajes creados/editados/anulados/liquidados, cambios en "
