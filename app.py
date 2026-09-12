@@ -6,6 +6,7 @@ import psycopg2.extras
 import json
 import io
 import os
+import html as html_lib
 import hashlib
 import binascii
 import secrets
@@ -58,6 +59,18 @@ def password_coincide(password, salt_hex, hash_hex):
 def generar_password_temporal(longitud=10):
     alfabeto = string.ascii_letters + string.digits
     return "".join(secrets.choice(alfabeto) for _ in range(longitud))
+
+
+def password_es_valida(password):
+    """Mínimo 8 caracteres, al menos una letra y al menos un número — no es
+    infalible, pero ya evita las más obvias ('12345678', 'contraseña')."""
+    if len(password) < 8:
+        return False, "Debe tener al menos 8 caracteres."
+    if not any(c.isalpha() for c in password):
+        return False, "Debe incluir al menos una letra."
+    if not any(c.isdigit() for c in password):
+        return False, "Debe incluir al menos un número."
+    return True, "OK"
 
 
 def registrar_auditoria(usuario, accion, detalle=""):
@@ -424,6 +437,10 @@ def init_db():
         cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
         cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS debe_cambiar_password BOOLEAN DEFAULT TRUE")
         cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS creado_por TEXT")
+        # Protección contra fuerza bruta: cuenta los intentos fallidos seguidos,
+        # y bloquea la cuenta temporalmente si se pasa del límite.
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS intentos_fallidos INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS bloqueado_hasta TIMESTAMP")
         # Qué clientes puede ver/trabajar cada usuario (excepto Administrador, que ve todos).
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_usuario_clientes (
@@ -441,6 +458,17 @@ def init_db():
                 usuario TEXT NOT NULL,
                 accion TEXT NOT NULL,
                 detalle TEXT
+            )
+        """)
+        # Plan de carga por hora — la meta de camiones/bultos contra la que se
+        # compara lo real en el Dashboard de indicadores (Estatus de Carga).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plan_carga_horario (
+                fecha DATE NOT NULL,
+                hora INTEGER NOT NULL CHECK (hora >= 0 AND hora <= 23),
+                camiones_plan INTEGER DEFAULT 0,
+                bultos_plan INTEGER DEFAULT 0,
+                PRIMARY KEY (fecha, hora)
             )
         """)
         conn.commit()
@@ -657,16 +685,51 @@ def _credenciales_validas(usuario, password):
         return {"perfil": row["perfil"], "debe_cambiar_password": row["debe_cambiar_password"]}
 
 
+MAX_INTENTOS_LOGIN = 5
+MINUTOS_BLOQUEO_LOGIN = 15
+
+
 def verificar_login(usuario, password):
-    """Como _credenciales_validas(), pero además deja rastro en la auditoría —
-    tanto de los intentos exitosos como de los fallidos. Úsalo solo en la
-    pantalla de inicio de sesión."""
-    resultado = _credenciales_validas(usuario, password)
-    if resultado is None:
-        registrar_auditoria(usuario or "(vacío)", "Intento de login FALLIDO")
-    else:
-        registrar_auditoria(usuario, "Login exitoso")
-    return resultado
+    """Como _credenciales_validas(), pero además:
+    - deja rastro en la auditoría (éxitos y fallos)
+    - bloquea la cuenta 15 minutos tras 5 intentos fallidos seguidos, para que
+      alguien no pueda probar contraseñas sin límite (fuerza bruta).
+    Úsalo solo en la pantalla de inicio de sesión — el cambio de contraseña
+    propia sigue usando _credenciales_validas() directo, sin este conteo."""
+    ahora_sin_tz = ahora().replace(tzinfo=None)
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT usuario, perfil, password_hash, password_salt, activo, debe_cambiar_password, "
+            "intentos_fallidos, bloqueado_hasta FROM cat_usuarios WHERE usuario = %s", (usuario,)
+        )
+        row = cur.fetchone()
+
+        if row and row["bloqueado_hasta"] and row["bloqueado_hasta"] > ahora_sin_tz:
+            registrar_auditoria(usuario, "Intento de login FALLIDO (cuenta bloqueada temporalmente)")
+            return None
+
+        if row and row["activo"] and password_coincide(password, row["password_salt"], row["password_hash"]):
+            cur.execute("UPDATE cat_usuarios SET intentos_fallidos=0, bloqueado_hasta=NULL WHERE usuario=%s", (usuario,))
+            conn.commit()
+            registrar_auditoria(usuario, "Login exitoso")
+            return {"perfil": row["perfil"], "debe_cambiar_password": row["debe_cambiar_password"]}
+
+        if row:
+            nuevos_intentos = (row["intentos_fallidos"] or 0) + 1
+            if nuevos_intentos >= MAX_INTENTOS_LOGIN:
+                cur.execute(
+                    "UPDATE cat_usuarios SET intentos_fallidos=0, bloqueado_hasta=%s WHERE usuario=%s",
+                    (ahora_sin_tz + timedelta(minutes=MINUTOS_BLOQUEO_LOGIN), usuario)
+                )
+                conn.commit()
+                registrar_auditoria(usuario, "Cuenta bloqueada temporalmente por intentos fallidos",
+                                     f"{MAX_INTENTOS_LOGIN} intentos seguidos — bloqueada {MINUTOS_BLOQUEO_LOGIN} min")
+            else:
+                cur.execute("UPDATE cat_usuarios SET intentos_fallidos=%s WHERE usuario=%s", (nuevos_intentos, usuario))
+                conn.commit()
+
+    registrar_auditoria(usuario or "(vacío)", "Intento de login FALLIDO")
+    return None
 
 
 def establecer_password(usuario, password_nueva, forzar_cambio_siguiente=False, cambiado_por=None):
@@ -1135,10 +1198,30 @@ def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
         return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
+def _sanear_formulas(df):
+    """Neutraliza el riesgo de 'CSV/Excel Injection': si una celda de texto
+    empieza con =, +, -, @ (o tab/retorno de carro), Excel podría interpretarla
+    como una fórmula al abrir el archivo exportado — por ejemplo alguien
+    escribiendo eso a propósito en una Observación. Le anteponemos un
+    apóstrofo para que Excel la trate siempre como texto plano, nunca como
+    fórmula. No cambia el dato guardado en la base, solo el archivo exportado."""
+    df = df.copy()
+    caracteres_riesgosos = ("=", "+", "-", "@", "\t", "\r")
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].apply(
+            lambda v: "'" + v if isinstance(v, str) and v.startswith(caracteres_riesgosos) else v
+        )
+    return df
+
+
 def exportar_excel(df):
     buffer = io.BytesIO()
-    df.to_excel(buffer, index=False, engine="openpyxl")
+    _sanear_formulas(df).to_excel(buffer, index=False, engine="openpyxl")
     return buffer.getvalue()
+
+
+def exportar_csv(df):
+    return _sanear_formulas(df).to_csv(index=False).encode("utf-8-sig")
 
 
 def obtener_reporte_liquidaciones(fecha_inicio, fecha_fin, cliente="Todos"):
@@ -1186,7 +1269,44 @@ def obtener_reporte_retornable_por_fecha(fecha_inicio, fecha_fin, cliente="Todos
         return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
-def buscar_viajes(valor_busqueda, clientes_permitidos=None):
+def obtener_plan_carga(fecha):
+    """Trae el plan de carga (camiones/bultos por hora) de una fecha, con las
+    24 horas siempre presentes (en 0 si todavía no se ha cargado nada)."""
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT hora, camiones_plan, bultos_plan FROM plan_carga_horario WHERE fecha = %s",
+            (fecha,)
+        )
+        existentes = {r["hora"]: r for r in cur.fetchall()}
+    return [
+        {"Hora": f"{h:02d}:00", "Camiones Plan": existentes.get(h, {}).get("camiones_plan", 0) or 0,
+         "Bultos Plan": existentes.get(h, {}).get("bultos_plan", 0) or 0}
+        for h in range(24)
+    ]
+
+
+def guardar_plan_carga(fecha, filas, usuario):
+    """Guarda el plan de carga de una fecha — upsert por hora, nunca borra
+    nada fuera de las 24 horas que ya se están mandando."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                for i, fila in enumerate(filas):
+                    cur.execute(
+                        "INSERT INTO plan_carga_horario (fecha, hora, camiones_plan, bultos_plan) "
+                        "VALUES (%s,%s,%s,%s) ON CONFLICT (fecha, hora) DO UPDATE SET "
+                        "camiones_plan = EXCLUDED.camiones_plan, bultos_plan = EXCLUDED.bultos_plan",
+                        (fecha, i, fila["Camiones Plan"], fila["Bultos Plan"])
+                    )
+            conn.commit()
+            registrar_auditoria(usuario, "Guardar plan de carga", f"Fecha {fecha}")
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+
+
+
     """Busca viajes por coincidencia PARCIAL (no exacta) de No. de Viaje, Marchamo de
     Ida (de cualquiera de sus destinos), o Placa. Devuelve una lista (puede tener
     más de un resultado si el texto buscado coincide con varios viajes).
@@ -1325,8 +1445,18 @@ def generar_hoja_control_html(viaje, destinos):
     de Ransa, pero al imprimir (@media print) los fondos de color se vuelven blancos
     y solo quedan bordes negros, para que salga limpia en una impresora blanco y negro.
     Si el viaje ya está Liquidado, los recuadros de devolución se llenan con los datos
-    reales de la liquidación en vez de salir en blanco."""
-    marchamo_ida_general = destinos[0]["marchamo_ida"] if destinos else ""
+    reales de la liquidación en vez de salir en blanco.
+
+    Todo texto que pudo haber sido digitado por una persona (marchamos, tienda,
+    observaciones, no. de despacho, documentos) se pasa por esc() antes de meterlo
+    en el HTML — si no, alguien podría escribir código en un campo de texto y que
+    se ejecute en la pantalla de quien reimprima esa hoja después (Administrador
+    incluido). esc() nunca cambia el dato que se guarda en la base, solo lo que
+    se muestra."""
+    def esc(valor):
+        return html_lib.escape(str(valor)) if valor is not None else ""
+
+    marchamo_ida_general = esc(destinos[0]["marchamo_ida"]) if destinos else ""
     es_cliente_unisuper = viaje["cliente"].startswith("UniSuper")
     esta_liquidado = viaje["estado"] == "Liquidado"
 
@@ -1336,22 +1466,22 @@ def generar_hoja_control_html(viaje, destinos):
             pedidos_lista = json.loads(d["pedidos"]) if d["pedidos"] else []
         except (json.JSONDecodeError, TypeError):
             pedidos_lista = []
-        pedidos_txt = ", ".join(p["pedido"] for p in pedidos_lista) if pedidos_lista else "—"
+        pedidos_txt = esc(", ".join(p["pedido"] for p in pedidos_lista)) if pedidos_lista else "—"
         badge_regreso = (
-            f'<span class="badge-regreso">Marchamo Retorno: {d["marchamo_regreso"]}</span>'
+            f'<span class="badge-regreso">Marchamo Retorno: {esc(d["marchamo_regreso"])}</span>'
             if d["marchamo_regreso"] else ""
         )
         badge_complemento = '<span class="badge-complemento">COMPLEMENTO</span>' if d["es_complemento"] else ""
-        incidencia_txt = d["incidencias"] or ""
+        incidencia_txt = esc(d["incidencias"]) if d["incidencias"] else ""
         incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
         material_cajas = (
             f'<div class="material-box"><b>{d["cajas"]}</b><span>BULTOS</span></div>'
             if not d["es_complemento"] else ""
         )
         documentos_html = (
-            f'<div class="sub-info">Remisión: <b>{d["remitos"] or "—"}</b> &nbsp;|&nbsp;'
-            f'Devolución: <b>{d["devolucion"] or "—"}</b> &nbsp;|&nbsp;'
-            f'Créditos: <b>{d["creditos"] or "—"}</b> &nbsp;|&nbsp;'
+            f'<div class="sub-info">Remisión: <b>{esc(d["remitos"]) or "—"}</b> &nbsp;|&nbsp;'
+            f'Devolución: <b>{esc(d["devolucion"]) or "—"}</b> &nbsp;|&nbsp;'
+            f'Créditos: <b>{esc(d["creditos"]) or "—"}</b> &nbsp;|&nbsp;'
             f'Cartas Solicitud Producto P&amp;G: <b>{d["pg_cajas"] or 0}</b></div>'
             if es_cliente_unisuper else ""
         )
@@ -1371,8 +1501,8 @@ def generar_hoja_control_html(viaje, destinos):
         <div class="destino-card">
             <div class="destino-header">
                 <div class="destino-header-izq">
-                    <span class="destino-num">{idx}</span> {d['tienda']}
-                    <span class="marchamo-inline">Marchamo: {d['marchamo_ida']}</span>
+                    <span class="destino-num">{idx}</span> {esc(d['tienda'])}
+                    <span class="marchamo-inline">Marchamo: {esc(d['marchamo_ida'])}</span>
                     {badge_complemento}
                 </div>
                 {badge_regreso}
@@ -1487,20 +1617,20 @@ def generar_hoja_control_html(viaje, destinos):
                 <h2>HOJA DE SALIDA</h2>
                 <p>Control de Ruta · Documento de Despacho</p>
                 <p style="margin-top:4px;">Generado: <b>{viaje['fecha_creacion']} {viaje['hora_creacion']}</b>
-                   por <b>{viaje['usuario_creador']}</b></p>
-                {f'<p style="margin-top:2px; color:#0B4A32;">✅ Liquidado por <b>{viaje["usuario_liquido"]}</b> el <b>{viaje["fecha_liquidacion"]} {viaje["hora_liquidacion"]}</b></p>' if esta_liquidado else ''}
+                   por <b>{esc(viaje['usuario_creador'])}</b></p>
+                {f'<p style="margin-top:2px; color:#0B4A32;">✅ Liquidado por <b>{esc(viaje["usuario_liquido"])}</b> el <b>{viaje["fecha_liquidacion"]} {viaje["hora_liquidacion"]}</b></p>' if esta_liquidado else ''}
             </div>
         </div>
         <div class="datos-grid">
-            <div class="dato"><label>No. de Viaje</label><span>{viaje['id_viaje']}</span></div>
-            <div class="dato"><label>Cliente</label><span>{viaje['cliente']}</span></div>
-            <div class="dato"><label>CD Origen</label><span>{viaje['cd_origen'] or '—'}</span></div>
-            <div class="dato"><label>Transportista</label><span>{viaje['transportista']}</span></div>
-            <div class="dato"><label>Placa</label><span>{viaje['placa']}</span></div>
+            <div class="dato"><label>No. de Viaje</label><span>{esc(viaje['id_viaje'])}</span></div>
+            <div class="dato"><label>Cliente</label><span>{esc(viaje['cliente'])}</span></div>
+            <div class="dato"><label>CD Origen</label><span>{esc(viaje['cd_origen']) or '—'}</span></div>
+            <div class="dato"><label>Transportista</label><span>{esc(viaje['transportista'])}</span></div>
+            <div class="dato"><label>Placa</label><span>{esc(viaje['placa'])}</span></div>
             <div class="dato"><label>Fecha</label><span>{viaje['fecha_creacion']}</span></div>
             <div class="dato dato-blanco"><label>Horario (Garita — hora real de salida)</label><span>&nbsp;</span></div>
-            <div class="dato"><label>Piloto</label><span>{viaje['piloto']}</span></div>
-            <div class="dato"><label>Auxiliar</label><span>{viaje['auxiliar']}</span></div>
+            <div class="dato"><label>Piloto</label><span>{esc(viaje['piloto'])}</span></div>
+            <div class="dato"><label>Auxiliar</label><span>{esc(viaje['auxiliar'])}</span></div>
             <div class="dato"><label>Marchamo de Ida</label><span>{marchamo_ida_general}</span></div>
         </div>
         <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
@@ -1623,6 +1753,22 @@ if not cuenta_sigue_activa(usuario_activo):
         st.session_state.pop(k, None)
     st.stop()
 
+# Cierre de sesión automático tras 30 minutos sin ninguna acción — para que una
+# sesión abierta y olvidada en una computadora compartida (garita, bodega) no
+# se quede activa indefinidamente. Cada clic/acción cuenta como actividad y
+# reinicia el conteo.
+MINUTOS_INACTIVIDAD_MAXIMOS = 30
+ahora_actividad = ahora().replace(tzinfo=None)
+ultima_actividad = st.session_state.get("ultima_actividad")
+if ultima_actividad and (ahora_actividad - ultima_actividad).total_seconds() > MINUTOS_INACTIVIDAD_MAXIMOS * 60:
+    registrar_auditoria(usuario_activo, "Sesión cerrada por inactividad", f"Más de {MINUTOS_INACTIVIDAD_MAXIMOS} minutos sin actividad")
+    for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password",
+              "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo", "ultima_actividad"):
+        st.session_state.pop(k, None)
+    st.warning(f"⏱️ Tu sesión se cerró automáticamente por {MINUTOS_INACTIVIDAD_MAXIMOS} minutos sin actividad. Vuelve a entrar.")
+    st.stop()
+st.session_state["ultima_actividad"] = ahora_actividad
+
 # --- PANTALLA 1B: Cambio de contraseña obligatorio (primer ingreso, o tras un
 # restablecimiento). No se puede pasar de aquí sin poner una contraseña nueva.
 if st.session_state.get("debe_cambiar_password"):
@@ -1637,11 +1783,12 @@ if st.session_state.get("debe_cambiar_password"):
     col_izq2, col_centro2, col_der2 = st.columns([1, 1.2, 1])
     with col_centro2:
         with st.container(border=True):
-            nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres)", type="password", key="nueva_pw_1")
+            nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres, con letra y número)", type="password", key="nueva_pw_1")
             nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="nueva_pw_2")
             if st.button(":material/check: Guardar Contraseña", use_container_width=True):
-                if len(nueva1) < 8:
-                    st.error("❌ La contraseña debe tener al menos 8 caracteres.")
+                valida, msg_valida = password_es_valida(nueva1)
+                if not valida:
+                    st.error(f"❌ {msg_valida}")
                 elif nueva1 != nueva2:
                     st.error("❌ Las dos contraseñas no coinciden.")
                 else:
@@ -1658,13 +1805,14 @@ st.sidebar.success(f"👤 **{usuario_activo}**")
 st.sidebar.caption(f"Perfil: {perfil_activo}")
 with st.sidebar.expander(":material/key: Cambiar mi contraseña"):
     pw_actual = st.text_input("Contraseña actual", type="password", key="pw_actual_sidebar")
-    pw_nueva1 = st.text_input("Nueva contraseña", type="password", key="pw_nueva1_sidebar")
+    pw_nueva1 = st.text_input("Nueva contraseña (con letra y número)", type="password", key="pw_nueva1_sidebar")
     pw_nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="pw_nueva2_sidebar")
     if st.button("Actualizar Contraseña", key="btn_pw_sidebar"):
+        valida, msg_valida = password_es_valida(pw_nueva1)
         if not _credenciales_validas(usuario_activo, pw_actual):
             st.error("❌ La contraseña actual no es correcta.")
-        elif len(pw_nueva1) < 8:
-            st.error("❌ La nueva contraseña debe tener al menos 8 caracteres.")
+        elif not valida:
+            st.error(f"❌ {msg_valida}")
         elif pw_nueva1 != pw_nueva2:
             st.error("❌ Las dos contraseñas nuevas no coinciden.")
         else:
@@ -1740,8 +1888,8 @@ st.markdown(f"""
             <div class="subtitulo">Sistema Integral de Gestión Logística</div>
         </div>
         <div class="contexto">
-            <b>{cliente_activo}</b> · CD {cd_origen_fijo}<br>
-            {usuario_activo} ({perfil_activo}) · {ahora().strftime('%H:%M:%S')}
+            <b>{html_lib.escape(str(cliente_activo))}</b> · CD {html_lib.escape(str(cd_origen_fijo))}<br>
+            {html_lib.escape(str(usuario_activo))} ({html_lib.escape(str(perfil_activo))}) · {ahora().strftime('%H:%M:%S')}
         </div>
     </div>
 """, unsafe_allow_html=True)
@@ -2423,7 +2571,8 @@ with tab5:
 # ==========================================
 with tab3:
     reporte_sel = st.selectbox(
-        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable", "Bultos por Camión (próximamente)"]
+        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
+                    "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
     )
 
     if reporte_sel == "Bitácora de Viajes":
@@ -2465,7 +2614,7 @@ with tab3:
                 with ecol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
-                        data=df_bitacora.to_csv(index=False).encode("utf-8-sig"),
+                        data=exportar_csv(df_bitacora),
                         file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.csv",
                         mime="text/csv",
                         use_container_width=True
@@ -2524,7 +2673,7 @@ with tab3:
                 with ecol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
-                        data=df_mostrar.to_csv(index=False).encode("utf-8-sig"),
+                        data=exportar_csv(df_mostrar),
                         file_name=f"liquidaciones_{fecha_ini_l}_a_{fecha_fin_l}.csv",
                         mime="text/csv",
                         use_container_width=True, key="csv_liq_rep"
@@ -2592,13 +2741,37 @@ with tab3:
                 with fcol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
-                        data=df_fecha_mostrar.to_csv(index=False).encode("utf-8-sig"),
+                        data=exportar_csv(df_fecha_mostrar),
                         file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.csv",
                         mime="text/csv",
                         use_container_width=True, key="csv_ret_rep_fecha"
                     )
         else:
             st.info("Elige el rango de fechas, cliente y material, y presiona Generar.")
+
+    elif reporte_sel == "Plan de Carga del Día (para el Dashboard)":
+        st.subheader(":material/event_note: Plan de Carga del Día")
+        st.caption("Esta es la meta (camiones y bultos por hora) contra la que el Dashboard de indicadores "
+                   "compara lo que realmente se va cargando — 'Estatus de Carga de Camiones'. No afecta "
+                   "nada dentro de esta app, solo alimenta ese dashboard aparte.")
+        if perfil_activo not in ["Administrador", "Supervisor"]:
+            st.info("Solo Administrador y Supervisor pueden cargar el plan del día.")
+        else:
+            fecha_plan = st.date_input("Fecha del plan", value=ahora().date(), key="fecha_plan_carga")
+            plan_actual = obtener_plan_carga(fecha_plan)
+            df_plan = pd.DataFrame(plan_actual)
+            st.caption("Edita directo en la tabla — una fila por hora del día.")
+            df_plan_editado = st.data_editor(
+                df_plan, use_container_width=True, height=460, hide_index=True,
+                disabled=["Hora"], key=f"editor_plan_{fecha_plan}"
+            )
+            if st.button(":material/save: Guardar Plan del Día", key="btn_guardar_plan"):
+                filas_guardar = df_plan_editado.to_dict("records")
+                ok, msg = guardar_plan_carga(fecha_plan, filas_guardar, usuario_activo)
+                if ok:
+                    st.success(f"✅ Plan de carga del {fecha_plan} guardado.")
+                else:
+                    st.error(f"❌ Error al guardar: {msg}")
     else:
         st.info("Este reporte todavía no está construido — lo armamos en la próxima ronda.")
 
@@ -3004,7 +3177,7 @@ with tab6:
                     with acol_e2:
                         st.download_button(
                             ":material/download: Exportar a CSV",
-                            data=df_aud.to_csv(index=False).encode("utf-8-sig"),
+                            data=exportar_csv(df_aud),
                             file_name=f"auditoria_{fecha_ini_aud}_a_{fecha_fin_aud}.csv",
                             mime="text/csv",
                             use_container_width=True, key="csv_aud"
