@@ -23,6 +23,11 @@ from contextlib import closing
 # Se actualiza a mano en cada entrega — no se calcula solo.
 VERSION_APP = "1.0.0"
 
+# Equivalencia acordada con el cliente: cada paca de cartón retornada equivale
+# a 50 lbs — se usa para reportar el retornable de cartón en libras, que es
+# como lo piden, en vez de solo en cantidad de pacas.
+LBS_POR_PACA_CARTON = 50
+
 # Configuración de la página web con estilo e identidad corporativa
 st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon="🚚")
 
@@ -1412,7 +1417,12 @@ def obtener_reporte_retornable_por_fecha(fecha_inicio, fecha_fin, cliente="Todos
             GROUP BY v.fecha_creacion, v.cliente, d.tienda
             ORDER BY v.cliente, d.tienda, v.fecha_creacion
         """
-        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+        df = pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+        # Cada paca de cartón equivale a 50 lbs (acordado con el cliente) —
+        # se agrega como columna aparte, sin quitar el conteo de pacas, para
+        # no perder la unidad con la que realmente se digitó.
+        df["Lbs de Cartón"] = df["Pacas de Cartón Retornadas"] * LBS_POR_PACA_CARTON
+        return df
 
 
 def obtener_plan_carga(fecha):
@@ -2858,8 +2868,9 @@ with tab3:
 
     elif reporte_sel == "Control de Retornable":
         st.subheader(":material/inventory_2: Control de Retornable")
-        st.caption("Roles, Tarimas y Pacas de Cartón — las cajas no son retornables, por eso no aparecen aquí. "
-                   "Mientras un viaje esté Pendiente de Liquidar, su material se cuenta como 'todavía en tienda'.")
+        st.caption("Roles, Tarimas y Pacas de Cartón (reportado en Lbs, 50 lbs por paca) — las cajas no son "
+                   "retornables, por eso no aparecen aquí. Mientras un viaje esté Pendiente de Liquidar, su "
+                   "material se cuenta como 'todavía en tienda'.")
 
         rcol1, rcol2, rcol3, rcol4 = st.columns([1, 1, 1, 1])
         with rcol1:
@@ -2870,7 +2881,7 @@ with tab3:
             clientes_reporte_r = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
             cliente_reporte_r = st.selectbox("Cliente", clientes_reporte_r, key="cliente_ret_rep")
         with rcol4:
-            material_sel = st.selectbox("Material", ["Todos", "Roles", "Tarimas", "Pacas de Cartón"], key="material_ret_rep")
+            material_sel = st.selectbox("Material", ["Todos", "Roles", "Tarimas", "Pacas de Cartón (Lbs)"], key="material_ret_rep")
 
         generar_r = st.button(":material/search: Generar", key="btn_generar_ret_rep")
         if generar_r:
@@ -2888,18 +2899,20 @@ with tab3:
                 if material_sel in ("Todos", "Tarimas"):
                     saldo_tarimas = int(df_fecha["Tarimas Enviadas"].sum() - df_fecha["Tarimas Retornadas"].sum())
                     kcol2.metric("Total Tarimas en Tiendas", saldo_tarimas)
-                if material_sel in ("Todos", "Pacas de Cartón"):
-                    kcol3.metric("Total Pacas de Cartón Retornadas", int(df_fecha["Pacas de Cartón Retornadas"].sum()))
+                if material_sel in ("Todos", "Pacas de Cartón (Lbs)"):
+                    total_lbs = int(df_fecha["Lbs de Cartón"].sum())
+                    kcol3.metric("Total Lbs de Cartón Retornadas", f"{total_lbs:,} lbs",
+                                 help=f"{int(df_fecha['Pacas de Cartón Retornadas'].sum())} pacas × {LBS_POR_PACA_CARTON} lbs c/u")
 
                 st.markdown("---")
                 st.caption("Cada fila es la fecha en que salió el viaje: lo enviado ese día, y lo retornado "
                            "de ese mismo viaje (el retorno solo tiene valor una vez que ya se liquidó).")
                 columnas_fecha_por_material = {
                     "Todos": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados",
-                              "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas"],
+                              "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
                     "Roles": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados"],
                     "Tarimas": ["Fecha", "Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas"],
-                    "Pacas de Cartón": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas"],
+                    "Pacas de Cartón (Lbs)": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
                 }
                 df_fecha_mostrar = df_fecha[columnas_fecha_por_material[material_sel]]
                 st.dataframe(df_fecha_mostrar, use_container_width=True, height=420)
@@ -3030,7 +3043,7 @@ with tab4:
             key=f"descargar_actual_{catalogo_sel}"
         )
 
-        st.markdown("#### ➕ Agregar o corregir UN registro")
+        st.markdown("#### ➕ Agregar o corregir un registro")
         st.caption("Para un cambio puntual, sin tener que subir un Excel completo. Si la llave "
                    "ya existe, se actualiza en vez de duplicarse.")
 
