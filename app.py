@@ -6,6 +6,8 @@ import psycopg2.extras
 import json
 import io
 import os
+import base64
+from PIL import Image
 import html as html_lib
 import hashlib
 import binascii
@@ -29,7 +31,13 @@ VERSION_APP = "1.0.0"
 LBS_POR_PACA_CARTON = 50
 
 # Configuración de la página web con estilo e identidad corporativa
-st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon="🚚")
+# Ícono de Ransa (el mismo recorte cuadrado que se usa en el dashboard),
+# incrustado aquí para no depender de subir un archivo de imagen aparte al
+# repositorio — con esto basta con subir este único archivo app.py.
+_FAVICON_B64 = "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"
+_favicon_ransa = Image.open(io.BytesIO(base64.b64decode(_FAVICON_B64)))
+
+st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon=_favicon_ransa)
 
 # El servidor (Render) corre en otro huso horario — todos los usuarios de esta
 # app están en Guatemala, así que fijamos la hora ahí en vez de usar la hora
@@ -451,6 +459,15 @@ def init_db():
         # Columnas para la Hoja de Control de Viaje (impresión)
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS cliente_principal TEXT")
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS cd_origen TEXT")
+        # Viajes que no llevan pedido (recolección, avería, traslado entre CDs,
+        # etc.) — NULL significa "es un viaje normal, con pedido".
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS motivo_sin_pedido TEXT")
+        cur.execute("CREATE TABLE IF NOT EXISTS cat_motivos_sin_pedido (nombre TEXT PRIMARY KEY)")
+        cur.execute("""
+            INSERT INTO cat_motivos_sin_pedido (nombre) VALUES
+            ('Recolección'), ('Avería'), ('Traslado entre CDs'), ('Otro')
+            ON CONFLICT DO NOTHING
+        """)
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS remitos TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS incidencias TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS devolucion TEXT")
@@ -693,6 +710,9 @@ def cargar_catalogos_desde_db():
         cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion ORDER BY tipo")
         rendimiento = {r["tipo"]: r["km_por_galon"] for r in cur.fetchall()}
 
+        cur.execute("SELECT nombre FROM cat_motivos_sin_pedido ORDER BY nombre")
+        motivos_sin_pedido = [r["nombre"] for r in cur.fetchall()]
+
         cur.execute("SELECT cliente, cd FROM cat_cds_por_cliente ORDER BY cliente, cd")
         cds_por_cliente = {}
         for r in cur.fetchall():
@@ -722,6 +742,7 @@ def cargar_catalogos_desde_db():
             "clientes": clientes,
             "clientes_lista": clientes_lista,
             "clientes_lista_activos": clientes_lista_activos,
+            "motivos_sin_pedido": motivos_sin_pedido,
             "rendimiento": rendimiento,
             "cds_por_cliente": cds_por_cliente,
             "usuario_clientes": usuario_clientes
@@ -955,6 +976,8 @@ CATALOGOS_CONFIG = {
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"],
                         "clave": ["cliente", "cd"], "numericas": []},
+    "Motivos de Viaje sin Pedido": {"tabla": "cat_motivos_sin_pedido", "columnas": ["nombre"],
+                                    "clave": ["nombre"], "numericas": []},
     # "Usuarios" ya no se gestiona aquí como catálogo genérico — crear una cuenta
     # necesita generarle una contraseña, así que vive en la pestaña "Usuarios"
     # dedicada (Gestión de Usuarios), no en un data_editor de texto plano.
@@ -1230,8 +1253,11 @@ def siguiente_correlativo(cliente, cur):
     return f"{prefijo}-{numero:04d}"
 
 
-def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None):
+def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None, motivo_sin_pedido=None):
     """Guarda el viaje y sus destinos en una sola transacción.
+    `motivo_sin_pedido`: si no es None, este viaje no lleva pedido (Recolección,
+    Avería, Traslado entre CDs, etc.) — se guarda como dato del viaje, no del
+    destino, ya que aplica a todo el viaje completo.
     Devuelve (True, id_viaje) si funcionó, o (False, mensaje_error) si no."""
     with closing(get_conn()) as conn:
         try:
@@ -1253,10 +1279,10 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
 
                 cur.execute(
                     "INSERT INTO viajes (id_viaje, cliente, placa, transportista, piloto, auxiliar, "
-                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen, motivo_sin_pedido) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                     (id_viaje_str, cliente, placa, transportista, piloto, auxiliar, usuario, fecha_hoy, hora_hoy,
-                     cd_origen)
+                     cd_origen, motivo_sin_pedido)
                 )
                 viaje_id = cur.fetchone()[0]
 
@@ -1335,7 +1361,8 @@ def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
                 cam.tipo AS "Tonelaje",
                 v.transportista AS "Transportista",
                 tr.razon_social AS "Razón Social",
-                ag.bultos AS "Bultos"
+                ag.bultos AS "Bultos",
+                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje"
             FROM viajes v
             JOIN agregado ag ON ag.viaje_id = v.id
             JOIN mas_lejano ml ON ml.viaje_id = v.id
@@ -1788,6 +1815,7 @@ def generar_hoja_control_html(viaje, destinos):
             <div class="titulo">
                 <h2>HOJA DE SALIDA</h2>
                 <p>Control de Ruta · Documento de Despacho</p>
+                {f'<p style="margin-top:2px;"><span style="background:#D9824F;color:#fff;padding:2px 10px;border-radius:6px;font-weight:600;font-size:13px;">SIN PEDIDO — {esc(viaje.get("motivo_sin_pedido"))}</span></p>' if viaje.get("motivo_sin_pedido") else ''}
                 <p style="margin-top:4px;">Generado: <b>{viaje['fecha_creacion']} {viaje['hora_creacion']}</b>
                    por <b>{esc(viaje['usuario_creador'])}</b></p>
                 {f'<p style="margin-top:2px; color:#0B4A32;">✅ Liquidado por <b>{esc(viaje["usuario_liquido"])}</b> el <b>{viaje["fecha_liquidacion"]} {viaje["hora_liquidacion"]}</b></p>' if esta_liquidado else ''}
@@ -2151,6 +2179,19 @@ with tab1:
 
             cd_origen_final = cd_origen_fijo
 
+            viaje_sin_pedido = st.toggle("Este viaje no lleva pedido (recolección, avería, traslado entre CDs, etc.)",
+                                          key=f"sin_pedido_{run}")
+            motivo_seleccionado = None
+            if viaje_sin_pedido:
+                motivos_disp = st.session_state.catalogos.get("motivos_sin_pedido", [])
+                if motivos_disp:
+                    motivo_seleccionado = st.selectbox("Motivo", motivos_disp, key=f"motivo_sin_pedido_{run}")
+                else:
+                    st.warning("No hay motivos en el catálogo — pídele a un Administrador que agregue al menos "
+                               "uno en Catálogos → Motivos de Viaje sin Pedido.")
+                st.caption("No vas a poder agregar 'No. de Despacho' en las paradas de este viaje — solo cuenta "
+                           "los bultos, roles o tarimas a mano si aplica.")
+
             with st.container(border=True):
                 st.markdown("##### :material/route: RUTA Y DESTINOS")
                 st.caption("Cuenta lo físico primero; el marchamo de ida se cierra al final de cada tienda.")
@@ -2196,7 +2237,11 @@ with tab1:
                                        + (" · Complemento: solo Roles y Tarimas." if es_complemento else ""))
 
                         with st.expander("Detalle de cajas, material y documentos", expanded=True):
-                            if not es_complemento:
+                            if es_complemento:
+                                cajas_total = 0
+                            elif viaje_sin_pedido:
+                                st.caption("Sin pedido en este viaje — cuenta los bultos, roles o tarimas a mano abajo.")
+                            else:
                                 fp1, fp2, fp3 = st.columns([1.6, 1, 1])
                                 with fp1:
                                     pedido_codigo = st.text_input("No. de Despacho", key=f"cod_pedido_{run}_{i}_{subrun}")
@@ -2229,8 +2274,6 @@ with tab1:
                                         if pc4.button(":material/delete:", key=f"del_pedido_{run}_{i}_{idx}"):
                                             lista_pedidos.pop(idx)
                                             st.rerun()
-                            else:
-                                cajas_total = 0
 
                             mf1, mf2, mf3, mf4 = st.columns(4)
                             with mf1:
@@ -2313,7 +2356,10 @@ with tab1:
                     destinos_viaje[-1]["marchamo_regreso"] = marchamo_regreso_viaje.strip()
                 with cc2:
                     st.write("")
-                    guardar_click = st.button(":material/print: Generar Viaje e Imprimir", use_container_width=True, type="primary")
+                    guardar_click = st.button(
+                        f":material/print: Generar {motivo_seleccionado}" if (viaje_sin_pedido and motivo_seleccionado) else ":material/print: Generar Viaje e Imprimir",
+                        use_container_width=True, type="primary"
+                    )
 
         with col_side:
             with st.container(border=True):
@@ -2372,6 +2418,8 @@ with tab1:
                 st.error("❌ Error: El Marchamo de Regreso es obligatorio para cerrar el circuito.")
             elif marchamo_regreso_choca_en_form:
                 st.error("❌ Error: El Marchamo de Regreso no puede ser igual a un Marchamo de Ida de este mismo viaje.")
+            elif viaje_sin_pedido and not motivo_seleccionado:
+                st.error("❌ Error: Elige un Motivo para este viaje sin pedido antes de generarlo.")
             else:
                 ok, resultado = guardar_viaje(
                     cliente=cliente_activo,
@@ -2381,7 +2429,8 @@ with tab1:
                     auxiliar=auxiliar_final,
                     usuario=usuario_activo,
                     destinos_viaje=destinos_viaje,
-                    cd_origen=cd_origen_final
+                    cd_origen=cd_origen_final,
+                    motivo_sin_pedido=motivo_seleccionado if viaje_sin_pedido else None
                 )
                 if ok:
                     st.success(f"✅ Viaje {resultado} guardado correctamente.")
