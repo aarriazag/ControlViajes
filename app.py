@@ -450,6 +450,15 @@ def init_db():
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS roles_devueltos INTEGER")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS tarimas_devueltas INTEGER")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS pacas_carton_devueltas INTEGER")
+        # Peso — hoy sin ningún módulo de precios detrás, se captura desde ya para
+        # tener historial listo el día que sí se construya facturación por peso.
+        # Opcional, aplica sobre todo a viajes de Transporte.
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS peso NUMERIC")
+        # Estado de entrega — solo aplica a destinos de Transporte (Distribución usa
+        # el flujo de Liquidación normal con roles/tarimas). NULL = no aplica/todavía
+        # no se ha confirmado.
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS estado_entrega TEXT")
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS observacion_entrega TEXT")
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS usuario_liquido TEXT")
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS fecha_liquidacion TEXT")
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS hora_liquidacion TEXT")
@@ -520,6 +529,12 @@ def init_db():
                 cliente TEXT, cd TEXT, PRIMARY KEY (cliente, cd)
             )
         """)
+        # Tipo de Operación: de qué tipo es el servicio que se despacha desde ESTE
+        # origen específico — no del cliente completo, porque un mismo cliente puede
+        # tener una bodega de Distribución y otra de Transporte (caso real: un cliente
+        # con varios orígenes, cada uno de naturaleza distinta). Determina qué
+        # formulario de Despacho se muestra al elegir ese CD.
+        cur.execute("ALTER TABLE cat_cds_por_cliente ADD COLUMN IF NOT EXISTS tipo_operacion TEXT DEFAULT 'Distribución'")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_usuarios (usuario TEXT PRIMARY KEY, perfil TEXT)")
         cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS password_hash TEXT")
         cur.execute("ALTER TABLE cat_usuarios ADD COLUMN IF NOT EXISTS password_salt TEXT")
@@ -540,6 +555,16 @@ def init_db():
         # Clientes y Tiendas) — necesario para poder referenciarlos con llave foránea.
         cur.execute("CREATE TABLE IF NOT EXISTS cat_clientes (id SERIAL, nombre TEXT PRIMARY KEY)")
         cur.execute("ALTER TABLE cat_clientes ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
+        # Estado del cliente en su ciclo de vida — reemplaza el simple Activo/Inactivo
+        # para Clientes específicamente (los demás catálogos se quedan con el booleano
+        # simple). 'Prueba' sigue operando en Despacho como cualquier cliente normal,
+        # pero queda fuera de Reportes/Dashboard por default, para no mezclar métricas
+        # reales con pruebas que quizás nunca se conviertan.
+        cur.execute("ALTER TABLE cat_clientes ADD COLUMN IF NOT EXISTS estado_cliente TEXT DEFAULT 'Activo'")
+        cur.execute("""
+            UPDATE cat_clientes SET estado_cliente = CASE WHEN activo THEN 'Activo' ELSE 'Inactivo' END
+            WHERE estado_cliente IS NULL
+        """)
         # Bitácora de auditoría: quién hizo qué y cuándo, en toda la app.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS auditoria (
@@ -713,10 +738,12 @@ def cargar_catalogos_desde_db():
         cur.execute("SELECT nombre FROM cat_motivos_sin_pedido ORDER BY nombre")
         motivos_sin_pedido = [r["nombre"] for r in cur.fetchall()]
 
-        cur.execute("SELECT cliente, cd FROM cat_cds_por_cliente ORDER BY cliente, cd")
+        cur.execute("SELECT cliente, cd, tipo_operacion FROM cat_cds_por_cliente ORDER BY cliente, cd")
         cds_por_cliente = {}
+        tipo_operacion_por_cd = {}
         for r in cur.fetchall():
             cds_por_cliente.setdefault(r["cliente"], []).append(r["cd"])
+            tipo_operacion_por_cd[(r["cliente"], r["cd"])] = r["tipo_operacion"] or "Distribución"
 
         cur.execute("SELECT usuario, cliente FROM cat_usuario_clientes ORDER BY usuario, cliente")
         usuario_clientes = {}
@@ -725,13 +752,16 @@ def cargar_catalogos_desde_db():
 
         cur.execute("SELECT nombre FROM cat_clientes ORDER BY nombre")
         clientes_lista = [r["nombre"] for r in cur.fetchall()]
-        # Aparte, solo los activos — para los menús donde se ASIGNA algo nuevo
-        # (Despacho, dar acceso a un usuario, agregar una tienda). Los Reportes
-        # y clientes_permitidos_para() siguen usando clientes_lista completa,
-        # para no perder la posibilidad de consultar el historial de un
-        # cliente que ya se desactivó.
-        cur.execute("SELECT nombre FROM cat_clientes WHERE activo = TRUE ORDER BY nombre")
+        # Aparte, los que sí sirven para EMPEZAR algo nuevo (Despacho, dar acceso a
+        # un usuario, agregar una tienda) — incluye Prueba, porque un cliente de
+        # prueba SÍ tiene que poder operar normal mientras se decide si se queda.
+        # Solo Inactivo queda fuera. Los Reportes y clientes_permitidos_para()
+        # siguen usando clientes_lista completa, para no perder el historial de
+        # un cliente que ya se desactivó.
+        cur.execute("SELECT nombre FROM cat_clientes WHERE estado_cliente != 'Inactivo' ORDER BY nombre")
         clientes_lista_activos = [r["nombre"] for r in cur.fetchall()]
+        cur.execute("SELECT nombre FROM cat_clientes WHERE estado_cliente = 'Prueba'")
+        clientes_en_prueba = {r["nombre"] for r in cur.fetchall()}
 
         return {
             "usuarios": usuarios,
@@ -745,6 +775,8 @@ def cargar_catalogos_desde_db():
             "motivos_sin_pedido": motivos_sin_pedido,
             "rendimiento": rendimiento,
             "cds_por_cliente": cds_por_cliente,
+            "tipo_operacion_por_cd": tipo_operacion_por_cd,
+            "clientes_en_prueba": clientes_en_prueba,
             "usuario_clientes": usuario_clientes
         }
 
@@ -960,21 +992,20 @@ def actualizar_default_camion(placa, piloto, auxiliar):
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
 CATALOGOS_CONFIG = {
-    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
-                "booleanas": ["activo"], "solo_lectura": ["id"]},
+    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente"], "clave": ["nombre"], "numericas": []},
     "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social", "activo"], "clave": ["nombre"],
-                       "numericas": [], "booleanas": ["activo"], "solo_lectura": ["codigo"]},
+                       "numericas": [], "booleanas": ["activo"]},
     "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
-               "booleanas": ["activo"], "solo_lectura": ["codigo"]},
+               "booleanas": ["activo"]},
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
-                  "booleanas": ["activo"], "solo_lectura": ["codigo"]},
+                  "booleanas": ["activo"]},
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "activo"],
                  "clave": ["placa"], "numericas": [], "booleanas": ["activo"]},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"]},
     "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
-    "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd"],
+    "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd", "tipo_operacion"],
                         "clave": ["cliente", "cd"], "numericas": []},
     "Motivos de Viaje sin Pedido": {"tabla": "cat_motivos_sin_pedido", "columnas": ["nombre"],
                                     "clave": ["nombre"], "numericas": []},
@@ -1290,21 +1321,21 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                     cur.execute(
                         "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
                         "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias, "
-                        "devolucion, creditos, pg_cajas, es_complemento, tipo_pago) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "devolucion, creditos, pg_cajas, es_complemento, tipo_pago, peso) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
                          dest["marchamo_ida"], dest["marchamo_regreso"] or None,
                          dest["roles"], dest["tarimas"], dest["cajas"],
                          dest.get("remitos", ""), dest.get("incidencias", ""),
                          dest.get("devolucion", ""), dest.get("creditos", ""),
                          dest.get("pg_cajas", 0), dest.get("es_complemento", False),
-                         dest.get("tipo_pago", "Local"))
+                         dest.get("tipo_pago", "Local"), dest.get("peso"))
                     )
             conn.commit()
             orden_tiendas = " → ".join(f"{i+1}) {d['tienda']}" for i, d in enumerate(destinos_viaje))
             registrar_auditoria(usuario, "Crear viaje", f"Viaje {id_viaje_str} · Cliente {cliente} · Placa {placa} · Orden de paradas: {orden_tiendas}")
             return True, id_viaje_str
-        except psycopg2.IntegrityError as e:
+        except psycopg2.IntegrityError:
             conn.rollback()
             return False, "Ese marchamo ya está en uso en otro viaje — revisa el número e inténtalo de nuevo."
         except Exception as e:
@@ -1487,25 +1518,6 @@ def guardar_plan_carga(fecha, filas, usuario):
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "guardar_plan_carga")
-
-
-
-    """Busca viajes por coincidencia PARCIAL (no exacta) de No. de Viaje, Marchamo de
-    Ida (de cualquiera de sus destinos), o Placa. Devuelve una lista (puede tener
-    más de un resultado si el texto buscado coincide con varios viajes).
-    Si `clientes_permitidos` no es None, solo devuelve viajes de esos clientes —
-    así nadie encuentra, ni por accidente, un viaje de un cliente que no le
-    corresponde (Administrador pasa None y ve todo)."""
-    valor = f"%{valor_busqueda.strip()}%"
-    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("""
-            SELECT DISTINCT v.* FROM viajes v
-            WHERE (v.id_viaje ILIKE %s OR v.placa ILIKE %s
-               OR EXISTS (SELECT 1 FROM destinos d WHERE d.viaje_id = v.id AND d.marchamo_ida ILIKE %s))
-              AND (%s::text[] IS NULL OR v.cliente = ANY(%s))
-            ORDER BY v.id DESC LIMIT 20
-        """, (valor, valor, valor, clientes_permitidos, clientes_permitidos))
-        return cur.fetchall()
 
 
 def obtener_destinos_de_viaje(viaje_id):
@@ -1845,6 +1857,40 @@ def generar_hoja_control_html(viaje, destinos):
     """
 
 
+def confirmar_entrega_transporte(viaje_id, entregas, usuario):
+    """Para viajes de Transporte: la versión simple de liquidar_viaje() — en vez
+    de registrar roles/tarimas devueltos, solo marca cada destino como
+    Entregado/No Entregado con una observación libre. Cierra el viaje con el
+    mismo estado 'Liquidado' que usa Distribución, para que el resto de
+    reportes y filtros funcionen igual, sin casos especiales.
+    `entregas`: lista de dicts {id, estado_entrega, observacion_entrega}."""
+    with closing(get_conn()) as conn:
+        try:
+            with conn.cursor() as cur:
+                for e in entregas:
+                    cur.execute(
+                        "UPDATE destinos SET estado_entrega=%s, observacion_entrega=%s WHERE id=%s",
+                        (e["estado_entrega"], e["observacion_entrega"], e["id"])
+                    )
+                fecha_hoy = ahora().strftime("%Y-%m-%d")
+                hora_hoy = ahora().strftime("%H:%M:%S")
+                cur.execute(
+                    "UPDATE viajes SET estado='Liquidado', usuario_liquido=%s, fecha_liquidacion=%s, hora_liquidacion=%s "
+                    "WHERE id=%s AND estado='Pendiente de Liquidar'",
+                    (usuario, fecha_hoy, hora_hoy, viaje_id)
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return False, ("Este viaje ya no está 'Pendiente de Liquidar' — alguien más lo confirmó "
+                                    "mientras tenías esta pantalla abierta.")
+            conn.commit()
+            registrar_auditoria(usuario, "Confirmar entrega Transporte", f"Viaje ID {viaje_id}")
+            return True, "OK"
+        except Exception as e:
+            conn.rollback()
+            return False, _error_tecnico(e, "confirmar_entrega_transporte")
+
+
 def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
     """Registra lo que el camión trajo de regreso por cada destino y marca el viaje como Liquidado.
     destinos_actualizados: lista de dicts con id, roles_devueltos, tarimas_devueltas, pacas_carton_devueltas.
@@ -2082,9 +2128,17 @@ if not st.session_state.get("config_bloqueada"):
 
 cliente_activo = st.session_state["cliente_activo_fijo"]
 cd_origen_fijo = st.session_state["cd_origen_fijo"]
+# Qué tipo de operación es ESTE origen específico — determina si Despacho
+# muestra el formulario completo (Distribución) o el simplificado (Transporte).
+tipo_operacion_actual = st.session_state.catalogos.get("tipo_operacion_por_cd", {}).get(
+    (cliente_activo, cd_origen_fijo), "Distribución"
+)
+es_transporte = tipo_operacion_actual == "Transporte"
 
 st.sidebar.markdown("---")
 st.sidebar.success(f"🎯 **{cliente_activo}** · CD {cd_origen_fijo}")
+if es_transporte:
+    st.sidebar.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
 if st.sidebar.button(":material/swap_horiz: Cambiar Cliente / CD"):
     st.session_state["config_bloqueada"] = False
     del st.session_state["cliente_activo_fijo"]
@@ -2179,18 +2233,26 @@ with tab1:
 
             cd_origen_final = cd_origen_fijo
 
-            viaje_sin_pedido = st.toggle("Este viaje no lleva pedido (recolección, avería, traslado entre CDs, etc.)",
-                                          key=f"sin_pedido_{run}")
-            motivo_seleccionado = None
-            if viaje_sin_pedido:
-                motivos_disp = st.session_state.catalogos.get("motivos_sin_pedido", [])
-                if motivos_disp:
-                    motivo_seleccionado = st.selectbox("Motivo", motivos_disp, key=f"motivo_sin_pedido_{run}")
-                else:
-                    st.warning("No hay motivos en el catálogo — pídele a un Administrador que agregue al menos "
-                               "uno en Catálogos → Motivos de Viaje sin Pedido.")
-                st.caption("No vas a poder agregar 'No. de Despacho' en las paradas de este viaje — solo cuenta "
-                           "los bultos, roles o tarimas a mano si aplica.")
+            if es_transporte:
+                # El origen ya declaró que es Transporte — se comporta como "sin
+                # pedido" automáticamente, sin que el digitador tenga que marcar
+                # nada ni elegir un motivo (Transporte no es una excepción, es la
+                # naturaleza normal de este origen).
+                viaje_sin_pedido = True
+                motivo_seleccionado = "Transporte"
+            else:
+                viaje_sin_pedido = st.toggle("Este viaje no lleva pedido (recolección, avería, traslado entre CDs, etc.)",
+                                              key=f"sin_pedido_{run}")
+                motivo_seleccionado = None
+                if viaje_sin_pedido:
+                    motivos_disp = st.session_state.catalogos.get("motivos_sin_pedido", [])
+                    if motivos_disp:
+                        motivo_seleccionado = st.selectbox("Motivo", motivos_disp, key=f"motivo_sin_pedido_{run}")
+                    else:
+                        st.warning("No hay motivos en el catálogo — pídele a un Administrador que agregue al menos "
+                                   "uno en Catálogos → Motivos de Viaje sin Pedido.")
+                    st.caption("No vas a poder agregar 'No. de Despacho' en las paradas de este viaje — solo cuenta "
+                               "los bultos, roles o tarimas a mano si aplica.")
 
             with st.container(border=True):
                 st.markdown("##### :material/route: RUTA Y DESTINOS")
@@ -2294,6 +2356,18 @@ with tab1:
                                 tipo_pago = tiendas_cliente[tienda]["clasificacion"] if tienda else "Local"
                                 st.text_input("Clasificación de Destino", value=tipo_pago, disabled=True, key=f"tipopago_{run}_{i}")
 
+                            if es_transporte:
+                                tc1, tc2 = st.columns(2)
+                                with tc1:
+                                    peso_kg = st.number_input("Peso (opcional)", min_value=0.0, step=1.0, value=None,
+                                                               placeholder="0", key=f"peso_{run}_{i}",
+                                                               help="Se captura desde ya, aunque todavía no exista facturación por peso.")
+                                with tc2:
+                                    st.caption("Roles/Tarimas arriba son opcionales aquí — solo si este destino "
+                                               "de verdad entrega o recibe material retornable.")
+                            else:
+                                peso_kg = None
+
                             if es_cliente_unisuper:
                                 dc1, dc2, dc3, dc4 = st.columns(4)
                                 with dc1:
@@ -2338,7 +2412,8 @@ with tab1:
                                 "creditos": creditos_txt.strip(),
                                 "pg_cajas": pg_cajas,
                                 "es_complemento": es_complemento,
-                                "tipo_pago": tipo_pago
+                                "tipo_pago": tipo_pago,
+                                "peso": peso_kg
                             })
 
                 if st.button(":material/add: Agregar Parada"):
@@ -2561,6 +2636,44 @@ with tab2:
             elif viaje["estado"] == "Anulado":
                 st.error(f"🚫 Este viaje fue anulado el {viaje['fecha_anulacion']} por "
                          f"{viaje['usuario_anulo']}. Motivo: {viaje['motivo_anulacion']}")
+            elif viaje.get("motivo_sin_pedido") == "Transporte":
+                # Confirmación simple: Entregado/No Entregado + observación — nada
+                # de roles/tarimas devueltos, ese formulario es solo para Distribución.
+                st.markdown("#### Confirmación de entrega")
+                st.caption("Viaje de Transporte — solo confirma si se entregó o no en cada destino.")
+                entregas_actualizadas = []
+                for d in destinos:
+                    st.markdown(f"📍 **{d['tienda']}**" + (f" — Peso: {d['peso']}" if d.get("peso") else ""))
+                    ec1, ec2 = st.columns([1, 2])
+                    with ec1:
+                        estado_entrega_sel = st.selectbox(
+                            "Estado", ["Pendiente", "Entregado", "No Entregado"],
+                            key=f"estado_entrega_{d['id']}"
+                        )
+                    with ec2:
+                        observacion_sel = st.text_input(
+                            "Observación (ej. devolución, novedad)", key=f"obs_entrega_{d['id']}"
+                        )
+                    entregas_actualizadas.append({
+                        "id": d["id"], "estado_entrega": estado_entrega_sel, "observacion_entrega": observacion_sel.strip()
+                    })
+                    st.markdown("---")
+
+                if st.button(":material/check: Confirmar Entregas y Cerrar Viaje"):
+                    faltan = [e for e in entregas_actualizadas if e["estado_entrega"] == "Pendiente"]
+                    if faltan:
+                        st.warning(f"⚠️ Todavía hay {len(faltan)} destino(s) en 'Pendiente' — confírmalos "
+                                   "como Entregado o No Entregado antes de cerrar el viaje.")
+                    else:
+                        ok, msg = confirmar_entrega_transporte(viaje["id"], entregas_actualizadas, usuario_activo)
+                        if ok:
+                            st.success(f"Viaje {viaje['id_viaje']} confirmado y cerrado correctamente.")
+                            del st.session_state["viaje_liq"]
+                            del st.session_state["destinos_liq"]
+                            st.session_state.pop("resultados_busqueda_liq", None)
+                            st.rerun()
+                        else:
+                            mostrar_resultado_error(msg, perfil_activo)
             else:
                 st.markdown("#### Devoluciones por tienda")
                 destinos_actualizados = []
@@ -3155,6 +3268,18 @@ with tab4:
                 valores_form["transportista"] = st.selectbox("Transportista", transportistas_existentes, key=f"campo_{catalogo_sel}_transportista_sel") if transportistas_existentes else ""
             elif col == "clasificacion":
                 valores_form["clasificacion"] = st.selectbox("Clasificación (Local/Departamental)", ["Local", "Departamental"], key=f"campo_{catalogo_sel}_clasificacion_sel")
+            elif col == "estado_cliente":
+                valores_form["estado_cliente"] = st.selectbox(
+                    "Estado del Cliente", ["Prueba", "Activo", "Inactivo"], index=1, key=f"campo_{catalogo_sel}_estado_sel",
+                    help="Prueba: sigue funcionando en Despacho, pero se excluye de Reportes/Dashboard por default. "
+                         "Inactivo: desaparece de los menús para crear viajes nuevos, sin borrar su historial."
+                )
+            elif col == "tipo_operacion":
+                valores_form["tipo_operacion"] = st.selectbox(
+                    "Tipo de Operación", ["Distribución", "Transporte"], key=f"campo_{catalogo_sel}_tipo_op_sel",
+                    help="Distribución: varias tiendas por viaje, con pedido y cajas (como hoy). "
+                         "Transporte: punto a punto, solo confirmación de entrega."
+                )
             elif col in config.get("booleanas", []):
                 valores_form[col] = st.checkbox("Activo", value=True, key=f"campo_{catalogo_sel}_{col}",
                                                   help="Desmárcalo para que ya no aparezca en los menús de Despacho, sin borrar su historial.")
@@ -3401,6 +3526,26 @@ with tab6:
                     ok, msg = cambiar_estado_usuario(usuario_toggle, True, usuario_activo)
                     if ok:
                         st.success(f"Cuenta de '{usuario_toggle}' reactivada.")
+                        st.session_state.catalogos = cargar_catalogos_desde_db()
+                        st.rerun()
+                    else:
+                        mostrar_resultado_error(msg, perfil_activo)
+
+        st.markdown("---")
+        st.markdown("#### :material/swap_horiz: Cambiar rol de usuario")
+        st.caption("Solo puedes asignar los roles que ves en el desplegable de arriba (Crear usuario nuevo) — "
+                   "no puedes ascender a nadie a un rol igual o superior al tuyo.")
+        if usuarios_gestionables:
+            usuario_rol = st.selectbox("Usuario", usuarios_gestionables, key="usuario_rol_gestion")
+            perfil_actual_usuario = next((u["perfil"] for u in usuarios_lista if u["usuario"] == usuario_rol), None)
+            nuevo_rol = st.selectbox("Nuevo rol", perfiles_asignables, key="nuevo_rol_gestion")
+            if st.button(":material/swap_horiz: Cambiar Rol", key="btn_cambiar_rol"):
+                if nuevo_rol == perfil_actual_usuario:
+                    st.warning(f"'{usuario_rol}' ya tiene el rol {nuevo_rol} — no hay nada que cambiar.")
+                else:
+                    ok, msg = cambiar_perfil_usuario(usuario_rol, nuevo_rol, usuario_activo)
+                    if ok:
+                        st.success(f"✅ '{usuario_rol}' ahora es {nuevo_rol} (antes: {perfil_actual_usuario}).")
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
                     else:
