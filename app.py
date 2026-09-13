@@ -1352,6 +1352,27 @@ def validar_pedido_wms(pedido_codigo):
     return None
 
 
+def enviar_visita_simpliroute(viaje_id):
+    """PENDIENTE: aquí se conectará el envío real de este viaje hacia SimpliRoute
+    (crear una Visita por cada destino, vía su API) — para los orígenes de
+    Transporte, donde SimpliRoute administra el aviso al piloto y el rastreo.
+
+    Por ahora no hay conexión configurada: no hace nada, y el viaje sigue
+    funcionando 100% manual dentro de Control de Ruta, exactamente como hoy.
+
+    Cuando se conecte de verdad, debe seguir la misma regla que ya usa
+    validar_pedido_wms() — nunca dejar que un fallo de SimpliRoute tumbe el
+    viaje que ya se guardó aquí:
+      - Tiempo límite corto en cada llamada (5-10 segundos, no el default de
+        la librería) — si SimpliRoute está lento, que falle rápido y el
+        viaje se quede en modo manual, no que la pantalla se congele.
+      - Si falla, se registra con _error_tecnico() para que quede en los
+        Logs, pero al digitador nunca se le bloquea ni se le exige nada —
+        simplemente sigue trabajando manual.
+    Debe devolver (True, "OK") si se mandó bien, o (False, motivo) si no."""
+    return False, "SimpliRoute todavía no está conectado — este viaje sigue en modo manual dentro de Control de Ruta."
+
+
 def obtener_viajes_recientes(limite=10):
     with closing(get_conn()) as conn:
         return pd.read_sql_query(
