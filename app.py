@@ -992,7 +992,8 @@ def actualizar_default_camion(placa, piloto, auxiliar):
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
 CATALOGOS_CONFIG = {
-    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente"], "clave": ["nombre"], "numericas": []},
+    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente"], "clave": ["nombre"], "numericas": [],
+                "opciones_desplegable": {"estado_cliente": ["Prueba", "Activo", "Inactivo"]}},
     "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social", "activo"], "clave": ["nombre"],
                        "numericas": [], "booleanas": ["activo"]},
     "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
@@ -1002,11 +1003,13 @@ CATALOGOS_CONFIG = {
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "activo"],
                  "clave": ["placa"], "numericas": [], "booleanas": ["activo"]},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
-                           "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"]},
+                           "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"],
+                           "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]}},
     "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd", "tipo_operacion"],
-                        "clave": ["cliente", "cd"], "numericas": []},
+                        "clave": ["cliente", "cd"], "numericas": [],
+                        "opciones_desplegable": {"tipo_operacion": ["Distribución", "Transporte"]}},
     "Motivos de Viaje sin Pedido": {"tabla": "cat_motivos_sin_pedido", "columnas": ["nombre"],
                                     "clave": ["nombre"], "numericas": []},
     # "Usuarios" ya no se gestiona aquí como catálogo genérico — crear una cuenta
@@ -2380,7 +2383,7 @@ with tab1:
                             if es_transporte:
                                 tc1, tc2 = st.columns(2)
                                 with tc1:
-                                    peso_kg = st.number_input("Peso (opcional)", min_value=0.0, step=1.0, value=None,
+                                    peso_kg = st.number_input("Peso en Kg (opcional)", min_value=0.0, step=1.0, value=None,
                                                                placeholder="0", key=f"peso_{run}_{i}",
                                                                help="Se captura desde ya, aunque todavía no exista facturación por peso.")
                                 with tc2:
@@ -2664,7 +2667,7 @@ with tab2:
                 st.caption("Viaje de Transporte — solo confirma si se entregó o no en cada destino.")
                 entregas_actualizadas = []
                 for d in destinos:
-                    st.markdown(f"📍 **{d['tienda']}**" + (f" — Peso: {d['peso']}" if d.get("peso") else ""))
+                    st.markdown(f"📍 **{d['tienda']}**" + (f" — Peso: {d['peso']} Kg" if d.get("peso") else ""))
                     ec1, ec2 = st.columns([1, 2])
                     with ec1:
                         estado_entrega_sel = st.selectbox(
@@ -3198,6 +3201,8 @@ with tab4:
         st.caption("Edita directo aquí como en Excel — agrega filas al final o marca la casilla de la "
                    "izquierda para borrar una. Los cambios no se guardan solos: presiona 'Guardar Cambios'.")
         column_config = {c: st.column_config.Column(disabled=True) for c in config.get("solo_lectura", [])}
+        for col, opciones in config.get("opciones_desplegable", {}).items():
+            column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=True)
         df_editado = st.data_editor(
             df_actual_completo, use_container_width=True, height=280, num_rows="dynamic",
             column_config=column_config, key=f"editor_{catalogo_sel}"
