@@ -1001,22 +1001,26 @@ CATALOGOS_CONFIG = {
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
                   "booleanas": ["activo"]},
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "activo"],
-                 "clave": ["placa"], "numericas": [], "booleanas": ["activo"]},
+                 "clave": ["placa"], "numericas": [], "booleanas": ["activo"],
+                 "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares"}},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"],
-                           "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]}},
+                           "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]},
+                           "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
     "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
                                "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd", "tipo_operacion"],
                         "clave": ["cliente", "cd"], "numericas": [],
-                        "opciones_desplegable": {"tipo_operacion": ["Distribución", "Transporte"]}},
+                        "opciones_desplegable": {"tipo_operacion": ["Distribución", "Transporte"]},
+                        "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
     "Motivos de Viaje sin Pedido": {"tabla": "cat_motivos_sin_pedido", "columnas": ["nombre"],
                                     "clave": ["nombre"], "numericas": []},
     # "Usuarios" ya no se gestiona aquí como catálogo genérico — crear una cuenta
     # necesita generarle una contraseña, así que vive en la pestaña "Usuarios"
     # dedicada (Gestión de Usuarios), no en un data_editor de texto plano.
     "Acceso Usuario → Cliente": {"tabla": "cat_usuario_clientes", "columnas": ["usuario", "cliente"],
-                                 "clave": ["usuario", "cliente"], "numericas": []},
+                                 "clave": ["usuario", "cliente"], "numericas": [],
+                                 "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
 }
 
 # Lista blanca de tablas/columnas para armar SQL dinámico — capa extra de
@@ -1045,6 +1049,25 @@ def _validar_identificadores_sql(tabla, columnas=None):
                 raise ValueError(f"Columna no permitida en {tabla!r}: {c!r}")
 
 
+def _mensaje_foreign_key_amigable(e):
+    """Traduce un ForeignKeyViolation de Postgres a un aviso de negocio claro,
+    en vez del texto técnico crudo — usado tanto al agregar/corregir un
+    registro individual como al guardar la tabla completa."""
+    detalle = str(e)
+    if "piloto" in detalle:
+        pista = "el Piloto"
+    elif "auxiliar" in detalle:
+        pista = "el Auxiliar"
+    elif "transportista" in detalle:
+        pista = "el Transportista"
+    elif "cliente" in detalle:
+        pista = "el Cliente"
+    else:
+        pista = "algún dato relacionado"
+    return (f"No se pudo guardar — {pista} que escribiste no existe todavía en su propio catálogo. "
+            f"Agrégalo ahí primero (o corrige el nombre si fue un error de tecleo) y vuelve a guardar.")
+
+
 def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clientes_permitidos=None):
     """Inserta un registro nuevo, o lo actualiza si la llave ya existe (upsert),
     para poder corregir un solo dato sin tener que resubir todo el Excel."""
@@ -1069,6 +1092,9 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clie
             registrar_auditoria(usuario, "Agregar/Actualizar registro de catálogo",
                                  f"Tabla {tabla} · {', '.join(f'{c}={valores[c]}' for c in clave)}")
             return True, "OK"
+        except psycopg2.errors.ForeignKeyViolation as e:
+            conn.rollback()
+            return False, _mensaje_foreign_key_amigable(e)
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "agregar_o_actualizar_registro")
@@ -1206,6 +1232,9 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
             if no_borrables:
                 return True, f"⚠️ Guardado, pero esto sigue existiendo porque está en uso en Camiones o Viajes: {', '.join(no_borrables)}"
             return True, "OK"
+        except psycopg2.errors.ForeignKeyViolation as e:
+            conn.rollback()
+            return False, _mensaje_foreign_key_amigable(e)
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "sincronizar_catalogo")
@@ -3203,6 +3232,13 @@ with tab4:
         column_config = {c: st.column_config.Column(disabled=True) for c in config.get("solo_lectura", [])}
         for col, opciones in config.get("opciones_desplegable", {}).items():
             column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=True)
+        for col, catalogo_key in config.get("opciones_desde_catalogo", {}).items():
+            opciones_vivas = sorted(st.session_state.catalogos.get(catalogo_key, []))
+            column_config[col] = st.column_config.SelectboxColumn(
+                options=opciones_vivas, required=True,
+                help="Solo aparecen los que ya existen en su propio catálogo — para agregar uno nuevo, ve primero a esa pantalla." if opciones_vivas
+                     else "⚠️ Ese catálogo está vacío todavía — agrega al menos un registro ahí primero."
+            )
         df_editado = st.data_editor(
             df_actual_completo, use_container_width=True, height=280, num_rows="dynamic",
             column_config=column_config, key=f"editor_{catalogo_sel}"
