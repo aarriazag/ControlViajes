@@ -471,6 +471,11 @@ def init_db():
         # Viajes que no llevan pedido (recolección, avería, traslado entre CDs,
         # etc.) — NULL significa "es un viaje normal, con pedido".
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS motivo_sin_pedido TEXT")
+        # Placa del furgón — solo aplica a unidades de 20 Ton (cabezal + furgón
+        # por separado). Vive en el viaje, no en el catálogo de Camiones, porque
+        # el furgón puede cambiar de un viaje a otro según lo que el proveedor
+        # tenga disponible ese día.
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS placa_furgon TEXT")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_motivos_sin_pedido (nombre TEXT PRIMARY KEY)")
         cur.execute("""
             INSERT INTO cat_motivos_sin_pedido (nombre) VALUES
@@ -1316,11 +1321,13 @@ def siguiente_correlativo(cliente, cur):
     return f"{prefijo}-{numero:04d}"
 
 
-def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None, motivo_sin_pedido=None):
+def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None, motivo_sin_pedido=None, placa_furgon=None):
     """Guarda el viaje y sus destinos en una sola transacción.
     `motivo_sin_pedido`: si no es None, este viaje no lleva pedido (Recolección,
     Avería, Traslado entre CDs, etc.) — se guarda como dato del viaje, no del
     destino, ya que aplica a todo el viaje completo.
+    `placa_furgon`: solo aplica a unidades de 20 Ton (cabezal + furgón), y
+    puede cambiar de un viaje a otro según lo que el proveedor tenga disponible.
     Devuelve (True, id_viaje) si funcionó, o (False, mensaje_error) si no."""
     with closing(get_conn()) as conn:
         try:
@@ -1342,10 +1349,10 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
 
                 cur.execute(
                     "INSERT INTO viajes (id_viaje, cliente, placa, transportista, piloto, auxiliar, "
-                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen, motivo_sin_pedido) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen, motivo_sin_pedido, placa_furgon) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                     (id_viaje_str, cliente, placa, transportista, piloto, auxiliar, usuario, fecha_hoy, hora_hoy,
-                     cd_origen, motivo_sin_pedido)
+                     cd_origen, motivo_sin_pedido, placa_furgon or None)
                 )
                 viaje_id = cur.fetchone()[0]
 
@@ -1446,7 +1453,8 @@ def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
                 v.transportista AS "Transportista",
                 tr.razon_social AS "Razón Social",
                 ag.bultos AS "Bultos",
-                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje"
+                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje",
+                COALESCE(v.placa_furgon, '') AS "Placa Furgón"
             FROM viajes v
             JOIN agregado ag ON ag.viaje_id = v.id
             JOIN mas_lejano ml ON ml.viaje_id = v.id
@@ -1644,7 +1652,7 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
             return False, _error_tecnico(e, "anular_viaje")
 
 
-def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados, marchamo_regreso_viaje, usuario_editor):
+def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados, marchamo_regreso_viaje, usuario_editor, placa_furgon=None):
     """Corrige los datos de un viaje ya guardado (solo permitido mientras esté
     'Pendiente de Liquidar'). destinos_actualizados es una lista de dicts con el
     id de cada destino y sus campos corregidos. El Marchamo de Regreso es UNO solo
@@ -1677,9 +1685,9 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                         return False, f"El marchamo de regreso '{marchamo_regreso_viaje}' ya está en uso en otro viaje."
 
                 cur.execute(
-                    "UPDATE viajes SET placa=%s, transportista=%s, piloto=%s, auxiliar=%s "
+                    "UPDATE viajes SET placa=%s, transportista=%s, piloto=%s, auxiliar=%s, placa_furgon=%s "
                     "WHERE id=%s AND estado = 'Pendiente de Liquidar'",
-                    (placa, transportista, piloto, auxiliar, viaje_id)
+                    (placa, transportista, piloto, auxiliar, placa_furgon or None, viaje_id)
                 )
                 if cur.rowcount == 0:
                     conn.rollback()
@@ -1891,7 +1899,8 @@ def generar_hoja_control_html(viaje, destinos):
             <div class="dato"><label>Cliente</label><span>{esc(viaje['cliente'])}</span></div>
             <div class="dato"><label>CD Origen</label><span>{esc(viaje['cd_origen']) or '—'}</span></div>
             <div class="dato"><label>Transportista</label><span>{esc(viaje['transportista'])}</span></div>
-            <div class="dato"><label>Placa</label><span>{esc(viaje['placa'])}</span></div>
+            <div class="dato"><label>Placa (Cabezal)</label><span>{esc(viaje['placa'])}</span></div>
+            {f'<div class="dato"><label>Placa (Furgón)</label><span>{esc(viaje.get("placa_furgon"))}</span></div>' if viaje.get('placa_furgon') else ''}
             <div class="dato"><label>Fecha</label><span>{viaje['fecha_creacion']}</span></div>
             <div class="dato dato-blanco"><label>Horario (Garita — hora real de salida)</label><span>&nbsp;</span></div>
             <div class="dato"><label>Piloto</label><span>{esc(viaje['piloto'])}</span></div>
@@ -2284,6 +2293,17 @@ with tab1:
                         st.warning("Sin auxiliares en el catálogo.")
                         auxiliar_final = ""
 
+                placa_furgon = ""
+                if cap_pred == "20 Ton":
+                    # Las unidades de 20 Ton llevan cabezal + furgón por separado —
+                    # el furgón tiene su propia placa, y como el proveedor lo puede
+                    # cambiar según disponibilidad, no vive en el catálogo de
+                    # Camiones (que es del cabezal) — se digita en cada viaje.
+                    placa_furgon = st.text_input(
+                        "Placa del Furgón (unidad de 20 Ton)", key=f"furgon_{run}",
+                        help="El furgón puede cambiar de un viaje a otro según lo que el proveedor tenga disponible."
+                    ).strip()
+
             cd_origen_final = cd_origen_fijo
 
             if es_transporte:
@@ -2538,6 +2558,8 @@ with tab1:
                 st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
             elif not piloto_final or not auxiliar_final:
                 st.error("❌ Error: Falta seleccionar Piloto y/o Auxiliar (revisa que el catálogo tenga al menos uno cargado).")
+            elif cap_pred == "20 Ton" and not placa_furgon:
+                st.error("❌ Error: Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
             elif marchamos_vacios:
                 st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
             elif marchamos_repetidos_en_form:
@@ -2558,7 +2580,8 @@ with tab1:
                     usuario=usuario_activo,
                     destinos_viaje=destinos_viaje,
                     cd_origen=cd_origen_final,
-                    motivo_sin_pedido=motivo_seleccionado if viaje_sin_pedido else None
+                    motivo_sin_pedido=motivo_seleccionado if viaje_sin_pedido else None,
+                    placa_furgon=placa_furgon if cap_pred == "20 Ton" else None
                 )
                 if ok:
                     st.success(f"✅ Viaje {resultado} guardado correctamente.")
@@ -2876,6 +2899,13 @@ with tab5:
                             st.warning(f"Catálogo de Auxiliares vacío — se mantiene el auxiliar actual: {viaje_g['auxiliar']}")
                             auxiliar_edit = viaje_g["auxiliar"]
 
+                        placa_furgon_edit = ""
+                        if datos_cam.get("tipo") == "20 Ton":
+                            placa_furgon_edit = st.text_input(
+                                "Placa del Furgón (unidad de 20 Ton)",
+                                value=viaje_g.get("placa_furgon") or "", key=f"edit_furgon_{viaje_g['id']}"
+                            ).strip()
+
                         st.markdown("##### DATOS POR TIENDA")
                         destinos_editados = []
                         for d in sorted(destinos_g, key=lambda x: x["orden"]):
@@ -2930,10 +2960,12 @@ with tab5:
                         if st.button("💾 Guardar Correcciones", key=f"btn_editar_{viaje_g['id']}"):
                             if not marchamo_regreso_edit.strip():
                                 st.error("❌ El Marchamo de Regreso es obligatorio.")
+                            elif datos_cam.get("tipo") == "20 Ton" and not placa_furgon_edit:
+                                st.error("❌ Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                             else:
                                 ok, msg = editar_viaje(viaje_g["id"], placa_edit, transportista_edit, piloto_edit,
                                                        auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip(),
-                                                       usuario_activo)
+                                                       usuario_activo, placa_furgon=placa_furgon_edit or None)
                                 if ok:
                                     st.success(f"Viaje {viaje_g['id_viaje']} corregido.")
                                     del st.session_state["viaje_gestion"]
