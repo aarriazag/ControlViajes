@@ -3259,16 +3259,29 @@ with tab4:
         df_actual = df_actual_completo[config["columnas"]]  # sin las de solo lectura, para el resto de la lógica
 
         st.markdown("#### :material/table_edit: Edición rápida en tabla")
-        st.caption("Edita directo aquí como en Excel — agrega filas al final o marca la casilla de la "
-                   "izquierda para borrar una. Los cambios no se guardan solos: presiona 'Guardar Cambios'.")
+        rcol1, rcol2 = st.columns([3, 1])
+        with rcol1:
+            st.caption("Edita directo aquí como en Excel — agrega filas al final o marca la casilla de la "
+                       "izquierda para borrar una. Los cambios no se guardan solos: presiona 'Guardar Cambios'.")
+        with rcol2:
+            if st.button("🔄 Actualizar catálogos", key=f"refrescar_{catalogo_sel}",
+                          help="Si acabas de agregar un cliente/piloto/camión nuevo y no te aparece en las listas de esta pantalla, dale clic aquí primero."):
+                st.session_state.catalogos = cargar_catalogos_desde_db()
+                st.rerun()
         column_config = {c: st.column_config.Column(disabled=True) for c in config.get("solo_lectura", [])}
         for col, opciones in config.get("opciones_desplegable", {}).items():
             column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=True)
         for col, catalogo_key in config.get("opciones_desde_catalogo", {}).items():
             opciones_vivas = sorted(st.session_state.catalogos.get(catalogo_key, []))
+            # Si quien edita tiene alcance limitado (Supervisor) y esta columna
+            # es "cliente", el combo solo debe ofrecer SUS clientes — si no, se
+            # ve una opción que de todos modos se va a rechazar al guardar.
+            if mis_clientes is not None and col == "cliente":
+                opciones_vivas = sorted(c for c in opciones_vivas if c in mis_clientes)
             column_config[col] = st.column_config.SelectboxColumn(
                 options=opciones_vivas, required=True,
-                help="Solo aparecen los que ya existen en su propio catálogo — para agregar uno nuevo, ve primero a esa pantalla." if opciones_vivas
+                help="Solo aparecen los que ya existen en su propio catálogo — si no ves el que buscas, dale "
+                     "'🔄 Actualizar catálogos' arriba (puede que se haya agregado después de que abriste esta pantalla)." if opciones_vivas
                      else "⚠️ Ese catálogo está vacío todavía — agrega al menos un registro ahí primero."
             )
         df_editado = st.data_editor(
