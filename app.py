@@ -1420,52 +1420,24 @@ def obtener_viajes_recientes(limite=10):
         )
 
 
-def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
-    """Un renglón por viaje: la tienda que se muestra es la más lejana (mayor km)
-    del viaje, junto con cuántas tiendas llevaba en total. BULTOS = solo cajas."""
+def obtener_reportes_activos():
+    """Motor de Reportes: lee de cat_reportes qué reportes existen y su query
+    SQL — así, agregar o ajustar un reporte que siga este mismo patrón
+    (fecha + cliente) es un UPDATE/INSERT en Supabase, sin deploy."""
+    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT clave, nombre, query_sql, extra_fn, descripcion FROM cat_reportes "
+            "WHERE activo = TRUE ORDER BY orden"
+        )
+        return cur.fetchall()
+
+
+def obtener_reporte_generico(query_sql, fecha_inicio, fecha_fin, cliente="Todos"):
+    """Corre el query_sql de un reporte de cat_reportes con los 4 parámetros
+    estándar (fecha_inicio, fecha_fin, cliente, cliente) que usan los tres
+    reportes actuales."""
     with closing(get_conn()) as conn:
-        query = """
-            WITH agregado AS (
-                SELECT viaje_id,
-                       STRING_AGG(marchamo_ida, ' / ' ORDER BY orden) AS marchamos,
-                       COUNT(*) AS cantidad_tiendas,
-                       SUM(cajas) AS bultos
-                FROM destinos
-                GROUP BY viaje_id
-            ),
-            mas_lejano AS (
-                SELECT DISTINCT ON (viaje_id) viaje_id, tienda, tipo_pago
-                FROM destinos
-                ORDER BY viaje_id, km DESC NULLS LAST
-            )
-            SELECT
-                v.fecha_creacion AS "Fecha",
-                v.id_viaje AS "No. Despacho",
-                v.usuario_creador AS "Supervisor/Coordinador",
-                ag.marchamos AS "No. de Marchamo",
-                ml.tienda AS "Tienda (más lejana)",
-                ag.cantidad_tiendas AS "Cantidad de Tiendas",
-                v.placa AS "Placa",
-                v.piloto AS "Piloto a Cargo",
-                v.cd_origen AS "Origen",
-                ml.tipo_pago AS "Clasificación de Destino",
-                cam.tipo AS "Tonelaje",
-                v.transportista AS "Transportista",
-                tr.razon_social AS "Razón Social",
-                ag.bultos AS "Bultos",
-                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje",
-                COALESCE(v.placa_furgon, '') AS "Placa Furgón"
-            FROM viajes v
-            JOIN agregado ag ON ag.viaje_id = v.id
-            JOIN mas_lejano ml ON ml.viaje_id = v.id
-            LEFT JOIN cat_camiones cam ON cam.placa = v.placa
-            LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
-            WHERE v.estado != 'Anulado'
-              AND v.fecha_creacion BETWEEN %s AND %s
-              AND (%s = 'Todos' OR v.cliente = %s)
-            ORDER BY v.fecha_creacion DESC, v.id DESC
-        """
-        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+        return pd.read_sql_query(query_sql, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
 def _sanear_formulas(df):
@@ -1494,54 +1466,78 @@ def exportar_csv(df):
     return _sanear_formulas(df).to_csv(index=False).encode("utf-8-sig")
 
 
-def obtener_reporte_liquidaciones(fecha_inicio, fecha_fin, cliente="Todos"):
-    """Resumen de cuántos viajes están Pendientes, Liquidados o Anulados en el
-    rango de fechas, más el detalle de cada uno para poder ver cuáles faltan."""
-    with closing(get_conn()) as conn:
-        query = """
-            SELECT
-                v.fecha_creacion AS "Fecha",
-                v.id_viaje AS "No. de Viaje",
-                v.cliente AS "Cliente",
-                v.placa AS "Placa",
-                v.piloto AS "Piloto",
-                v.estado AS "Estado",
-                v.fecha_liquidacion AS "Fecha de Liquidación",
-                v.usuario_liquido AS "Liquidado Por"
-            FROM viajes v
-            WHERE v.fecha_creacion BETWEEN %s AND %s
-              AND (%s = 'Todos' OR v.cliente = %s)
-            ORDER BY v.fecha_creacion DESC, v.id DESC
-        """
-        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+def _extra_liquidaciones(df, key_prefix):
+    """Lógica particular de 'Resumen de Liquidaciones': 4 KPIs + filtro por
+    Estado. No es parte del query genérico porque no aplica a los demás
+    reportes. Devuelve el df ya filtrado para mostrar/exportar."""
+    total = len(df)
+    pendientes = (df["Estado"] == "Pendiente de Liquidar").sum()
+    liquidados = (df["Estado"] == "Liquidado").sum()
+    anulados = (df["Estado"] == "Anulado").sum()
+
+    kcol1, kcol2, kcol3, kcol4 = st.columns(4)
+    kcol1.metric("Total de Viajes", total)
+    kcol2.metric("Pendientes de Liquidar", pendientes)
+    kcol3.metric("Liquidados", liquidados)
+    kcol4.metric("Anulados", anulados)
+
+    st.markdown("---")
+    filtro_estado = st.selectbox(
+        "Filtrar por estado", ["Todos", "Pendiente de Liquidar", "Liquidado", "Anulado"],
+        key=f"filtro_estado_{key_prefix}"
+    )
+    return df if filtro_estado == "Todos" else df[df["Estado"] == filtro_estado]
 
 
-def obtener_reporte_retornable_por_fecha(fecha_inicio, fecha_fin, cliente="Todos"):
-    """Detalle día por día: en cada fecha del viaje, cuánto se envió y cuánto se
-    retornó de cada material, por tienda. Todo queda bajo la fecha del viaje
-    (no la de liquidación) para que no haya confusión al leerlo día a día —
-    el retorno solo tiene valor una vez que ese viaje ya se liquidó, pero se
-    reporta en la misma fila que su envío."""
-    with closing(get_conn()) as conn:
-        query = """
-            SELECT v.fecha_creacion AS "Fecha", v.cliente AS "Cliente", d.tienda AS "Tienda",
-                   SUM(d.roles) AS "Roles Enviados",
-                   SUM(COALESCE(d.roles_devueltos, 0)) AS "Roles Retornados",
-                   SUM(d.tarimas) AS "Tarimas Enviadas",
-                   SUM(COALESCE(d.tarimas_devueltas, 0)) AS "Tarimas Retornadas",
-                   SUM(COALESCE(d.pacas_carton_devueltas, 0)) AS "Pacas de Cartón Retornadas"
-            FROM destinos d JOIN viajes v ON v.id = d.viaje_id
-            WHERE v.estado != 'Anulado' AND v.fecha_creacion BETWEEN %s AND %s
-              AND (%s = 'Todos' OR v.cliente = %s)
-            GROUP BY v.fecha_creacion, v.cliente, d.tienda
-            ORDER BY v.cliente, d.tienda, v.fecha_creacion
-        """
-        df = pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
-        # Cada paca de cartón equivale a 50 lbs (acordado con el cliente) —
-        # se agrega como columna aparte, sin quitar el conteo de pacas, para
-        # no perder la unidad con la que realmente se digitó.
-        df["Lbs de Cartón"] = df["Pacas de Cartón Retornadas"] * LBS_POR_PACA_CARTON
-        return df
+def _extra_retornable(df, key_prefix):
+    """Lógica particular de 'Control de Retornable': agrega la columna
+    calculada Lbs de Cartón (no viene del query — se calcula en Python porque
+    depende de LBS_POR_PACA_CARTON), muestra KPIs de saldo por material, y
+    recorta las columnas según el Material elegido."""
+    df = df.copy()
+    # Cada paca de cartón equivale a 50 lbs (acordado con el cliente) — se
+    # agrega como columna aparte, sin quitar el conteo de pacas, para no
+    # perder la unidad con la que realmente se digitó.
+    df["Lbs de Cartón"] = df["Pacas de Cartón Retornadas"] * LBS_POR_PACA_CARTON
+
+    material_sel = st.selectbox(
+        "Material", ["Todos", "Roles", "Tarimas", "Pacas de Cartón (Lbs)"],
+        key=f"material_{key_prefix}"
+    )
+
+    kcol1, kcol2, kcol3 = st.columns(3)
+    if material_sel in ("Todos", "Roles"):
+        saldo_roles = int(df["Roles Enviados"].sum() - df["Roles Retornados"].sum())
+        kcol1.metric("Total Roles en Tiendas", saldo_roles)
+    if material_sel in ("Todos", "Tarimas"):
+        saldo_tarimas = int(df["Tarimas Enviadas"].sum() - df["Tarimas Retornadas"].sum())
+        kcol2.metric("Total Tarimas en Tiendas", saldo_tarimas)
+    if material_sel in ("Todos", "Pacas de Cartón (Lbs)"):
+        total_lbs = int(df["Lbs de Cartón"].sum())
+        kcol3.metric("Total Lbs de Cartón Retornadas", f"{total_lbs:,} lbs",
+                     help=f"{int(df['Pacas de Cartón Retornadas'].sum())} pacas × {LBS_POR_PACA_CARTON} lbs c/u")
+
+    st.markdown("---")
+    st.caption("Cada fila es la fecha en que salió el viaje: lo enviado ese día, y lo retornado "
+               "de ese mismo viaje (el retorno solo tiene valor una vez que ya se liquidó).")
+    columnas_por_material = {
+        "Todos": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados",
+                  "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
+        "Roles": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados"],
+        "Tarimas": ["Fecha", "Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas"],
+        "Pacas de Cartón (Lbs)": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
+    }
+    return df[columnas_por_material[material_sel]]
+
+
+# Mapa de extra_fn (columna en cat_reportes) -> función de Python que aplica
+# la lógica particular de ese reporte después de correr el query genérico.
+# Un reporte nuevo simple (solo query + tabla + export) no necesita entrada
+# aquí — basta con dejar extra_fn en NULL en cat_reportes.
+EXTRA_FNS_REPORTES = {
+    "liquidaciones": _extra_liquidaciones,
+    "retornable": _extra_retornable,
+}
 
 
 def obtener_plan_carga(fecha):
@@ -3002,187 +2998,72 @@ with tab5:
 # MÓDULO 3: REPORTES (pendiente de construir)
 # ==========================================
 with tab3:
-    reporte_sel = st.selectbox(
-        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
-                    "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
-    )
+    reportes_bd = obtener_reportes_activos()
+    nombres_reportes = [r["nombre"] for r in reportes_bd] + [
+        "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"
+    ]
+    reporte_sel = st.selectbox("Reporte", nombres_reportes)
+    reporte_actual = next((r for r in reportes_bd if r["nombre"] == reporte_sel), None)
 
-    if reporte_sel == "Bitácora de Viajes":
-        st.subheader(":material/receipt_long: Bitácora de Viajes")
+    if reporte_actual:
+        clave = reporte_actual["clave"]
+        st.subheader(reporte_sel)
+        if reporte_actual["descripcion"]:
+            st.caption(reporte_actual["descripcion"])
 
         fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1.3, 0.8])
         with fcol1:
-            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7))
+            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key=f"fecha_ini_{clave}")
         with fcol2:
-            fecha_fin = st.date_input("Hasta", value=ahora().date())
+            fecha_fin = st.date_input("Hasta", value=ahora().date(), key=f"fecha_fin_{clave}")
         with fcol3:
             clientes_reporte = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
-            cliente_reporte = st.selectbox("Cliente", clientes_reporte)
+            cliente_reporte = st.selectbox("Cliente", clientes_reporte, key=f"cliente_{clave}")
         with fcol4:
             st.write("")
-            generar = st.button(":material/search: Generar", use_container_width=True)
+            generar = st.button(":material/search: Generar", use_container_width=True, key=f"btn_generar_{clave}")
 
         if generar:
-            st.session_state["df_bitacora"] = obtener_reporte_bitacora(fecha_ini, fecha_fin, cliente_reporte)
+            st.session_state[f"df_{clave}"] = obtener_reporte_generico(
+                reporte_actual["query_sql"], fecha_ini, fecha_fin, cliente_reporte
+            )
+            st.session_state[f"fechas_{clave}"] = (fecha_ini, fecha_fin)
 
-        df_bitacora = st.session_state.get("df_bitacora")
-        if df_bitacora is not None:
-            if df_bitacora.empty:
-                st.info("No hay viajes en ese rango de fechas para ese cliente.")
+        df_reporte = st.session_state.get(f"df_{clave}")
+        if df_reporte is not None:
+            if df_reporte.empty:
+                st.info("No hay datos en ese rango de fechas para ese cliente.")
             else:
-                st.caption(f"{len(df_bitacora)} viaje(s) encontrados.")
+                extra_fn = EXTRA_FNS_REPORTES.get(reporte_actual["extra_fn"])
+                if extra_fn:
+                    df_mostrar = extra_fn(df_reporte, clave)
+                else:
+                    st.caption(f"{len(df_reporte)} resultado(s) encontrados.")
+                    df_mostrar = df_reporte
+
                 # Ventana con su propio scroll, en vez de empujar toda la página
-                st.dataframe(df_bitacora, use_container_width=True, height=420)
+                st.dataframe(df_mostrar, use_container_width=True, height=420)
 
-                ecol1, ecol2 = st.columns(2)
-                with ecol1:
-                    st.download_button(
-                        ":material/download: Exportar a Excel",
-                        data=exportar_excel(df_bitacora),
-                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                with ecol2:
-                    st.download_button(
-                        ":material/download: Exportar a CSV",
-                        data=exportar_csv(df_bitacora),
-                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-        else:
-            st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
-
-    elif reporte_sel == "Resumen de Liquidaciones":
-        st.subheader(":material/fact_check: Resumen de Liquidaciones")
-
-        lcol1, lcol2, lcol3, lcol4 = st.columns([1, 1, 1.3, 0.8])
-        with lcol1:
-            fecha_ini_l = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key="fecha_ini_liq_rep")
-        with lcol2:
-            fecha_fin_l = st.date_input("Hasta", value=ahora().date(), key="fecha_fin_liq_rep")
-        with lcol3:
-            clientes_reporte_l = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
-            cliente_reporte_l = st.selectbox("Cliente", clientes_reporte_l, key="cliente_liq_rep")
-        with lcol4:
-            st.write("")
-            generar_l = st.button(":material/search: Generar", use_container_width=True, key="btn_generar_liq_rep")
-
-        if generar_l:
-            st.session_state["df_liquidaciones"] = obtener_reporte_liquidaciones(fecha_ini_l, fecha_fin_l, cliente_reporte_l)
-
-        df_liq = st.session_state.get("df_liquidaciones")
-        if df_liq is not None:
-            if df_liq.empty:
-                st.info("No hay viajes en ese rango de fechas para ese cliente.")
-            else:
-                total = len(df_liq)
-                pendientes = (df_liq["Estado"] == "Pendiente de Liquidar").sum()
-                liquidados = (df_liq["Estado"] == "Liquidado").sum()
-                anulados = (df_liq["Estado"] == "Anulado").sum()
-
-                kcol1, kcol2, kcol3, kcol4 = st.columns(4)
-                kcol1.metric("Total de Viajes", total)
-                kcol2.metric("Pendientes de Liquidar", pendientes)
-                kcol3.metric("Liquidados", liquidados)
-                kcol4.metric("Anulados", anulados)
-
-                st.markdown("---")
-                filtro_estado = st.selectbox("Filtrar por estado", ["Todos", "Pendiente de Liquidar", "Liquidado", "Anulado"], key="filtro_estado_liq_rep")
-                df_mostrar = df_liq if filtro_estado == "Todos" else df_liq[df_liq["Estado"] == filtro_estado]
-                st.dataframe(df_mostrar, use_container_width=True, height=380)
-
+                fecha_ini_exp, fecha_fin_exp = st.session_state.get(f"fechas_{clave}", (fecha_ini, fecha_fin))
                 ecol1, ecol2 = st.columns(2)
                 with ecol1:
                     st.download_button(
                         ":material/download: Exportar a Excel",
                         data=exportar_excel(df_mostrar),
-                        file_name=f"liquidaciones_{fecha_ini_l}_a_{fecha_fin_l}.xlsx",
+                        file_name=f"{clave}_{fecha_ini_exp}_a_{fecha_fin_exp}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key="excel_liq_rep"
+                        use_container_width=True, key=f"excel_{clave}"
                     )
                 with ecol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
                         data=exportar_csv(df_mostrar),
-                        file_name=f"liquidaciones_{fecha_ini_l}_a_{fecha_fin_l}.csv",
+                        file_name=f"{clave}_{fecha_ini_exp}_a_{fecha_fin_exp}.csv",
                         mime="text/csv",
-                        use_container_width=True, key="csv_liq_rep"
+                        use_container_width=True, key=f"csv_{clave}"
                     )
         else:
             st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
-
-    elif reporte_sel == "Control de Retornable":
-        st.subheader(":material/inventory_2: Control de Retornable")
-        st.caption("Roles, Tarimas y Pacas de Cartón (reportado en Lbs, 50 lbs por paca) — las cajas no son "
-                   "retornables, por eso no aparecen aquí. Mientras un viaje esté Pendiente de Liquidar, su "
-                   "material se cuenta como 'todavía en tienda'.")
-
-        rcol1, rcol2, rcol3, rcol4 = st.columns([1, 1, 1, 1])
-        with rcol1:
-            fecha_ini_r = st.date_input("Desde", value=ahora().date() - timedelta(days=30), key="fecha_ini_ret_rep")
-        with rcol2:
-            fecha_fin_r = st.date_input("Hasta", value=ahora().date(), key="fecha_fin_ret_rep")
-        with rcol3:
-            clientes_reporte_r = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
-            cliente_reporte_r = st.selectbox("Cliente", clientes_reporte_r, key="cliente_ret_rep")
-        with rcol4:
-            material_sel = st.selectbox("Material", ["Todos", "Roles", "Tarimas", "Pacas de Cartón (Lbs)"], key="material_ret_rep")
-
-        generar_r = st.button(":material/search: Generar", key="btn_generar_ret_rep")
-        if generar_r:
-            st.session_state["df_retornable_fecha"] = obtener_reporte_retornable_por_fecha(fecha_ini_r, fecha_fin_r, cliente_reporte_r)
-
-        df_fecha = st.session_state.get("df_retornable_fecha")
-        if df_fecha is not None:
-            if df_fecha.empty:
-                st.info("No hay movimientos en ese rango de fechas para ese cliente.")
-            else:
-                kcol1, kcol2, kcol3 = st.columns(3)
-                if material_sel in ("Todos", "Roles"):
-                    saldo_roles = int(df_fecha["Roles Enviados"].sum() - df_fecha["Roles Retornados"].sum())
-                    kcol1.metric("Total Roles en Tiendas", saldo_roles)
-                if material_sel in ("Todos", "Tarimas"):
-                    saldo_tarimas = int(df_fecha["Tarimas Enviadas"].sum() - df_fecha["Tarimas Retornadas"].sum())
-                    kcol2.metric("Total Tarimas en Tiendas", saldo_tarimas)
-                if material_sel in ("Todos", "Pacas de Cartón (Lbs)"):
-                    total_lbs = int(df_fecha["Lbs de Cartón"].sum())
-                    kcol3.metric("Total Lbs de Cartón Retornadas", f"{total_lbs:,} lbs",
-                                 help=f"{int(df_fecha['Pacas de Cartón Retornadas'].sum())} pacas × {LBS_POR_PACA_CARTON} lbs c/u")
-
-                st.markdown("---")
-                st.caption("Cada fila es la fecha en que salió el viaje: lo enviado ese día, y lo retornado "
-                           "de ese mismo viaje (el retorno solo tiene valor una vez que ya se liquidó).")
-                columnas_fecha_por_material = {
-                    "Todos": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados",
-                              "Tarimas Enviadas", "Tarimas Retornadas", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
-                    "Roles": ["Fecha", "Cliente", "Tienda", "Roles Enviados", "Roles Retornados"],
-                    "Tarimas": ["Fecha", "Cliente", "Tienda", "Tarimas Enviadas", "Tarimas Retornadas"],
-                    "Pacas de Cartón (Lbs)": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
-                }
-                df_fecha_mostrar = df_fecha[columnas_fecha_por_material[material_sel]]
-                st.dataframe(df_fecha_mostrar, use_container_width=True, height=420)
-
-                fcol1, fcol2 = st.columns(2)
-                with fcol1:
-                    st.download_button(
-                        ":material/download: Exportar a Excel",
-                        data=exportar_excel(df_fecha_mostrar),
-                        file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key="excel_ret_rep_fecha"
-                    )
-                with fcol2:
-                    st.download_button(
-                        ":material/download: Exportar a CSV",
-                        data=exportar_csv(df_fecha_mostrar),
-                        file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.csv",
-                        mime="text/csv",
-                        use_container_width=True, key="csv_ret_rep_fecha"
-                    )
-        else:
-            st.info("Elige el rango de fechas, cliente y material, y presiona Generar.")
 
     elif reporte_sel == "Plan de Carga del Día (para el Dashboard)":
         st.subheader(":material/event_note: Plan de Carga del Día")
