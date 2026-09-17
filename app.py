@@ -1540,43 +1540,6 @@ EXTRA_FNS_REPORTES = {
 }
 
 
-def obtener_plan_carga(fecha):
-    """Trae el plan de carga (camiones/bultos por hora) de una fecha, con las
-    24 horas siempre presentes (en 0 si todavía no se ha cargado nada)."""
-    with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            "SELECT hora, camiones_plan, bultos_plan FROM plan_carga_horario WHERE fecha = %s",
-            (fecha,)
-        )
-        existentes = {r["hora"]: r for r in cur.fetchall()}
-    return [
-        {"Hora": f"{h:02d}:00", "Camiones Plan": existentes.get(h, {}).get("camiones_plan", 0) or 0,
-         "Bultos Plan": existentes.get(h, {}).get("bultos_plan", 0) or 0}
-        for h in range(24)
-    ]
-
-
-def guardar_plan_carga(fecha, filas, usuario):
-    """Guarda el plan de carga de una fecha — upsert por hora, nunca borra
-    nada fuera de las 24 horas que ya se están mandando."""
-    with closing(get_conn()) as conn:
-        try:
-            with conn.cursor() as cur:
-                for i, fila in enumerate(filas):
-                    cur.execute(
-                        "INSERT INTO plan_carga_horario (fecha, hora, camiones_plan, bultos_plan) "
-                        "VALUES (%s,%s,%s,%s) ON CONFLICT (fecha, hora) DO UPDATE SET "
-                        "camiones_plan = EXCLUDED.camiones_plan, bultos_plan = EXCLUDED.bultos_plan",
-                        (fecha, i, fila["Camiones Plan"], fila["Bultos Plan"])
-                    )
-            conn.commit()
-            registrar_auditoria(usuario, "Guardar plan de carga", f"Fecha {fecha}")
-            return True, "OK"
-        except Exception as e:
-            conn.rollback()
-            return False, _error_tecnico(e, "guardar_plan_carga")
-
-
 def obtener_destinos_de_viaje(viaje_id):
     with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT * FROM destinos WHERE viaje_id = %s ORDER BY orden", (viaje_id,))
@@ -2999,9 +2962,7 @@ with tab5:
 # ==========================================
 with tab3:
     reportes_bd = obtener_reportes_activos()
-    nombres_reportes = [r["nombre"] for r in reportes_bd] + [
-        "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"
-    ]
+    nombres_reportes = [r["nombre"] for r in reportes_bd] + ["Bultos por Camión (próximamente)"]
     reporte_sel = st.selectbox("Reporte", nombres_reportes)
     reporte_actual = next((r for r in reportes_bd if r["nombre"] == reporte_sel), None)
 
@@ -3065,29 +3026,6 @@ with tab3:
         else:
             st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
 
-    elif reporte_sel == "Plan de Carga del Día (para el Dashboard)":
-        st.subheader(":material/event_note: Plan de Carga del Día")
-        st.caption("Esta es la meta (camiones y bultos por hora) contra la que el Dashboard de indicadores "
-                   "compara lo que realmente se va cargando — 'Estatus de Carga de Camiones'. No afecta "
-                   "nada dentro de esta app, solo alimenta ese dashboard aparte.")
-        if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
-            st.info("Solo Administrador, SuperAdministrador y Supervisor pueden cargar el plan del día.")
-        else:
-            fecha_plan = st.date_input("Fecha del plan", value=ahora().date(), key="fecha_plan_carga")
-            plan_actual = obtener_plan_carga(fecha_plan)
-            df_plan = pd.DataFrame(plan_actual)
-            st.caption("Edita directo en la tabla — una fila por hora del día.")
-            df_plan_editado = st.data_editor(
-                df_plan, use_container_width=True, height=460, hide_index=True,
-                disabled=["Hora"], key=f"editor_plan_{fecha_plan}"
-            )
-            if st.button(":material/save: Guardar Plan del Día", key="btn_guardar_plan"):
-                filas_guardar = df_plan_editado.to_dict("records")
-                ok, msg = guardar_plan_carga(fecha_plan, filas_guardar, usuario_activo)
-                if ok:
-                    st.success(f"✅ Plan de carga del {fecha_plan} guardado.")
-                else:
-                    mostrar_resultado_error(msg, perfil_activo)
     else:
         st.info("Este reporte todavía no está construido — lo armamos en la próxima ronda.")
 
