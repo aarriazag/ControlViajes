@@ -310,7 +310,9 @@ st.markdown("""
         div[data-testid="stAlert"] { border-radius: 8px; }
 
         /* Barra superior simple, solo texto — la usan las pantallas de login
-           y selección de cliente/CD, antes de entrar a la app de verdad. */
+           y selección de cliente/CD, antes de entrar a la app de verdad, y
+           también la barra principal de la app ya adentro (con la línea de
+           Usuario/Cliente/Hora de solo lectura a la derecha). */
         .ransa-topbar {
             display: flex; align-items: center; justify-content: space-between;
             padding: 14px 22px; border-radius: 12px;
@@ -320,31 +322,9 @@ st.markdown("""
         }
         .ransa-topbar .titulo { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; color: white; }
         .ransa-topbar .subtitulo { font-size: 13px; opacity: 0.85; font-weight: 400; color: white; }
-
-        /* Barra superior de marca de la app ya adentro — es un
-           st.container(key=...) real, no un div de HTML puro, porque
-           adentro también vive un menú de Streamlit de verdad (el de
-           Cliente/CD), no solo texto. */
-        div.st-key-ransa_topbar {
-            padding: 10px 22px; border-radius: 12px;
-            background: linear-gradient(90deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
-            margin-bottom: 18px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
-        }
-        div.st-key-ransa_topbar .titulo { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; color: white; }
-        div.st-key-ransa_topbar .subtitulo { font-size: 13px; opacity: 0.85; font-weight: 400; color: white; }
-        /* El botón que abre el menú de Cliente/CD, para que se vea como la
-           misma "píldora" translúcida que tenía el texto antes, no como un
-           botón normal de la app. */
-        div.st-key-ransa_topbar div[data-testid="stPopover"] button {
-            background: rgba(255,255,255,0.14) !important;
-            color: white !important;
-            border: 1px solid rgba(255,255,255,0.3) !important;
-            font-size: 13px !important;
-            font-weight: 500 !important;
-        }
-        div.st-key-ransa_topbar div[data-testid="stPopover"] button:hover {
-            background: rgba(255,255,255,0.24) !important;
+        .ransa-topbar .contexto {
+            text-align: right; font-size: 13px; line-height: 1.5; color: white;
+            background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 8px;
         }
         .ransa-badge {
             display: inline-block; background: var(--ransa-verde-claro); color: var(--ransa-verde-oscuro);
@@ -2272,29 +2252,34 @@ tipo_operacion_actual = st.session_state.catalogos.get("tipo_operacion_por_cd", 
 )
 es_transporte = tipo_operacion_actual == "Transporte"
 
-with st.container(key="ransa_topbar"):
-    col_marca, col_cliente = st.columns([3, 1.2], vertical_alignment="center")
-    with col_marca:
-        st.markdown("""
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div>
-                    <div class="titulo">RANSA <span style="font-weight:400;">· Control de Ruta</span>
-                        <span class="ransa-badge">TMS</span>
-                    </div>
-                    <div class="subtitulo">Sistema Integral de Gestión Logística</div>
-                </div>
+with st.sidebar.popover(f":material/my_location: {cliente_activo} · CD {cd_origen_fijo}", use_container_width=True):
+    if es_transporte:
+        st.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
+    if st.button(":material/swap_horiz: Cambiar Cliente / CD", key="btn_cambiar_cliente_sidebar", use_container_width=True):
+        st.session_state["config_bloqueada"] = False
+        del st.session_state["cliente_activo_fijo"]
+        del st.session_state["cd_origen_fijo"]
+        st.rerun()
+    st.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
+
+# Barra superior — vuelve a ser HTML puro (sin widgets mezclados), porque ya
+# no necesita ningún botón adentro. Se queda con una línea de solo lectura
+# (Usuario · Cliente/CD · Hora) a la vista, útil para saber de un vistazo
+# quién trabaja y cuándo — sobre todo cuando me mandas una captura de pantalla.
+st.markdown(f"""
+    <div class="ransa-topbar">
+        <div>
+            <div class="titulo">RANSA <span style="font-weight:400;">· Control de Ruta</span>
+                <span class="ransa-badge">TMS</span>
             </div>
-        """, unsafe_allow_html=True)
-    with col_cliente:
-        with st.popover(f":material/my_location: {cliente_activo} · CD {cd_origen_fijo}", use_container_width=True):
-            if es_transporte:
-                st.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
-            if st.button(":material/swap_horiz: Cambiar Cliente / CD", key="btn_cambiar_cliente_topbar", use_container_width=True):
-                st.session_state["config_bloqueada"] = False
-                del st.session_state["cliente_activo_fijo"]
-                del st.session_state["cd_origen_fijo"]
-                st.rerun()
-            st.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
+            <div class="subtitulo">Sistema Integral de Gestión Logística</div>
+        </div>
+        <div class="contexto">
+            <b>{html_lib.escape(str(cliente_activo))}</b> · CD {html_lib.escape(str(cd_origen_fijo))}<br>
+            {html_lib.escape(str(usuario_activo))} ({html_lib.escape(str(perfil_activo))}) · {ahora().strftime('%H:%M:%S')}
+        </div>
+    </div>
+""", unsafe_allow_html=True)
 st.markdown("---")
 
 
