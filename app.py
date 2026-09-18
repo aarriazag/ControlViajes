@@ -2312,7 +2312,7 @@ def pagina_despacho():
                     ic2.text_input("Correlativo de Viaje (automático)", value=peek_siguiente_correlativo(cliente_activo), disabled=True, key=f"info_corr_{run}")
                     ic3.text_input("CD Origen", value=cd_origen_fijo, disabled=True, key=f"info_cd_{run}")
 
-                    col_p, col_t, col_cap, col_pil, col_aux = st.columns(5)
+                    col_p, col_pil, col_aux = st.columns(3)
                     with col_p:
                         placa = st.selectbox("Placa del Camión", [""] + list(st.session_state.catalogos["camiones"].keys()), key=f"placa_{run}")
 
@@ -2324,10 +2324,6 @@ def pagina_despacho():
                         pil_pred = datos_c["piloto"]
                         aux_pred = datos_c["auxiliar"]
 
-                    with col_t:
-                        st.text_input("Transportista", value=t_pred, disabled=True, key=f"transp_{run}")
-                    with col_cap:
-                        st.text_input("Capacidad Camión", value=cap_pred, disabled=True, key=f"cap_{run}")
                     with col_pil:
                         pilotos = st.session_state.catalogos["pilotos"]
                         if pilotos:
@@ -2342,6 +2338,16 @@ def pagina_despacho():
                         else:
                             st.warning("Sin auxiliares en el catálogo.")
                             auxiliar_final = ""
+
+                    if placa:
+                        st.markdown(
+                            f'<div style="background:#EAF3EE; border-radius:8px; padding:8px 14px; margin:-4px 0 12px 0; '
+                            f'font-size:14px; color:#0B4A32;">🚚 <b>Transportista:</b> {html_lib.escape(str(t_pred))} '
+                            f'&nbsp;·&nbsp; <b>Capacidad:</b> {html_lib.escape(str(cap_pred))}</div>',
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.caption("Elige una placa para ver el transportista y la capacidad del camión.")
 
                     placa_furgon = ""
                     if cap_pred == "20 Ton":
@@ -2405,7 +2411,8 @@ def pagina_despacho():
                                                        placeholder="Tienda / Destino")
                             with cab3:
                                 m_ida_tienda = st.text_input("Marchamo Ida", key=f"mida_{run}_{i}",
-                                                              label_visibility="collapsed", placeholder="Marchamo Ida")
+                                                              label_visibility="collapsed",
+                                                              placeholder="📷 Escanea o digita el marchamo")
                             with cab4:
                                 puede_borrar = (i == total_destinos - 1) and total_destinos > 1
                                 if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=not puede_borrar,
@@ -2511,8 +2518,9 @@ def pagina_despacho():
                                     creditos_txt = ""
 
                                 observaciones_txt = st.text_area(
-                                    "Observaciones", key=f"obs_{run}_{i}",
-                                    placeholder="Ej: lleva transferencia T-123, tienda cerrada, faltante detectado, etc."
+                                    "Observaciones / Instrucciones para el Piloto", key=f"obs_{run}_{i}",
+                                    placeholder="Ej: lleva transferencia T-123, tienda cerrada, faltante detectado, etc.",
+                                    help="Esto se imprime en la Hoja de Control — el piloto sí lo va a ver."
                                 )
 
                             if tienda:
