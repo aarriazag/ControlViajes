@@ -39,6 +39,15 @@ _favicon_ransa = Image.open(io.BytesIO(base64.b64decode(_FAVICON_B64)))
 
 st.set_page_config(page_title="Ransa | Control de Ruta", layout="wide", page_icon=_favicon_ransa)
 
+# Logo de texto "RANSA" en blanco (mismo criterio que el favicon: incrustado
+# aquí, sin depender de subir un archivo aparte) — se usa en st.logo(), que
+# lo coloca en su espacio propio, arriba de la lista de navegación del
+# sidebar. El ícono cuadrado (_FAVICON_B64) se reutiliza para cuando el
+# sidebar está colapsado.
+_LOGO_TEXTO_B64 = "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"
+_logo_texto_ransa = Image.open(io.BytesIO(base64.b64decode(_LOGO_TEXTO_B64)))
+st.logo(_logo_texto_ransa, icon_image=_favicon_ransa, size="large")
+
 # El servidor (Render) corre en otro huso horario — todos los usuarios de esta
 # app están en Guatemala, así que fijamos la hora ahí en vez de usar la hora
 # del servidor o intentar leer la del navegador de cada quien.
@@ -215,28 +224,30 @@ st.markdown("""
         }
 
         /* Enlaces de navegación (los genera st.navigation solo, dentro del
-           sidebar) — mismo estilo mint translúcido del diseño original. */
+           sidebar) — texto normal, resalte verde clarito en la página activa,
+           reutilizando el mismo verde clarito que ya existe en el sistema de
+           diseño (var(--ransa-verde-claro)), no un color nuevo. */
         div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"] {
-            color: rgba(255,255,255,0.85) !important;
+            color: var(--gris-texto) !important;
             border-radius: 8px !important;
             font-weight: 500;
         }
         div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"] span {
-            color: rgba(255,255,255,0.85) !important;
+            color: var(--gris-texto) !important;
         }
         div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"]:hover {
-            background: rgba(255,255,255,0.08) !important;
+            background: var(--gris-fondo) !important;
         }
         /* Página activa — usa el atributo de accesibilidad aria-current, que
            es el más probable en versiones recientes de Streamlit. Si no
            aparece resaltada al verla en vivo, este selector es el que hay
            que revisar/ajustar primero. */
         div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"][aria-current="page"] {
-            background: rgba(255,255,255,0.12) !important;
+            background: var(--ransa-verde-claro) !important;
         }
         div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"][aria-current="page"] span {
-            color: #FFFFFF !important;
-            font-weight: 600 !important;
+            color: var(--ransa-verde) !important;
+            font-weight: 700 !important;
         }
 
         /* Tarjetas (st.container(border=True)) con look "panel corporativo" */
@@ -258,35 +269,14 @@ st.markdown("""
         div[data-testid="stMetricLabel"] { color: var(--gris-medio) !important; font-weight: 600; }
         div[data-testid="stMetricValue"] { color: var(--ransa-verde) !important; }
 
-        /* Sidebar — verde oscuro de marca, como ancla visual fija (mismo
-           patrón que ya usa la barra superior). Todo el texto de adentro
-           pasa a un tono claro para que se lea bien sobre el fondo oscuro. */
+        /* Sidebar — fondo blanco, se separa del resto por profundidad
+           (borde + sombra), no por color. Como es blanco igual que las
+           tarjetas del contenido, hereda el mismo texto oscuro de siempre —
+           no hace falta ninguna regla especial de color aquí. */
         section[data-testid="stSidebar"] {
-            background-color: var(--ransa-verde);
-            border-right: none;
-        }
-        section[data-testid="stSidebar"] p,
-        section[data-testid="stSidebar"] span,
-        section[data-testid="stSidebar"] label,
-        section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"],
-        section[data-testid="stSidebar"] h1,
-        section[data-testid="stSidebar"] h2,
-        section[data-testid="stSidebar"] h3 {
-            color: rgba(255,255,255,0.92) !important;
-        }
-        section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] p {
-            color: rgba(255,255,255,0.65) !important;
-        }
-        /* Botones dentro del sidebar (Cambiar Cliente/CD, Cerrar Sesión, etc.)
-           en un verde un poco más claro, para que no se pierdan contra el
-           fondo — el resto de la app conserva el botón verde oscuro normal. */
-        section[data-testid="stSidebar"] div.stButton > button:first-child {
-            background-color: rgba(255,255,255,0.14) !important;
-            color: #FFFFFF !important;
-            border: 1px solid rgba(255,255,255,0.25) !important;
-        }
-        section[data-testid="stSidebar"] div.stButton > button:first-child:hover {
-            background-color: rgba(255,255,255,0.24) !important;
+            background-color: #FFFFFF;
+            border-right: 1px solid var(--gris-borde);
+            box-shadow: 2px 0 8px rgba(16, 24, 40, 0.05);
         }
         /* Menos espacio vertical entre elementos del sidebar, para minimizar el
            scroll — sobre todo en pantallas anchas donde el sidebar es angosto
@@ -296,7 +286,6 @@ st.markdown("""
         }
         section[data-testid="stSidebar"] hr {
             margin: 0.35rem 0 !important;
-            border-color: rgba(255,255,255,0.15) !important;
         }
         section[data-testid="stSidebar"] .block-container {
             padding-top: 1.2rem;
@@ -304,6 +293,17 @@ st.markdown("""
         }
         section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] {
             margin-top: -0.3rem;
+        }
+        /* Tarjetas de usuario/cliente activo (st.success de adorno) — planas,
+           sin la barra de color al lado que trae por default: eso se lee como
+           "hecho por una IA", así que se quita a propósito. */
+        section[data-testid="stSidebar"] div[data-testid="stAlert"] {
+            background-color: var(--gris-fondo) !important;
+            border: none !important;
+            border-radius: 8px !important;
+        }
+        section[data-testid="stSidebar"] div[data-testid="stAlert"] p {
+            color: var(--gris-texto) !important;
         }
 
         /* Alertas (success/info/warning/error) con bordes redondeados consistentes */
@@ -2059,10 +2059,8 @@ if 'num_destinos' not in st.session_state:
 # ==========================================
 # SIDEBAR + FLUJO DE ENTRADA (Login → Cliente/CD → App)
 # ==========================================
-st.sidebar.markdown("<h2 style='color:#0B4A32; font-weight:700; letter-spacing:-0.02em;'>RANSA</h2>", unsafe_allow_html=True)
-st.sidebar.caption("Control de Ruta")
-
-st.sidebar.markdown("---")
+# El branding "RANSA" ya lo puso st.logo() arriba, en su propio espacio fijo
+# antes de la lista de navegación — no hace falta repetirlo aquí también.
 try:
     with closing(get_conn()):
         pass
