@@ -1283,6 +1283,14 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
                         v = row[c]
                         if pd.isna(v):
                             valores.append(None)
+                        elif c == "activo" and isinstance(v, str):
+                            # La columna "activo" es booleana en la base de
+                            # datos, y Postgres solo entiende esa palabra en
+                            # inglés (true/false/yes/no) — pero la plantilla
+                            # de Excel está en español, así que aquí se
+                            # traduce antes de mandarlo, en vez de exigirle a
+                            # quien llena el archivo que escriba en inglés.
+                            valores.append(v.strip().lower() not in ("no", "falso", "false", "inactivo", "0", "n"))
                         elif hasattr(v, "item"):  # numpy.int64, numpy.float64, etc.
                             valores.append(v.item())
                         else:
