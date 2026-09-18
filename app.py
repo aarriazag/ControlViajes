@@ -214,17 +214,30 @@ st.markdown("""
             box-shadow: none;
         }
 
-        /* Pestañas */
-        button[data-baseweb="tab"] {
-            font-size: 15px !important;
+        /* Enlaces de navegación (los genera st.navigation solo, dentro del
+           sidebar) — mismo estilo mint translúcido del diseño original. */
+        div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"] {
+            color: rgba(255,255,255,0.85) !important;
+            border-radius: 8px !important;
+            font-weight: 500;
+        }
+        div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"] span {
+            color: rgba(255,255,255,0.85) !important;
+        }
+        div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"]:hover {
+            background: rgba(255,255,255,0.08) !important;
+        }
+        /* Página activa — usa el atributo de accesibilidad aria-current, que
+           es el más probable en versiones recientes de Streamlit. Si no
+           aparece resaltada al verla en vivo, este selector es el que hay
+           que revisar/ajustar primero. */
+        div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"][aria-current="page"] {
+            background: rgba(255,255,255,0.12) !important;
+        }
+        div[data-testid="stSidebarNav"] a[data-testid="stSidebarNavLink"][aria-current="page"] span {
+            color: #FFFFFF !important;
             font-weight: 600 !important;
-            color: var(--gris-medio);
         }
-        button[aria-selected="true"] {
-            color: var(--ransa-verde) !important;
-            border-bottom: 3px solid var(--ransa-verde) !important;
-        }
-        div[data-baseweb="tab-highlight"] { background-color: var(--ransa-verde) !important; }
 
         /* Tarjetas (st.container(border=True)) con look "panel corporativo" */
         div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -245,10 +258,35 @@ st.markdown("""
         div[data-testid="stMetricLabel"] { color: var(--gris-medio) !important; font-weight: 600; }
         div[data-testid="stMetricValue"] { color: var(--ransa-verde) !important; }
 
-        /* Sidebar */
+        /* Sidebar — verde oscuro de marca, como ancla visual fija (mismo
+           patrón que ya usa la barra superior). Todo el texto de adentro
+           pasa a un tono claro para que se lea bien sobre el fondo oscuro. */
         section[data-testid="stSidebar"] {
-            background-color: var(--gris-fondo);
-            border-right: 1px solid var(--gris-borde);
+            background-color: var(--ransa-verde);
+            border-right: none;
+        }
+        section[data-testid="stSidebar"] p,
+        section[data-testid="stSidebar"] span,
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"],
+        section[data-testid="stSidebar"] h1,
+        section[data-testid="stSidebar"] h2,
+        section[data-testid="stSidebar"] h3 {
+            color: rgba(255,255,255,0.92) !important;
+        }
+        section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] p {
+            color: rgba(255,255,255,0.65) !important;
+        }
+        /* Botones dentro del sidebar (Cambiar Cliente/CD, Cerrar Sesión, etc.)
+           en un verde un poco más claro, para que no se pierdan contra el
+           fondo — el resto de la app conserva el botón verde oscuro normal. */
+        section[data-testid="stSidebar"] div.stButton > button:first-child {
+            background-color: rgba(255,255,255,0.14) !important;
+            color: #FFFFFF !important;
+            border: 1px solid rgba(255,255,255,0.25) !important;
+        }
+        section[data-testid="stSidebar"] div.stButton > button:first-child:hover {
+            background-color: rgba(255,255,255,0.24) !important;
         }
         /* Menos espacio vertical entre elementos del sidebar, para minimizar el
            scroll — sobre todo en pantallas anchas donde el sidebar es angosto
@@ -258,6 +296,7 @@ st.markdown("""
         }
         section[data-testid="stSidebar"] hr {
             margin: 0.35rem 0 !important;
+            border-color: rgba(255,255,255,0.15) !important;
         }
         section[data-testid="stSidebar"] .block-container {
             padding-top: 1.2rem;
@@ -2239,19 +2278,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 st.markdown("---")
 
-tab1, tab2, tab5, tab3, tab4, tab6 = st.tabs([
-    ":material/local_shipping: Despacho (Salidas)",
-    ":material/receipt_long: Recepción (Liquidaciones)",
-    ":material/edit_document: Gestión de Viajes",
-    ":material/bar_chart: Reportes",
-    ":material/settings: Catálogos",
-    ":material/manage_accounts: Usuarios"
-])
 
 # ==========================================
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
-with tab1:
+def pagina_despacho():
     if perfil_activo in ["Administrador", "SuperAdministrador", "Operador", "Supervisor"]:
         st.header(":material/local_shipping: Creación de Viaje")
         st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
@@ -2628,7 +2659,7 @@ with tab1:
 # ==========================================
 # MÓDULO 2: LIQUIDACIONES
 # ==========================================
-with tab2:
+def pagina_liquidaciones():
     if perfil_activo in ["Administrador", "SuperAdministrador", "Liquidador", "Supervisor"]:
         st.header(":material/receipt_long: Liquidación de Viajes")
         st.caption("Registra lo que el camión trajo de regreso de cada tienda. Las cajas no se devuelven.")
@@ -2809,7 +2840,7 @@ with tab2:
 # MÓDULO 2B: GESTIÓN DE VIAJES — Editar (solo si Pendiente de Liquidar) y Anular
 # (disponible mientras no esté ya Anulado). Separado de Liquidaciones a propósito.
 # ==========================================
-with tab5:
+def pagina_gestion_viajes():
     if perfil_activo in ["Administrador", "SuperAdministrador", "Operador"]:
         st.header(":material/edit_document: Gestión de Viajes")
         if perfil_activo == "Operador":
@@ -3016,7 +3047,7 @@ with tab5:
 # ==========================================
 # MÓDULO 3: REPORTES (pendiente de construir)
 # ==========================================
-with tab3:
+def pagina_reportes():
     reporte_sel = st.selectbox(
         "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
                     "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
@@ -3229,7 +3260,7 @@ with tab3:
 # MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
-with tab4:
+def pagina_catalogos():
     if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
     else:
@@ -3548,7 +3579,7 @@ with tab4:
 # cuentas de su mismo nivel o superior); Supervisor solo ve/administra cuentas
 # Operador y Liquidador.
 # ==========================================
-with tab6:
+def pagina_usuarios():
     if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de usuarios.")
     else:
@@ -3720,6 +3751,22 @@ with tab6:
                         )
             else:
                 st.info("Elige el rango de fechas y presiona 'Ver'.")
+
+# ==========================================
+# NAVEGACIÓN — páginas reales en la barra lateral (Streamlit solo ejecuta
+# el código de la página elegida, no las 6 de un jalón como pasaba con
+# pestañas — esto es justo lo que evita la clase de bug que ya nos mordió
+# una vez con un st.stop() en una pestaña tumbando las que venían después).
+# ==========================================
+pagina_actual = st.navigation([
+    st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:"),
+    st.Page(pagina_liquidaciones, title="Recepción (Liquidaciones)", icon=":material/receipt_long:"),
+    st.Page(pagina_gestion_viajes, title="Gestión de Viajes", icon=":material/edit_document:"),
+    st.Page(pagina_reportes, title="Reportes", icon=":material/bar_chart:"),
+    st.Page(pagina_catalogos, title="Catálogos", icon=":material/settings:"),
+    st.Page(pagina_usuarios, title="Usuarios", icon=":material/manage_accounts:"),
+])
+pagina_actual.run()
 
 # ==========================================
 # PIE DE PÁGINA DE LA HERRAMIENTA (visible en toda la app)
