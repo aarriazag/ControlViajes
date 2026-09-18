@@ -309,7 +309,8 @@ st.markdown("""
         /* Alertas (success/info/warning/error) con bordes redondeados consistentes */
         div[data-testid="stAlert"] { border-radius: 8px; }
 
-        /* Barra superior de marca */
+        /* Barra superior simple, solo texto — la usan las pantallas de login
+           y selección de cliente/CD, antes de entrar a la app de verdad. */
         .ransa-topbar {
             display: flex; align-items: center; justify-content: space-between;
             padding: 14px 22px; border-radius: 12px;
@@ -317,11 +318,33 @@ st.markdown("""
             color: white; margin-bottom: 18px;
             box-shadow: 0 2px 6px rgba(0,0,0,0.12);
         }
-        .ransa-topbar .titulo { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
-        .ransa-topbar .subtitulo { font-size: 13px; opacity: 0.85; font-weight: 400; }
-        .ransa-topbar .contexto {
-            text-align: right; font-size: 13px; line-height: 1.5;
-            background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 8px;
+        .ransa-topbar .titulo { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; color: white; }
+        .ransa-topbar .subtitulo { font-size: 13px; opacity: 0.85; font-weight: 400; color: white; }
+
+        /* Barra superior de marca de la app ya adentro — es un
+           st.container(key=...) real, no un div de HTML puro, porque
+           adentro también vive un menú de Streamlit de verdad (el de
+           Cliente/CD), no solo texto. */
+        div.st-key-ransa_topbar {
+            padding: 10px 22px; border-radius: 12px;
+            background: linear-gradient(90deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
+            margin-bottom: 18px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+        }
+        div.st-key-ransa_topbar .titulo { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; color: white; }
+        div.st-key-ransa_topbar .subtitulo { font-size: 13px; opacity: 0.85; font-weight: 400; color: white; }
+        /* El botón que abre el menú de Cliente/CD, para que se vea como la
+           misma "píldora" translúcida que tenía el texto antes, no como un
+           botón normal de la app. */
+        div.st-key-ransa_topbar div[data-testid="stPopover"] button {
+            background: rgba(255,255,255,0.14) !important;
+            color: white !important;
+            border: 1px solid rgba(255,255,255,0.3) !important;
+            font-size: 13px !important;
+            font-weight: 500 !important;
+        }
+        div.st-key-ransa_topbar div[data-testid="stPopover"] button:hover {
+            background: rgba(255,255,255,0.24) !important;
         }
         .ransa-badge {
             display: inline-block; background: var(--ransa-verde-claro); color: var(--ransa-verde-oscuro);
@@ -2167,32 +2190,32 @@ if st.session_state.get("debe_cambiar_password"):
                         mostrar_resultado_error(msg, perfil_activo)
     st.stop()
 
-st.sidebar.success(f"👤 **{usuario_activo}**")
-st.sidebar.caption(f"Perfil: {perfil_activo}")
-with st.sidebar.expander(":material/key: Cambiar mi contraseña"):
-    pw_actual = st.text_input("Contraseña actual", type="password", key="pw_actual_sidebar")
-    pw_nueva1 = st.text_input("Nueva contraseña (con letra y número)", type="password", key="pw_nueva1_sidebar")
-    pw_nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="pw_nueva2_sidebar")
-    if st.button("Actualizar Contraseña", key="btn_pw_sidebar"):
-        valida, msg_valida = password_es_valida(pw_nueva1)
-        if not _credenciales_validas(usuario_activo, pw_actual):
-            st.error("❌ La contraseña actual no es correcta.")
-        elif not valida:
-            st.error(f"❌ {msg_valida}")
-        elif pw_nueva1 != pw_nueva2:
-            st.error("❌ Las dos contraseñas nuevas no coinciden.")
-        else:
-            ok, msg = establecer_password(usuario_activo, pw_nueva1, forzar_cambio_siguiente=False)
-            if ok:
-                st.success("✅ Contraseña actualizada.")
+with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_container_width=True):
+    st.caption(f"Perfil: {perfil_activo}")
+    with st.expander(":material/key: Cambiar mi contraseña"):
+        pw_actual = st.text_input("Contraseña actual", type="password", key="pw_actual_sidebar")
+        pw_nueva1 = st.text_input("Nueva contraseña (con letra y número)", type="password", key="pw_nueva1_sidebar")
+        pw_nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="pw_nueva2_sidebar")
+        if st.button("Actualizar Contraseña", key="btn_pw_sidebar"):
+            valida, msg_valida = password_es_valida(pw_nueva1)
+            if not _credenciales_validas(usuario_activo, pw_actual):
+                st.error("❌ La contraseña actual no es correcta.")
+            elif not valida:
+                st.error(f"❌ {msg_valida}")
+            elif pw_nueva1 != pw_nueva2:
+                st.error("❌ Las dos contraseñas nuevas no coinciden.")
             else:
-                mostrar_resultado_error(msg, perfil_activo)
-if st.sidebar.button(":material/logout: Cerrar Sesión"):
-    st.session_state["login_confirmado"] = False
-    st.session_state["config_bloqueada"] = False
-    for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password", "cliente_activo_fijo", "cd_origen_fijo"):
-        st.session_state.pop(k, None)
-    st.rerun()
+                ok, msg = establecer_password(usuario_activo, pw_nueva1, forzar_cambio_siguiente=False)
+                if ok:
+                    st.success("✅ Contraseña actualizada.")
+                else:
+                    mostrar_resultado_error(msg, perfil_activo)
+    if st.button(":material/logout: Cerrar Sesión", key="btn_logout_sidebar", use_container_width=True):
+        st.session_state["login_confirmado"] = False
+        st.session_state["config_bloqueada"] = False
+        for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password", "cliente_activo_fijo", "cd_origen_fijo"):
+            st.session_state.pop(k, None)
+        st.rerun()
 
 # --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
 # cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
@@ -2249,31 +2272,29 @@ tipo_operacion_actual = st.session_state.catalogos.get("tipo_operacion_por_cd", 
 )
 es_transporte = tipo_operacion_actual == "Transporte"
 
-st.sidebar.markdown("---")
-st.sidebar.success(f"🎯 **{cliente_activo}** · CD {cd_origen_fijo}")
-if es_transporte:
-    st.sidebar.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
-if st.sidebar.button(":material/swap_horiz: Cambiar Cliente / CD"):
-    st.session_state["config_bloqueada"] = False
-    del st.session_state["cliente_activo_fijo"]
-    del st.session_state["cd_origen_fijo"]
-    st.rerun()
-st.sidebar.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
-
-st.markdown(f"""
-    <div class="ransa-topbar">
-        <div>
-            <div class="titulo">RANSA <span style="font-weight:400;">· Control de Ruta</span>
-                <span class="ransa-badge">TMS</span>
+with st.container(key="ransa_topbar"):
+    col_marca, col_cliente = st.columns([3, 1.2], vertical_alignment="center")
+    with col_marca:
+        st.markdown("""
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div>
+                    <div class="titulo">RANSA <span style="font-weight:400;">· Control de Ruta</span>
+                        <span class="ransa-badge">TMS</span>
+                    </div>
+                    <div class="subtitulo">Sistema Integral de Gestión Logística</div>
+                </div>
             </div>
-            <div class="subtitulo">Sistema Integral de Gestión Logística</div>
-        </div>
-        <div class="contexto">
-            <b>{html_lib.escape(str(cliente_activo))}</b> · CD {html_lib.escape(str(cd_origen_fijo))}<br>
-            {html_lib.escape(str(usuario_activo))} ({html_lib.escape(str(perfil_activo))}) · {ahora().strftime('%H:%M:%S')}
-        </div>
-    </div>
-""", unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+    with col_cliente:
+        with st.popover(f":material/my_location: {cliente_activo} · CD {cd_origen_fijo}", use_container_width=True):
+            if es_transporte:
+                st.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
+            if st.button(":material/swap_horiz: Cambiar Cliente / CD", key="btn_cambiar_cliente_topbar", use_container_width=True):
+                st.session_state["config_bloqueada"] = False
+                del st.session_state["cliente_activo_fijo"]
+                del st.session_state["cd_origen_fijo"]
+                st.rerun()
+            st.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
 st.markdown("---")
 
 
