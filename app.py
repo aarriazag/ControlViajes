@@ -518,6 +518,12 @@ def init_db():
         # el furgón puede cambiar de un viaje a otro según lo que el proveedor
         # tenga disponible ese día.
         cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS placa_furgon TEXT")
+        # Tipo/tonelaje del camión (5/10/20 Ton) — igual que la placa del
+        # furgón, se guarda en el viaje mismo, no se busca en el catálogo de
+        # Camiones al imprimir, porque ese camión podría desactivarse o
+        # cambiar de tipo después, y la Hoja de Control debe seguir mostrando
+        # lo que era cierto el día que el viaje se creó.
+        cur.execute("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS tipo_camion TEXT")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_motivos_sin_pedido (nombre TEXT PRIMARY KEY)")
         cur.execute("""
             INSERT INTO cat_motivos_sin_pedido (nombre) VALUES
@@ -1386,13 +1392,14 @@ def siguiente_correlativo(cliente, cur):
     return f"{prefijo}-{numero:04d}"
 
 
-def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None, motivo_sin_pedido=None, placa_furgon=None):
+def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, destinos_viaje, cd_origen=None, motivo_sin_pedido=None, placa_furgon=None, tipo_camion=None):
     """Guarda el viaje y sus destinos en una sola transacción.
     `motivo_sin_pedido`: si no es None, este viaje no lleva pedido (Recolección,
     Avería, Traslado entre CDs, etc.) — se guarda como dato del viaje, no del
     destino, ya que aplica a todo el viaje completo.
     `placa_furgon`: solo aplica a unidades de 20 Ton (cabezal + furgón), y
     puede cambiar de un viaje a otro según lo que el proveedor tenga disponible.
+    `tipo_camion`: 5/10/20 Ton, guardado tal como era al crear el viaje.
     Devuelve (True, id_viaje) si funcionó, o (False, mensaje_error) si no."""
     with closing(get_conn()) as conn:
         try:
@@ -1414,10 +1421,10 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
 
                 cur.execute(
                     "INSERT INTO viajes (id_viaje, cliente, placa, transportista, piloto, auxiliar, "
-                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen, motivo_sin_pedido, placa_furgon) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    "usuario_creador, fecha_creacion, hora_creacion, cd_origen, motivo_sin_pedido, placa_furgon, tipo_camion) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                     (id_viaje_str, cliente, placa, transportista, piloto, auxiliar, usuario, fecha_hoy, hora_hoy,
-                     cd_origen, motivo_sin_pedido, placa_furgon or None)
+                     cd_origen, motivo_sin_pedido, placa_furgon or None, tipo_camion or None)
                 )
                 viaje_id = cur.fetchone()[0]
 
@@ -1810,7 +1817,7 @@ def generar_hoja_control_html(viaje, destinos):
         )
         badge_complemento = '<span class="badge-complemento">COMPLEMENTO</span>' if d["es_complemento"] else ""
         incidencia_txt = esc(d["incidencias"]) if d["incidencias"] else ""
-        incidencia_html = f'<div class="incidencia">⚠ {incidencia_txt}</div>' if incidencia_txt else ""
+        incidencia_html = f'<div class="incidencia"><span class="etiqueta">OBSERVACIONES</span><div class="incidencia-texto">{incidencia_txt}</div></div>' if incidencia_txt else ""
         material_cajas = (
             f'<div class="material-box"><b>{d["cajas"]}</b><span>BULTOS</span></div>'
             if not d["es_complemento"] else ""
@@ -1927,7 +1934,12 @@ def generar_hoja_control_html(viaje, destinos):
         .grid-encabezados span {{ flex: 1; text-align: center; font-size: 8px; color: #666; text-transform: uppercase; }}
         .sello-area {{ margin-top: 10px; }}
         .sello-espacio {{ min-height: 46px; }}
-        .incidencia {{ font-size: 10px; margin-top: 3px; color: #b34700; }}
+        .incidencia {{
+            margin-top: 8px; padding: 8px 10px; background: #FFF4EC;
+            border: 1.5px solid #D9824F; border-radius: 6px;
+        }}
+        .incidencia .etiqueta {{ color: #D9824F; }}
+        .incidencia-texto {{ font-size: 13px; color: #7A3E1D; margin-top: 3px; font-weight: 600; }}
         .footer {{ display: flex; justify-content: space-between; font-size: 9px; color: #999; margin-top: 10px; }}
         .btn-imprimir {{ background: #0B4A32; color: white; border: none; padding: 10px 20px;
                           border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }}
@@ -1964,8 +1976,8 @@ def generar_hoja_control_html(viaje, destinos):
             <div class="dato"><label>Cliente</label><span>{esc(viaje['cliente'])}</span></div>
             <div class="dato"><label>CD Origen</label><span>{esc(viaje['cd_origen']) or '—'}</span></div>
             <div class="dato"><label>Transportista</label><span>{esc(viaje['transportista'])}</span></div>
-            <div class="dato"><label>Placa (Cabezal)</label><span>{esc(viaje['placa'])}</span></div>
-            {f'<div class="dato"><label>Placa (Furgón)</label><span>{esc(viaje.get("placa_furgon"))}</span></div>' if viaje.get('placa_furgon') else ''}
+            <div class="dato"><label>Camión</label><span>{esc(viaje['placa'])}{f' · {esc(viaje["tipo_camion"])}' if viaje.get('tipo_camion') else ''}</span></div>
+            <div class="dato"><label>Furgón</label><span>{esc(viaje['placa_furgon']) if viaje.get('placa_furgon') else 'No Furgón'}</span></div>
             <div class="dato"><label>Fecha</label><span>{viaje['fecha_creacion']}</span></div>
             <div class="dato dato-blanco"><label>Horario (Garita — hora real de salida)</label><span>&nbsp;</span></div>
             <div class="dato"><label>Piloto</label><span>{esc(viaje['piloto'])}</span></div>
@@ -2647,7 +2659,8 @@ def pagina_despacho():
                         destinos_viaje=destinos_viaje,
                         cd_origen=cd_origen_final,
                         motivo_sin_pedido=motivo_seleccionado if viaje_sin_pedido else None,
-                        placa_furgon=placa_furgon if cap_pred == "20 Ton" else None
+                        placa_furgon=placa_furgon if cap_pred == "20 Ton" else None,
+                        tipo_camion=cap_pred
                     )
                     if ok:
                         st.success(f"✅ Viaje {resultado} guardado correctamente.")
