@@ -65,21 +65,27 @@ def _headers(token=None):
     return {"Authorization": f"Token {token}", "Content-Type": "application/json"}
 
 
-def _sr_request(method, ruta, token=None, **kwargs):
+def _sr_request(method, ruta, token=None, timeout=None, **kwargs):
     """Wrapper único para todas las llamadas a la API de SR.
 
     Devuelve siempre (ok: bool, data_o_mensaje). Nunca lanza una excepción:
     - Error de red / timeout -> (False, mensaje corto y claro)
     - HTTP 4xx/5xx            -> (False, mensaje con el código y el body de SR)
     - HTTP 2xx                -> (True, json ya parseado)
-    """
+
+    `timeout` es opcional — por defecto usa TIMEOUT_SEGUNDOS (8s), pensado
+    para llamadas ligeras (un vehículo, un piloto). Las que traen listas
+    completas de un día entero (ej. importar_rutas_sr) piden explícitamente
+    un timeout más largo, porque la respuesta puede ser de miles de
+    registros y 8s se queda corto — no es un error, es una respuesta grande
+    de verdad."""
     url = BASE_URL + ruta.lstrip("/")
     try:
         resp = requests.request(
-            method, url, headers=_headers(token), timeout=TIMEOUT_SEGUNDOS, **kwargs
+            method, url, headers=_headers(token), timeout=(timeout or TIMEOUT_SEGUNDOS), **kwargs
         )
     except requests.exceptions.Timeout:
-        return False, "SimpliRoute no respondió a tiempo (timeout de 8s)."
+        return False, f"SimpliRoute no respondió a tiempo (timeout de {timeout or TIMEOUT_SEGUNDOS}s)."
     except requests.exceptions.RequestException as e:
         return False, f"No se pudo conectar con SimpliRoute: {e}"
 
@@ -454,12 +460,12 @@ def importar_rutas_sr(fecha, token=None):
         ],
       }
     """
-    ok, rutas_raw = _sr_request("GET", "routes/routes/", token=token, params={"planned_date": fecha})
+    ok, rutas_raw = _sr_request("GET", "routes/routes/", token=token, timeout=45, params={"planned_date": fecha})
     if not ok:
         return False, f"No se pudieron traer las Rutas de SimpliRoute: {rutas_raw}"
     lista_rutas = rutas_raw.get("results", rutas_raw) if isinstance(rutas_raw, dict) else rutas_raw
 
-    ok, visitas_raw = _sr_request("GET", "routes/visits/", token=token, params={"planned_date": fecha})
+    ok, visitas_raw = _sr_request("GET", "routes/visits/", token=token, timeout=45, params={"planned_date": fecha})
     if not ok:
         return False, f"No se pudieron traer las Visitas de SimpliRoute: {visitas_raw}"
     lista_visitas = visitas_raw.get("results", visitas_raw) if isinstance(visitas_raw, dict) else visitas_raw
