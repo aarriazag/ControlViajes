@@ -135,6 +135,26 @@ def buscar_vehiculo_sr_por_placa(placa, token=None):
     return True, None  # búsqueda exitosa, simplemente no existe todavía
 
 
+def obtener_token_sr_desde_vault(get_conn_fn):
+    """Lee el token de SimpliRoute desde Supabase Vault (guardado ahí con
+    `select vault.create_secret(...)`) en vez de st.secrets — así el token
+    vive centralizado en la base de datos, no repartido entre Render y
+    GitHub. Las credenciales de Postgres NO pueden vivir aquí (se necesitan
+    para poder conectarse a la base en primer lugar) — esas siguen viniendo
+    de Render. Devuelve el token (str) o None si no está configurado."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = %s",
+                ("simpliroute_api_token",)
+            )
+            fila = cur.fetchone()
+            return fila[0] if fila else None
+    except Exception:
+        return None  # Vault no configurado, sin permisos, o la tabla no existe todavía
+
+
 # ---------------------------------------------------------------------------
 # VEHÍCULOS — Control de Ruta manda, SR solo recibe
 # ---------------------------------------------------------------------------

@@ -2227,8 +2227,8 @@ st.markdown(f"""
 st.markdown("---")
 
 try:
-    _token_sr_autosync = st.secrets["simpliroute"]["api_token"]
-    if sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
+    _token_sr_autosync = sr_int.obtener_token_sr_desde_vault(get_conn)
+    if _token_sr_autosync and sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
         sr_int.sincronizar_pilotos_desde_sr(get_conn, token=_token_sr_autosync)
 except Exception:
     pass  # sin token, o SR no responde — nunca debe tumbar el arranque de la app
@@ -2266,11 +2266,9 @@ with tab1:
 
         if st.session_state.modo_importar_sr:
             st.markdown("#### :material/sync: Rutas de SimpliRoute pendientes de importar")
-            try:
-                _token_sr_import = st.secrets["simpliroute"]["api_token"]
-            except Exception:
-                _token_sr_import = None
-                st.error("❌ No hay token de SimpliRoute configurado — no se puede importar. Usa creación manual.")
+            _token_sr_import = sr_int.obtener_token_sr_desde_vault(get_conn)
+            if not _token_sr_import:
+                st.error("❌ No hay token de SimpliRoute configurado (revisa el Vault de Supabase) — no se puede importar. Usa creación manual.")
 
             if _token_sr_import:
                 _fecha_import = st.date_input("Fecha de las rutas", value=datetime.now().date(), key="fecha_import_sr")
@@ -3351,7 +3349,7 @@ with tab4:
                         # SR. Si alguna falla, se queda en la lista de pendientes —
                         # nunca deshace el guardado que ya se hizo arriba.
                         try:
-                            token_sr = st.secrets["simpliroute"]["api_token"]
+                            token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
                             fallidas = []
                             for placa_fila in df_editado["placa"].dropna().unique():
                                 ok_sr, msg_sr = sr_int.sincronizar_camion_con_sr(get_conn, placa_fila, token=token_sr)
@@ -3483,7 +3481,7 @@ with tab4:
                         # camión ya quedó guardado arriba — solo se le avisa
                         # al usuario, nunca se bloquea ni se deshace nada.
                         try:
-                            token_sr = st.secrets["simpliroute"]["api_token"]
+                            token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
                             ok_sr, msg_sr = sr_int.sincronizar_camion_con_sr(get_conn, valores_form["placa"], token=token_sr)
                             if not ok_sr:
                                 st.session_state["flash_catalogos"] = (
@@ -3619,12 +3617,10 @@ with tab4:
         st.markdown("---")
         st.markdown("### :material/sync: Integración SimpliRoute")
 
-        try:
-            token_sr = st.secrets["simpliroute"]["api_token"]
-            hay_token_sr = True
-        except Exception:
-            hay_token_sr = False
-            st.warning("⚠️ No hay token de SimpliRoute configurado en los secrets — la integración está "
+        token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
+        hay_token_sr = bool(token_sr)
+        if not hay_token_sr:
+            st.warning("⚠️ No hay token de SimpliRoute configurado en el Vault de Supabase — la integración está "
                        "desactivada. Todo sigue funcionando en modo manual.")
 
         with st.expander(":material/local_shipping: Camiones pendientes de sincronizar con SR", expanded=False):
