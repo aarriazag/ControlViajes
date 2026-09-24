@@ -1433,12 +1433,12 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                 for i, dest in enumerate(destinos_viaje):
                     cur.execute(
                         "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
-                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias, "
+                        "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, unidades, remitos, incidencias, "
                         "devolucion, creditos, pg_cajas, es_complemento, tipo_pago, peso) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
                          dest["marchamo_ida"], dest["marchamo_regreso"] or None,
-                         dest["roles"], dest["tarimas"], dest["cajas"],
+                         dest["roles"], dest["tarimas"], dest["cajas"], dest.get("unidades", 0),
                          dest.get("remitos", ""), dest.get("incidencias", ""),
                          dest.get("devolucion", ""), dest.get("creditos", ""),
                          dest.get("pg_cajas", 0), dest.get("es_complemento", False),
@@ -1770,10 +1770,10 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                 for d in destinos_actualizados:
                     marchamo_regreso_d = marchamo_regreso_viaje if d["id"] == destino_final_id else None
                     cur.execute(
-                        "UPDATE destinos SET tienda=%s, roles=%s, tarimas=%s, cajas=%s, marchamo_ida=%s, "
+                        "UPDATE destinos SET tienda=%s, roles=%s, tarimas=%s, cajas=%s, unidades=%s, marchamo_ida=%s, "
                         "marchamo_regreso=%s, remitos=%s, devolucion=%s, creditos=%s, pg_cajas=%s, "
                         "incidencias=%s, es_complemento=%s, tipo_pago=%s WHERE id=%s",
-                        (d["tienda"], d["roles"], d["tarimas"], d["cajas"], d["marchamo_ida"],
+                        (d["tienda"], d["roles"], d["tarimas"], d["cajas"], d.get("unidades", 0), d["marchamo_ida"],
                          marchamo_regreso_d, d["remitos"], d["devolucion"], d["creditos"],
                          d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"], d["id"])
                     )
@@ -2373,24 +2373,100 @@ def pagina_despacho():
 
                 if _rutas_sr:
                     st.success(f"✅ {len(_rutas_sr)} ruta(s) de **{cliente_activo}** encontrada(s) con visitas ese día.")
+                    _tiendas_cliente_import = st.session_state.catalogos["clientes"].get(cliente_activo, {})
                     for _idx_ruta, _ruta_sr in enumerate(_rutas_sr):
                         with st.container(border=True):
-                            st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {_ruta_sr['total_visitas']} visita(s) · "
+                            st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {len(_ruta_sr['destinos'])} parada(s)/tienda(s) "
+                                        f"({_ruta_sr['total_visitas']} registro(s) de pedido/transferencia en SR) · "
                                         f"Vehículo SR: {_ruta_sr['vehicle_sr_id']} · Piloto SR: {_ruta_sr['driver_sr_id']}")
                             st.caption("Tipos de visita: " + ", ".join(f"{k} ({v})" for k, v in _ruta_sr["visit_types"].items()))
+                            st.caption("⚠️ La columna 'Unidades' es la suma de `load_3` de SR — confirmado antes con datos reales "
+                                       "que para Zona Sur eso cuenta UNIDADES sueltas de producto, no bultos físicos "
+                                       "(un bulto trae varias unidades). No es el número de bultos que despachas — "
+                                       "ese sigue viniendo de Infor. Se muestra solo como referencia.")
                             _df_destinos_sr = pd.DataFrame([
-                                {"Tienda": d["tienda"], "Cajas": d["cajas"], "Pedidos/Transferencias": len(d["pedidos"])}
+                                {"Tienda": d["tienda"], "Unidades (SR, no bultos)": d["cajas"], "Pedidos/Transferencias": len(d["pedidos"])}
                                 for d in _ruta_sr["destinos"]
                             ])
                             st.dataframe(_df_destinos_sr, use_container_width=True, hide_index=True)
-                    st.info(":material/info: **Siguiente paso pendiente de construir:** hoy esta pantalla te deja ver y "
-                            "revisar la ruta completa antes de decidir — falta la parte que toma un botón "
-                            "'Usar esta ruta' y llena automáticamente el formulario de abajo (tienda, cajas, "
-                            "vehículo/piloto) para que solo captures transportista, roles y tarimas. Es el "
-                            "siguiente paso de esta misma fase, no algo que dejamos pendiente sin más.")
+                            if st.button(":material/check: Usar esta ruta", key=f"usar_ruta_sr_{_idx_ruta}", use_container_width=True):
+                                _run_destino = st.session_state.form_run
+                                _sin_match = []
+                                _pedidos_sin_confirmar = 0
+                                st.session_state.num_destinos = len(_ruta_sr["destinos"])
+                                for _i_dest, _d in enumerate(_ruta_sr["destinos"]):
+                                    # Match por nombre: exacto (sin importar mayúsculas) primero,
+                                    # si no, "contiene" en cualquier dirección — mismo tipo de
+                                    # coincidencia que ya usamos hoy a mano con los datos reales
+                                    # de SR. Si no encuentra nada, el campo queda vacío para que
+                                    # el digitador lo elija — nunca se inventa una tienda.
+                                    _tienda_sr_norm = _d["tienda"].strip().upper()
+                                    _match = next((t for t in _tiendas_cliente_import if t.strip().upper() == _tienda_sr_norm), None)
+                                    if not _match:
+                                        _match = next((t for t in _tiendas_cliente_import
+                                                        if t.strip().upper() in _tienda_sr_norm or _tienda_sr_norm in t.strip().upper()), None)
+                                    if _match:
+                                        st.session_state[f"t_{_run_destino}_{_i_dest}"] = _match
+                                    else:
+                                        _sin_match.append(_d["tienda"])
+                                    # Ojo: NO se usan las "cajas" que trae SR (d["cajas"] = load_3) como
+                                    # el número real de bultos — ya confirmamos con datos reales que para
+                                    # Zona Sur eso cuenta unidades sueltas, no bultos, y sería un número
+                                    # muy inflado si se guardara así en el viaje. Se usa validar_pedido_wms()
+                                    # por cada pedido — el mismo mecanismo del flujo manual — para traer el
+                                    # bulto real de Infor. Si Infor todavía no lo tiene, queda en 0 y marcado
+                                    # para que el digitador lo confirme a mano, en vez de guardar un número
+                                    # que sabemos que está mal.
+                                    _pedidos_prellenados = []
+                                    for p in _d["pedidos"]:
+                                        _cajas_reales_wms = validar_pedido_wms(p["pedido"])
+                                        if _cajas_reales_wms is None:
+                                            _pedidos_sin_confirmar += 1
+                                        _pedidos_prellenados.append({
+                                            "pedido": p["pedido"],
+                                            "cajas": _cajas_reales_wms if _cajas_reales_wms is not None else 0,
+                                            "origen": "WMS" if _cajas_reales_wms is not None else "SR (confirmar bultos)"
+                                        })
+                                    st.session_state[f"pedidos_lista_{_run_destino}_{_i_dest}"] = _pedidos_prellenados
+                                    # Unidades de referencia (load_3 de SR) — solo tiene un
+                                    # campo real en el formulario para clientes "Importados",
+                                    # pero se guarda igual aquí; si el destino termina siendo
+                                    # de otro cliente, el valor simplemente no se usa.
+                                    st.session_state[f"unidades_{_run_destino}_{_i_dest}"] = _d["cajas"]
+
+                                # Vehículo/piloto real: solo se prellena si el vehicle_sr_id de la
+                                # Ruta ya corresponde a un camión REAL tuyo (no el dummy de Infor) —
+                                # si es dummy o no se encuentra, se deja en blanco para que el
+                                # digitador elija uno, y el PATCH que reemplaza el dummy se dispara
+                                # al guardar el viaje (ver el hook después de guardar_viaje()).
+                                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                                    _cur.execute("SELECT placa FROM cat_camiones WHERE id_sr = %s", (_ruta_sr["vehicle_sr_id"],))
+                                    _fila_placa = _cur.fetchone()
+                                    _cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (_ruta_sr["driver_sr_id"],))
+                                    _fila_piloto = _cur.fetchone()
+                                if _fila_placa:
+                                    st.session_state[f"placa_{_run_destino}"] = _fila_placa[0]
+                                if _fila_piloto:
+                                    st.session_state[f"piloto_{_run_destino}"] = _fila_piloto[0]
+
+                                st.session_state[f"route_id_sr_{_run_destino}"] = _ruta_sr["route_id"]
+                                st.session_state.modo_importar_sr = False
+                                _avisos = []
+                                if _sin_match:
+                                    _avisos.append(f"{len(_sin_match)} tienda(s) de SR no se pudieron emparejar automáticamente, "
+                                                    f"elígelas a mano: {', '.join(_sin_match)}")
+                                if _pedidos_sin_confirmar:
+                                    _avisos.append(f"{_pedidos_sin_confirmar} pedido(s) quedaron con 0 cajas — Infor todavía no "
+                                                    "tiene el bulto real de esos, confírmalos a mano antes de guardar el viaje.")
+                                if _avisos:
+                                    st.session_state["flash_importar_sr"] = ("warning", "⚠️ " + " · ".join(_avisos))
+                                st.rerun()
             st.markdown("---")
 
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
+        _flash_import = st.session_state.pop("flash_importar_sr", None)
+        if _flash_import:
+            getattr(st, _flash_import[0])(_flash_import[1])
         marchamo_regreso_actual = st.session_state.get(f"mreg_final_{run}", "")
         tiendas_cliente = st.session_state.catalogos["clientes"].get(cliente_activo, {})
         es_cliente_unisuper = cliente_activo.startswith("UniSuper")
@@ -2610,11 +2686,27 @@ def pagina_despacho():
                                             pg_cajas = st.number_input("Cartas Sol. P&G", min_value=0, step=1, value=None, placeholder="0", key=f"pg_{run}_{i}") or 0
                                         else:
                                             pg_cajas = 0
+                                    if "Importados" in cliente_activo:
+                                        # Solo lectura: es un dato de referencia que viene de SR
+                                        # (load_3), nunca algo que el digitador deba poder tocar.
+                                        # "Bultos Totales" arriba sigue siendo el campo editable
+                                        # si hace falta ajustar algo a mano.
+                                        unidades_sr = st.session_state.get(f"unidades_{run}_{i}", 0)
+                                        st.number_input(
+                                            "Unidades (referencia de SR — NO son bultos reales)",
+                                            value=unidades_sr, disabled=True, key=f"unidades_disp_{run}_{i}",
+                                            help="Suma de load_3 de SimpliRoute para esta tienda. Confirmado que para "
+                                                 "este cliente cuenta unidades sueltas, no bultos — solo de referencia. "
+                                                 "Si necesitas ajustar cajas, usa 'Bultos Totales' arriba."
+                                        )
+                                    else:
+                                        unidades_sr = 0
                                 else:
                                     pg_cajas = 0
                                     remitos_txt = ""
                                     devolucion_txt = ""
                                     creditos_txt = ""
+                                    unidades_sr = 0
 
                                 observaciones_txt = st.text_area(
                                     "Observaciones / Instrucciones para el Piloto", key=f"obs_{run}_{i}",
@@ -2636,6 +2728,7 @@ def pagina_despacho():
                                     "roles": roles,
                                     "tarimas": tarimas,
                                     "cajas": cajas_total,
+                                    "unidades": unidades_sr,
                                     "remitos": remitos_txt.strip(),
                                     "incidencias": observaciones_txt.strip(),
                                     "devolucion": devolucion_txt.strip(),
@@ -2746,6 +2839,30 @@ def pagina_despacho():
                         # El camión "aprende" el piloto/auxiliar usado esta vez, para
                         # que la próxima vez ya salga como default (se puede cambiar).
                         actualizar_default_camion(placa, piloto_final, auxiliar_final)
+                        # Si este viaje vino de "Importar desde SimpliRoute", la Ruta en
+                        # SR probablemente todavía tiene el vehículo/piloto dummy de
+                        # Infor — ahora que el digitador ya eligió el camión/piloto
+                        # real, se reemplaza en SR con un PATCH. Best-effort: si falla,
+                        # el viaje ya quedó guardado igual, solo se avisa.
+                        _route_id_sr_pendiente = st.session_state.get(f"route_id_sr_{run}")
+                        if _route_id_sr_pendiente:
+                            try:
+                                _token_sr_reasignar = sr_int.obtener_token_sr_desde_vault(get_conn)
+                                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                                    _cur.execute("SELECT id_sr FROM cat_camiones WHERE placa = %s", (placa,))
+                                    _fila_cam = _cur.fetchone()
+                                    _cur.execute("SELECT id_sr FROM cat_pilotos WHERE nombre = %s", (piloto_final,))
+                                    _fila_pil = _cur.fetchone()
+                                _id_sr_cam = _fila_cam[0] if _fila_cam else None
+                                _id_sr_pil = _fila_pil[0] if _fila_pil else None
+                                if _id_sr_cam:
+                                    _ok_reasig, _msg_reasig = sr_int.reasignar_vehiculo_piloto_ruta_sr(
+                                        _route_id_sr_pendiente, _id_sr_cam, _id_sr_pil, token=_token_sr_reasignar
+                                    )
+                                    if not _ok_reasig:
+                                        st.warning(f"⚠️ El viaje se guardó bien, pero no se pudo actualizar el vehículo/piloto en SimpliRoute todavía: {_msg_reasig}")
+                            except Exception:
+                                pass
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.session_state.num_destinos = 1
                         st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
@@ -3091,6 +3208,14 @@ def pagina_gestion_viajes():
                                 creditos_e = st.text_input("Créditos", value=d["creditos"] or "", max_chars=10, key=f"ecreditos_{d['id']}")
                             with dc4:
                                 pg_e = st.number_input("Cartas Sol. P&G", min_value=0, step=1, value=d["pg_cajas"] or 0, key=f"epg_{d['id']}")
+                            if "Importados" in viaje_g["cliente"]:
+                                st.number_input(
+                                    "Unidades (referencia de SR — NO son bultos reales)",
+                                    value=d.get("unidades") or 0, disabled=True, key=f"eunidades_{d['id']}",
+                                    help="Solo lectura — dato de referencia traído de SimpliRoute al importar. "
+                                         "Si necesitas ajustar cajas, usa 'Bultos' arriba."
+                                )
+                            unidades_e = d.get("unidades") or 0
                             obs_e = st.text_area("Observaciones", value=d["incidencias"] or "", key=f"eobs_{d['id']}")
                             es_comp_e = st.checkbox("¿Es complemento?", value=d["es_complemento"], key=f"ecomp_{d['id']}")
                             # Ya no se elige — se deriva de la tienda seleccionada arriba,
@@ -3100,6 +3225,7 @@ def pagina_gestion_viajes():
                             destinos_editados.append({
                                 "id": d["id"], "orden": d["orden"], "tienda": tienda_e,
                                 "roles": roles_e, "tarimas": tarimas_e, "cajas": cajas_e,
+                                "unidades": unidades_e,
                                 "marchamo_ida": mida_e.strip(),
                                 "remitos": remitos_e.strip(), "devolucion": devolucion_e.strip(),
                                 "creditos": creditos_e.strip(), "pg_cajas": pg_e,
@@ -3372,6 +3498,21 @@ def pagina_reportes():
 # MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
+@st.cache_data(ttl=900, show_spinner="Revisando visit_type de hoy en SimpliRoute...")
+def _tipos_sin_mapear_de_hoy(token_cache_key):
+    """Trae las Rutas de hoy de SimpliRoute y devuelve los visit_type que
+    todavía no están en cat_mapeo_cliente_sr — cacheado 15 min porque la
+    consulta completa del día puede tardar hasta 45s, y no tiene sentido
+    repetirla cada vez que alguien abre Catálogos."""
+    ok, rutas = sr_int.importar_rutas_sr(str(datetime.now().date()), token=token_cache_key)
+    if not ok:
+        return None
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT visit_type FROM cat_mapeo_cliente_sr")
+        ya_mapeados = {r[0] for r in cur.fetchall()}
+    return sorted({t for r in rutas for t in r["visit_types"] if t not in ya_mapeados})
+
+
 def pagina_catalogos():
     if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
@@ -3728,6 +3869,19 @@ def pagina_catalogos():
         if not hay_token_sr:
             st.warning("⚠️ No hay token de SimpliRoute configurado en el Vault de Supabase — la integración está "
                        "desactivada. Todo sigue funcionando en modo manual.")
+
+        # Visible para Administrador/SuperAdministrador/Supervisor sin que
+        # tengan que entrar a Despacho a importar algo primero — se revisa
+        # de una vez contra TODOS los clientes, no solo el que tengas activo.
+        # Cacheado 15 min: esta consulta trae el día completo de SimpliRoute
+        # (puede tardar hasta 45s) — no tiene sentido repetirla cada vez que
+        # se abre esta pantalla.
+        if hay_token_sr:
+            _tipos_sin_mapear_hoy = _tipos_sin_mapear_de_hoy(token_sr)
+            if _tipos_sin_mapear_hoy:
+                st.warning(f"⚠️ {len(_tipos_sin_mapear_hoy)} visit_type de hoy sin mapear a ningún cliente: "
+                           f"{', '.join(_tipos_sin_mapear_hoy)}. Mapéalos abajo para que sus rutas aparezcan "
+                           "en la importación del cliente correcto.")
 
         with st.expander(":material/local_shipping: Camiones pendientes de sincronizar con SR", expanded=False):
             with closing(get_conn()) as _conn, _conn.cursor() as _cur:
