@@ -16,6 +16,8 @@ import string
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import closing
+import requests
+import integracion_simpliroute as sr_int
 
 # --- VERSIÓN DE LA APP ---
 # Formato estándar Mayor.Menor.Parche:
@@ -2311,6 +2313,83 @@ def pagina_despacho():
         st.header(":material/local_shipping: Creación de Viaje")
         st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
 
+        if "modo_importar_sr" not in st.session_state:
+            st.session_state.modo_importar_sr = False
+
+        _c_manual, _c_importar = st.columns([1, 1])
+        with _c_importar:
+            if not st.session_state.modo_importar_sr:
+                if st.button(":material/sync: Importar desde SimpliRoute", key="btn_abrir_importar_sr", use_container_width=True):
+                    st.session_state.modo_importar_sr = True
+                    st.rerun()
+            else:
+                if st.button(":material/arrow_back: Volver a creación manual", key="btn_cerrar_importar_sr", use_container_width=True):
+                    st.session_state.modo_importar_sr = False
+                    st.rerun()
+
+        if st.session_state.modo_importar_sr:
+            st.markdown("#### :material/sync: Rutas de SimpliRoute pendientes de importar")
+            _token_sr_import = sr_int.obtener_token_sr_desde_vault(get_conn)
+            if not _token_sr_import:
+                st.error("❌ No hay token de SimpliRoute configurado (revisa el Vault de Supabase) — no se puede importar. Usa creación manual.")
+
+            if _token_sr_import:
+                _fecha_import = st.date_input("Fecha de las rutas", value=datetime.now().date(), key="fecha_import_sr")
+                if st.button(":material/refresh: Consultar Rutas", key="btn_consultar_rutas_sr"):
+                    ok_imp, rutas_o_error = sr_int.importar_rutas_sr(str(_fecha_import), token=_token_sr_import)
+                    st.session_state["rutas_sr_encontradas"] = rutas_o_error if ok_imp else []
+                    if not ok_imp:
+                        st.error(f"❌ {rutas_o_error}")
+
+                # Filtra por el cliente activo (el mismo que ya elegiste arriba en el
+                # sidebar) usando el mapeo visit_type -> cliente. Una ruta sin ningún
+                # visit_type mapeado NO se asume de nadie — se muestra aparte, para
+                # que un Administrador la mapee en vez de que se mezcle sola.
+                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                    _cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr")
+                    _mapa_cliente_sr = dict(_cur.fetchall())
+
+                _todas_las_rutas = st.session_state.get("rutas_sr_encontradas", [])
+                _rutas_sr, _rutas_otro_cliente, _rutas_sin_mapear = [], [], []
+                for _r in _todas_las_rutas:
+                    _clientes_de_ruta = {_mapa_cliente_sr.get(t) for t in _r["visit_types"]}
+                    _clientes_de_ruta.discard(None)
+                    if not _clientes_de_ruta:
+                        _rutas_sin_mapear.append(_r)
+                    elif cliente_activo in _clientes_de_ruta:
+                        _rutas_sr.append(_r)
+                    else:
+                        _rutas_otro_cliente.append(_r)
+
+                if _todas_las_rutas:
+                    st.caption(f"{len(_todas_las_rutas)} ruta(s) totales ese día · "
+                               f"{len(_rutas_otro_cliente)} de otro(s) cliente(s) (ocultas) · "
+                               f"{len(_rutas_sin_mapear)} con visit_type sin mapear")
+                if _rutas_sin_mapear:
+                    _tipos_sin_mapear = sorted({t for r in _rutas_sin_mapear for t in r["visit_types"]})
+                    st.warning(f"⚠️ {len(_rutas_sin_mapear)} ruta(s) con visit_type sin mapear a ningún cliente: "
+                               f"{', '.join(_tipos_sin_mapear)}. Mapéalos en Catálogos → Integración SimpliRoute "
+                               "para que aparezcan en la importación del cliente correcto.")
+
+                if _rutas_sr:
+                    st.success(f"✅ {len(_rutas_sr)} ruta(s) de **{cliente_activo}** encontrada(s) con visitas ese día.")
+                    for _idx_ruta, _ruta_sr in enumerate(_rutas_sr):
+                        with st.container(border=True):
+                            st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {_ruta_sr['total_visitas']} visita(s) · "
+                                        f"Vehículo SR: {_ruta_sr['vehicle_sr_id']} · Piloto SR: {_ruta_sr['driver_sr_id']}")
+                            st.caption("Tipos de visita: " + ", ".join(f"{k} ({v})" for k, v in _ruta_sr["visit_types"].items()))
+                            _df_destinos_sr = pd.DataFrame([
+                                {"Tienda": d["tienda"], "Cajas": d["cajas"], "Pedidos/Transferencias": len(d["pedidos"])}
+                                for d in _ruta_sr["destinos"]
+                            ])
+                            st.dataframe(_df_destinos_sr, use_container_width=True, hide_index=True)
+                    st.info(":material/info: **Siguiente paso pendiente de construir:** hoy esta pantalla te deja ver y "
+                            "revisar la ruta completa antes de decidir — falta la parte que toma un botón "
+                            "'Usar esta ruta' y llena automáticamente el formulario de abajo (tienda, cajas, "
+                            "vehículo/piloto) para que solo captures transportista, roles y tarimas. Es el "
+                            "siguiente paso de esta misma fase, no algo que dejamos pendiente sin más.")
+            st.markdown("---")
+
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
         marchamo_regreso_actual = st.session_state.get(f"mreg_final_{run}", "")
         tiendas_cliente = st.session_state.catalogos["clientes"].get(cliente_activo, {})
@@ -3370,6 +3449,8 @@ def pagina_catalogos():
                 column_config=column_config, key=f"editor_{catalogo_sel}"
             )
             if st.button(":material/save: Guardar Cambios de la Tabla", key=f"guardar_editor_{catalogo_sel}"):
+                if config["tabla"] == "cat_camiones" and "placa" in df_editado.columns:
+                    df_editado["placa"] = df_editado["placa"].apply(sr_int.normalizar_placa)
                 faltan = df_editado[config["clave"]].isnull().any(axis=1) | (df_editado[config["clave"]].astype(str).apply(lambda s: s.str.strip()).eq("").any(axis=1))
                 if faltan.any():
                     st.error(f"❌ Hay fila(s) sin llenar la llave ({', '.join(config['clave'])}). Complétalas o bórralas antes de guardar.")
@@ -3379,6 +3460,18 @@ def pagina_catalogos():
                         texto = "✅ Tabla actualizada correctamente."
                         if msg != "OK":
                             texto += f"\n\n⚠️ {msg}"
+                        if config["tabla"] == "cat_camiones":
+                            try:
+                                token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
+                                fallidas = []
+                                for placa_fila in df_editado["placa"].dropna().unique():
+                                    ok_sr, msg_sr = sr_int.sincronizar_camion_con_sr(get_conn, placa_fila, token=token_sr)
+                                    if not ok_sr:
+                                        fallidas.append(placa_fila)
+                                if fallidas:
+                                    texto += f"\n\n⚠️ {len(fallidas)} camión(es) quedaron pendientes de sincronizar con SimpliRoute."
+                            except Exception:
+                                pass
                         st.session_state["flash_catalogos"] = ("success", texto)
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
@@ -3477,6 +3570,8 @@ def pagina_catalogos():
                     valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
             guardar_registro = st.button(":material/save: Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
             if guardar_registro:
+                if config["tabla"] == "cat_camiones" and "placa" in valores_form:
+                    valores_form["placa"] = sr_int.normalizar_placa(valores_form["placa"])
                 faltan_llave = [c for c in config["clave"] if not str(valores_form[c]).strip()]
                 if faltan_llave:
                     st.error(f"❌ Debes llenar: {', '.join(faltan_llave)} (son la llave del registro).")
@@ -3490,6 +3585,18 @@ def pagina_catalogos():
                     ok, msg = agregar_o_actualizar_registro(config["tabla"], config["columnas"], config["clave"], valores_form, usuario_activo, mis_clientes)
                     if ok:
                         st.session_state["flash_catalogos"] = ("success", "✅ Registro guardado correctamente.")
+                        if config["tabla"] == "cat_camiones":
+                            try:
+                                token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
+                                ok_sr, msg_sr = sr_int.sincronizar_camion_con_sr(get_conn, valores_form["placa"], token=token_sr)
+                                if not ok_sr:
+                                    st.session_state["flash_catalogos"] = (
+                                        "warning",
+                                        f"✅ Camión guardado, pero no se pudo sincronizar con SimpliRoute todavía "
+                                        f"(quedó en la lista de pendientes): {msg_sr}"
+                                    )
+                            except Exception:
+                                pass
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
                     else:
@@ -3605,6 +3712,116 @@ def pagina_catalogos():
                             else:
                                 st.session_state["flash_catalogos"] = ("error", f"❌ El borrado masivo falló, no se borró nada (probablemente algo ahí está en uso en Camiones o Viajes): {resultado}")
                                 st.rerun()
+
+    # ==========================================
+    # Integración SimpliRoute — visible para Administrador/SuperAdministrador/
+    # Supervisor. Nunca bloquea nada de lo de arriba; es solo visibilidad y
+    # botones de reintento sobre lo que ya se sincronizó (o no) en segundo
+    # plano al guardar camiones/pilotos.
+    # ==========================================
+    if perfil_activo in ["Administrador", "SuperAdministrador", "Supervisor"]:
+        st.markdown("---")
+        st.markdown("### :material/sync: Integración SimpliRoute")
+
+        token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
+        hay_token_sr = bool(token_sr)
+        if not hay_token_sr:
+            st.warning("⚠️ No hay token de SimpliRoute configurado en el Vault de Supabase — la integración está "
+                       "desactivada. Todo sigue funcionando en modo manual.")
+
+        with st.expander(":material/local_shipping: Camiones pendientes de sincronizar con SR", expanded=False):
+            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                _cur.execute(
+                    "SELECT placa FROM cat_camiones WHERE activo = TRUE "
+                    "AND (sincronizado_sr IS NOT TRUE OR id_sr IS NULL) ORDER BY placa"
+                )
+                _placas_pendientes = [r[0] for r in _cur.fetchall()]
+            if not _placas_pendientes:
+                st.success("✅ No hay camiones pendientes — todos sincronizados.")
+            else:
+                st.write(f"{len(_placas_pendientes)} camión(es) pendiente(s): " + ", ".join(_placas_pendientes))
+                if hay_token_sr and st.button(":material/refresh: Reintentar todos", key="btn_reintentar_camiones_sr"):
+                    resultados, resumen = sr_int.reintentar_camiones_pendientes(get_conn, token=token_sr)
+                    st.session_state["flash_catalogos"] = ("success", resumen)
+                    st.rerun()
+
+        with st.expander(":material/person: Pilotos pendientes de completar (nuevos desde SR)", expanded=False):
+            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                _cur.execute("SELECT nombre, id_sr FROM cat_pilotos WHERE pendiente_completar = TRUE ORDER BY nombre")
+                _pilotos_pendientes = _cur.fetchall()
+            if not _pilotos_pendientes:
+                st.success("✅ No hay pilotos pendientes de completar.")
+            else:
+                st.dataframe(pd.DataFrame(_pilotos_pendientes, columns=["Nombre (de SR)", "ID en SR"]), use_container_width=True, hide_index=True)
+                st.caption("Complétalos desde el catálogo de Pilotos arriba (licencia, transportista, etc.) y márcalos activos cuando estén listos.")
+
+        with st.expander(":material/warning: Nombres en revisión (posible piloto duplicado)", expanded=False):
+            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                _cur.execute(
+                    "SELECT nombre, id_sr, fecha_deteccion FROM cat_pilotos_revision_nombre "
+                    "WHERE resuelto = FALSE ORDER BY fecha_deteccion DESC"
+                )
+                _en_revision = _cur.fetchall()
+            if not _en_revision:
+                st.success("✅ No hay nombres en revisión.")
+            else:
+                for _nombre_rev, _id_sr_rev, _fecha_rev in _en_revision:
+                    st.write(f"**{_nombre_rev}** (id_sr {_id_sr_rev}) — detectado {_fecha_rev}")
+                    _c1, _c2 = st.columns(2)
+                    with _c1:
+                        if st.button("Es la misma persona → vincular", key=f"vincular_rev_{_id_sr_rev}"):
+                            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                                _cur.execute("UPDATE cat_pilotos SET id_sr = %s WHERE nombre = %s", (_id_sr_rev, _nombre_rev))
+                                _cur.execute("UPDATE cat_pilotos_revision_nombre SET resuelto = TRUE WHERE id_sr = %s", (_id_sr_rev,))
+                                _conn.commit()
+                            st.rerun()
+                    with _c2:
+                        if st.button("Es otra persona → crear aparte", key=f"separar_rev_{_id_sr_rev}"):
+                            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                                _cur.execute(
+                                    "INSERT INTO cat_pilotos (nombre, id_sr, activo, pendiente_completar) "
+                                    "VALUES (%s, %s, FALSE, TRUE) ON CONFLICT (nombre) DO NOTHING",
+                                    (f"{_nombre_rev} (SR)", _id_sr_rev)
+                                )
+                                _cur.execute("UPDATE cat_pilotos_revision_nombre SET resuelto = TRUE WHERE id_sr = %s", (_id_sr_rev,))
+                                _conn.commit()
+                            st.rerun()
+
+        if hay_token_sr and st.button(":material/sync: Sincronizar Pilotos desde SimpliRoute ahora", key="btn_sync_pilotos_manual"):
+            ok_sync, resumen_sync = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token_sr)
+            st.session_state["flash_catalogos"] = ("success" if ok_sync else "error", resumen_sync)
+            st.rerun()
+
+        with st.expander(":material/link: Mapeo Cliente ↔ visit_type de SR", expanded=False):
+            st.caption("Un cliente de facturación puede tener varios visit_type en SR (ej. Grupo Premium = "
+                       "pizza_hut_frio + pizza_hut_seco + kfc_frio + kfc_seco...). Sin mapear, ese visit_type "
+                       "queda 'sin cliente identificado' al importar — nunca se asume solo.")
+            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                _cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr ORDER BY cliente, visit_type")
+                _mapeos_actuales = _cur.fetchall()
+            if _mapeos_actuales:
+                st.dataframe(pd.DataFrame(_mapeos_actuales, columns=["visit_type", "Cliente"]), use_container_width=True, hide_index=True)
+            else:
+                st.info("Todavía no hay ningún visit_type mapeado.")
+
+            _clientes_disponibles = list(st.session_state.catalogos["clientes"].keys())
+            _mc1, _mc2, _mc3 = st.columns([2, 2, 1])
+            with _mc1:
+                _nuevo_visit_type = st.text_input("visit_type (tal cual aparece en SR)", key="nuevo_visit_type_sr")
+            with _mc2:
+                _cliente_para_mapeo = st.selectbox("Cliente en Control de Ruta", _clientes_disponibles, key="cliente_para_mapeo_sr")
+            with _mc3:
+                st.write("")
+                st.write("")
+                if st.button(":material/save: Guardar", key="btn_guardar_mapeo_sr") and _nuevo_visit_type.strip():
+                    with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                        _cur.execute(
+                            "INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s, %s) "
+                            "ON CONFLICT (visit_type) DO UPDATE SET cliente = EXCLUDED.cliente",
+                            (_nuevo_visit_type.strip(), _cliente_para_mapeo)
+                        )
+                        _conn.commit()
+                    st.rerun()
 
 # ==========================================
 # MÓDULO 6: GESTIÓN DE USUARIOS — SuperAdministrador ve y administra a todos;
@@ -3786,11 +4003,48 @@ def pagina_usuarios():
                 st.info("Elige el rango de fechas y presiona 'Ver'.")
 
 # ==========================================
+# MÓDULO 7: DASHBOARDS — una sola pantalla con varios dashboards
+# seleccionables, en vez de una página aparte por cada uno. Agregar un
+# dashboard nuevo es: escribir una función que reciba `conn` (ya abierta) y
+# dibuje lo que sea con st.* (gráficas, tablas, métricas) — de solo lectura,
+# nunca hace commit/insert — y agregarla al diccionario DASHBOARDS_DISPONIBLES
+# de abajo. No hay que tocar nada más de este módulo ni de la navegación.
+# ==========================================
+def _dashboard_placeholder(conn):
+    st.info(":material/construction: Todavía no hay dashboards configurados — "
+            "cuando definamos el primero (ej. Indicadores de SimpliRoute: puntualidad, "
+            "efectividad de entrega, km real), aparece seleccionable aquí mismo, "
+            "sin tener que tocar la estructura de esta pantalla.")
+
+
+DASHBOARDS_DISPONIBLES = {
+    "(Ninguno configurado todavía)": _dashboard_placeholder,
+    # "Indicadores SimpliRoute": _dashboard_indicadores_sr,
+    # "Flota y Distribución": _dashboard_flota,
+}
+
+
+def pagina_dashboards():
+    st.header(":material/dashboard: Dashboards")
+    st.caption(f"Conectado como **{usuario_activo}** ({perfil_activo})")
+    dashboard_elegido = st.selectbox("Elige un dashboard", list(DASHBOARDS_DISPONIBLES.keys()), key="dashboard_sel")
+    with closing(get_conn()) as conn:
+        DASHBOARDS_DISPONIBLES[dashboard_elegido](conn)
+
+
+# ==========================================
 # NAVEGACIÓN — páginas reales en la barra lateral (Streamlit solo ejecuta
 # el código de la página elegida, no las 6 de un jalón como pasaba con
 # pestañas — esto es justo lo que evita la clase de bug que ya nos mordió
 # una vez con un st.stop() en una pestaña tumbando las que venían después).
 # ==========================================
+try:
+    _token_sr_autosync = sr_int.obtener_token_sr_desde_vault(get_conn)
+    if _token_sr_autosync and sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
+        sr_int.sincronizar_pilotos_desde_sr(get_conn, token=_token_sr_autosync)
+except Exception:
+    pass  # sin token, o SR no responde — nunca debe tumbar el arranque de la app
+
 pagina_actual = st.navigation([
     st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:"),
     st.Page(pagina_liquidaciones, title="Recepción (Liquidaciones)", icon=":material/receipt_long:"),
@@ -3798,6 +4052,7 @@ pagina_actual = st.navigation([
     st.Page(pagina_reportes, title="Reportes", icon=":material/bar_chart:"),
     st.Page(pagina_catalogos, title="Catálogos", icon=":material/settings:"),
     st.Page(pagina_usuarios, title="Usuarios", icon=":material/manage_accounts:"),
+    st.Page(pagina_dashboards, title="Dashboards", icon=":material/dashboard:"),
 ])
 pagina_actual.run()
 
