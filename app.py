@@ -2278,9 +2278,38 @@ with tab1:
                     if not ok_imp:
                         st.error(f"❌ {rutas_o_error}")
 
-                _rutas_sr = st.session_state.get("rutas_sr_encontradas", [])
+                # Filtra por el cliente activo (el mismo que ya elegiste arriba en el
+                # sidebar) usando el mapeo visit_type -> cliente. Una ruta sin ningún
+                # visit_type mapeado NO se asume de nadie — se muestra aparte, para
+                # que un Administrador la mapee en vez de que se mezcle sola.
+                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                    _cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr")
+                    _mapa_cliente_sr = dict(_cur.fetchall())
+
+                _todas_las_rutas = st.session_state.get("rutas_sr_encontradas", [])
+                _rutas_sr, _rutas_otro_cliente, _rutas_sin_mapear = [], [], []
+                for _r in _todas_las_rutas:
+                    _clientes_de_ruta = {_mapa_cliente_sr.get(t) for t in _r["visit_types"]}
+                    _clientes_de_ruta.discard(None)
+                    if not _clientes_de_ruta:
+                        _rutas_sin_mapear.append(_r)
+                    elif cliente_activo in _clientes_de_ruta:
+                        _rutas_sr.append(_r)
+                    else:
+                        _rutas_otro_cliente.append(_r)
+
+                if _todas_las_rutas:
+                    st.caption(f"{len(_todas_las_rutas)} ruta(s) totales ese día · "
+                               f"{len(_rutas_otro_cliente)} de otro(s) cliente(s) (ocultas) · "
+                               f"{len(_rutas_sin_mapear)} con visit_type sin mapear")
+                if _rutas_sin_mapear:
+                    _tipos_sin_mapear = sorted({t for r in _rutas_sin_mapear for t in r["visit_types"]})
+                    st.warning(f"⚠️ {len(_rutas_sin_mapear)} ruta(s) con visit_type sin mapear a ningún cliente: "
+                               f"{', '.join(_tipos_sin_mapear)}. Mapéalos en Catálogos → Integración SimpliRoute "
+                               "para que aparezcan en la importación del cliente correcto.")
+
                 if _rutas_sr:
-                    st.success(f"✅ {len(_rutas_sr)} ruta(s) encontrada(s) con visitas ese día.")
+                    st.success(f"✅ {len(_rutas_sr)} ruta(s) de **{cliente_activo}** encontrada(s) con visitas ese día.")
                     for _idx_ruta, _ruta_sr in enumerate(_rutas_sr):
                         with st.container(border=True):
                             st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {_ruta_sr['total_visitas']} visita(s) · "
@@ -3685,6 +3714,37 @@ with tab4:
             ok_sync, resumen_sync = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token_sr)
             st.session_state["flash_catalogos"] = ("success" if ok_sync else "error", resumen_sync)
             st.rerun()
+
+        with st.expander(":material/link: Mapeo Cliente ↔ visit_type de SR", expanded=False):
+            st.caption("Un cliente de facturación puede tener varios visit_type en SR (ej. Grupo Premium = "
+                       "pizza_hut_frio + pizza_hut_seco + kfc_frio + kfc_seco...). Sin mapear, ese visit_type "
+                       "queda 'sin cliente identificado' al importar — nunca se asume solo.")
+            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                _cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr ORDER BY cliente, visit_type")
+                _mapeos_actuales = _cur.fetchall()
+            if _mapeos_actuales:
+                st.dataframe(pd.DataFrame(_mapeos_actuales, columns=["visit_type", "Cliente"]), use_container_width=True, hide_index=True)
+            else:
+                st.info("Todavía no hay ningún visit_type mapeado.")
+
+            _clientes_disponibles = list(st.session_state.catalogos["clientes"].keys())
+            _mc1, _mc2, _mc3 = st.columns([2, 2, 1])
+            with _mc1:
+                _nuevo_visit_type = st.text_input("visit_type (tal cual aparece en SR)", key="nuevo_visit_type_sr")
+            with _mc2:
+                _cliente_para_mapeo = st.selectbox("Cliente en Control de Ruta", _clientes_disponibles, key="cliente_para_mapeo_sr")
+            with _mc3:
+                st.write("")
+                st.write("")
+                if st.button(":material/save: Guardar", key="btn_guardar_mapeo_sr") and _nuevo_visit_type.strip():
+                    with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                        _cur.execute(
+                            "INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s, %s) "
+                            "ON CONFLICT (visit_type) DO UPDATE SET cliente = EXCLUDED.cliente",
+                            (_nuevo_visit_type.strip(), _cliente_para_mapeo)
+                        )
+                        _conn.commit()
+                    st.rerun()
 
 # ==========================================
 # MÓDULO 6: GESTIÓN DE USUARIOS — SuperAdministrador ve y administra a todos;
