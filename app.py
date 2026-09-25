@@ -2101,47 +2101,6 @@ if 'form_run' not in st.session_state:
 if 'num_destinos' not in st.session_state:
     st.session_state.num_destinos = 1
 
-# Prefijos de TODAS las claves de session_state que usa el formulario de
-# Despacho, con el número de "corrida" (run) incrustado en el nombre — ver
-# pagina_despacho() más abajo para la lista completa de keys que generan.
-# Incluye también las que deja la importación desde SimpliRoute
-# (route_id_sr, resumen_sr), que también nacen con el número de run.
-_PREFIJOS_FORM_DESPACHO = [
-    "mreg_final", "info_cli", "info_corr", "info_cd", "placa", "piloto", "aux",
-    "furgon", "sin_pedido", "motivo_sin_pedido", "pedido_subrun", "pedidos_lista",
-    "t", "mida", "del_destino", "comp", "cod_pedido", "cajas_pedido",
-    "btn_agregar_pedido", "del_pedido", "c_disabled", "c_calc", "c", "tar", "r",
-    "tipopago", "peso", "remitos", "dev", "cred", "pg", "obs",
-    "route_id_sr", "resumen_sr",
-]
-
-
-def _limpiar_claves_formulario_despacho(run_a_borrar):
-    """Borra del session_state las claves de widgets de una 'corrida' (run) ya
-    cerrada del formulario de Despacho.
-
-    Cada vez que se guarda un viaje, form_run se incrementa para que el
-    formulario nazca limpio con keys nuevas (placa_4, mida_4_0, etc.) — pero
-    Streamlit NUNCA borra solo las keys de la corrida anterior (placa_3,
-    mida_3_0, pedidos_lista_3_0...). Sin esto, cada viaje que se despacha deja
-    "basura" acumulándose en memoria durante toda la sesión — y una sesión de
-    un despachador que trabaja un turno completo sin cerrar sesión puede crear
-    decenas de viajes, cada uno dejando su propio rastro de campos fantasma.
-    Con varias personas trabajando así al mismo tiempo, esto es una causa
-    directa de que el servidor se quede sin memoria (out of memory) después de
-    un rato de uso normal.
-
-    Se identifican por coincidencia exacta de prefijo + número de run (nunca
-    por 'contiene', para no borrar por accidente una clave de otra pantalla
-    que use el mismo número por coincidencia, como un ID de viaje)."""
-    marcador = f"_{run_a_borrar}"
-    for clave in list(st.session_state.keys()):
-        for prefijo in _PREFIJOS_FORM_DESPACHO:
-            objetivo = f"{prefijo}{marcador}"
-            if clave == objetivo or clave.startswith(objetivo + "_"):
-                del st.session_state[clave]
-                break
-
 # ==========================================
 # SIDEBAR + FLUJO DE ENTRADA (Login → Cliente/CD → App)
 # ==========================================
@@ -2630,6 +2589,46 @@ def pagina_despacho():
                     st.markdown("##### :material/route: RUTA Y DESTINOS")
                     st.caption("Cuenta lo físico primero; el marchamo de ida se cierra al final de cada tienda.")
 
+                    # --- Reordenar/eliminar destinos: todo lo que vive "por destino" en
+                    # session_state está indexado por posición (ej. t_{run}_{i}). Mover un
+                    # destino de posición significa mover TODAS sus claves juntas — de ahí
+                    # esta lista central, para no arriesgar que una quede regada al agregar
+                    # un campo nuevo más adelante y se nos olvide incluirla aquí.
+                    _CLAVES_POR_DESTINO = [
+                        "t", "mida", "comp", "r", "tar", "c", "peso", "remitos", "dev", "cred",
+                        "pg", "obs", "pedidos_lista", "pedido_subrun", "resumen_sr",
+                    ]
+
+                    def _mover_valor_destino(_origen, _destino):
+                        for _pref in _CLAVES_POR_DESTINO:
+                            _ko, _kd = f"{_pref}_{run}_{_origen}", f"{_pref}_{run}_{_destino}"
+                            if _ko in st.session_state:
+                                st.session_state[_kd] = st.session_state[_ko]
+                            else:
+                                st.session_state.pop(_kd, None)
+
+                    def _intercambiar_destinos(_i, _j):
+                        for _pref in _CLAVES_POR_DESTINO:
+                            _ki, _kj = f"{_pref}_{run}_{_i}", f"{_pref}_{run}_{_j}"
+                            _tiene_i, _vi = (_ki in st.session_state), st.session_state.get(_ki)
+                            _tiene_j, _vj = (_kj in st.session_state), st.session_state.get(_kj)
+                            if _tiene_j:
+                                st.session_state[_ki] = _vj
+                            else:
+                                st.session_state.pop(_ki, None)
+                            if _tiene_i:
+                                st.session_state[_kj] = _vi
+                            else:
+                                st.session_state.pop(_kj, None)
+
+                    def _eliminar_destino(_k, _total):
+                        for _idx in range(_k, _total - 1):
+                            _mover_valor_destino(_idx + 1, _idx)
+                        _ultimo = _total - 1
+                        for _pref in _CLAVES_POR_DESTINO:
+                            st.session_state.pop(f"{_pref}_{run}_{_ultimo}", None)
+                        st.session_state.num_destinos -= 1
+
                     destinos_viaje = []
                     total_destinos = st.session_state.num_destinos
                     tiendas_usadas_en_form = set()
@@ -2646,7 +2645,7 @@ def pagina_despacho():
                         lista_pedidos = st.session_state[key_lista_pedidos]
 
                         with st.container(border=True):
-                            cab1, cab2, cab3, cab4 = st.columns([0.35, 2.2, 1.5, 0.4])
+                            cab1, cab2, cab3, cab4, cab5, cab6 = st.columns([0.35, 2.2, 1.5, 0.3, 0.3, 0.4])
                             cab1.markdown(f'<div class="badge-numero">{i + 1}</div>', unsafe_allow_html=True)
                             with cab2:
                                 tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()),
@@ -2657,10 +2656,19 @@ def pagina_despacho():
                                                               label_visibility="collapsed",
                                                               placeholder="📷 Escanea o digita el marchamo")
                             with cab4:
-                                puede_borrar = (i == total_destinos - 1) and total_destinos > 1
-                                if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=not puede_borrar,
-                                             help="Quitar este destino" if puede_borrar else "Solo puedes quitar el último destino agregado"):
-                                    st.session_state.num_destinos -= 1
+                                if st.button(":material/arrow_upward:", key=f"subir_destino_{run}_{i}",
+                                             disabled=(i == 0), help="Subir en el orden de entrega"):
+                                    _intercambiar_destinos(i, i - 1)
+                                    st.rerun()
+                            with cab5:
+                                if st.button(":material/arrow_downward:", key=f"bajar_destino_{run}_{i}",
+                                             disabled=(i == total_destinos - 1), help="Bajar en el orden de entrega"):
+                                    _intercambiar_destinos(i, i + 1)
+                                    st.rerun()
+                            with cab6:
+                                if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=(total_destinos <= 1),
+                                             help="Quitar este destino del viaje" if total_destinos > 1 else "Debe quedar al menos un destino"):
+                                    _eliminar_destino(i, total_destinos)
                                     st.rerun()
 
                             km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
@@ -2925,8 +2933,7 @@ def pagina_despacho():
                                 pass
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.session_state.num_destinos = 1
-                        _limpiar_claves_formulario_despacho(run)  # libera los campos de ESTA corrida ya cerrada
-                        st.session_state.form_run += 1  # el próximo formulario nace con keys nuevas
+                        st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
                         st.session_state["ultimo_viaje_guardado"] = resultado
                         st.rerun()
                     else:

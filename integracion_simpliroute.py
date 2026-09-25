@@ -35,6 +35,7 @@ en app.py):
 """
 
 import requests
+import time
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -65,11 +66,14 @@ def _headers(token=None):
     return {"Authorization": f"Token {token}", "Content-Type": "application/json"}
 
 
-def _sr_request(method, ruta, token=None, timeout=None, **kwargs):
+def _sr_request(method, ruta, token=None, timeout=None, reintentos_429=2, **kwargs):
     """Wrapper único para todas las llamadas a la API de SR.
 
     Devuelve siempre (ok: bool, data_o_mensaje). Nunca lanza una excepción:
     - Error de red / timeout -> (False, mensaje corto y claro)
+    - HTTP 429 (demasiadas peticiones) -> espera y reintenta sola, hasta
+      `reintentos_429` veces, respetando el header Retry-After de SR si lo
+      manda; si se agotan los reintentos, mensaje claro (no un error crudo).
     - HTTP 4xx/5xx            -> (False, mensaje con el código y el body de SR)
     - HTTP 2xx                -> (True, json ya parseado)
 
@@ -80,14 +84,30 @@ def _sr_request(method, ruta, token=None, timeout=None, **kwargs):
     registros y 8s se queda corto — no es un error, es una respuesta grande
     de verdad."""
     url = BASE_URL + ruta.lstrip("/")
-    try:
-        resp = requests.request(
-            method, url, headers=_headers(token), timeout=(timeout or TIMEOUT_SEGUNDOS), **kwargs
-        )
-    except requests.exceptions.Timeout:
-        return False, f"SimpliRoute no respondió a tiempo (timeout de {timeout or TIMEOUT_SEGUNDOS}s)."
-    except requests.exceptions.RequestException as e:
-        return False, f"No se pudo conectar con SimpliRoute: {e}"
+    for intento in range(reintentos_429 + 1):
+        try:
+            resp = requests.request(
+                method, url, headers=_headers(token), timeout=(timeout or TIMEOUT_SEGUNDOS), **kwargs
+            )
+        except requests.exceptions.Timeout:
+            return False, f"SimpliRoute no respondió a tiempo (timeout de {timeout or TIMEOUT_SEGUNDOS}s)."
+        except requests.exceptions.RequestException as e:
+            return False, f"No se pudo conectar con SimpliRoute: {e}"
+
+        if resp.status_code == 429 and intento < reintentos_429:
+            espera = resp.headers.get("Retry-After")
+            try:
+                espera = float(espera)
+            except (TypeError, ValueError):
+                espera = 3 * (intento + 1)  # 3s, luego 6s si hace falta un segundo reintento
+            time.sleep(min(espera, 15))  # nunca más de 15s de espera, para no colgar la pantalla
+            continue
+        break
+
+    if resp.status_code == 429:
+        return False, ("SimpliRoute está limitando las peticiones por exceso de consultas seguidas "
+                        "(código 429). Espera uno o dos minutos y vuelve a intentar — no es un error "
+                        "de tu base de datos ni de Control de Ruta.")
 
     if resp.ok:
         try:
@@ -456,8 +476,11 @@ def importar_rutas_sr(fecha, token=None):
         "total_visitas": int,
         "visit_types": {tipo: conteo},  # para más adelante cruzar con cat_mapeo_cliente_sr
         "destinos": [
-            {"tienda": str, "cajas": int, "pedidos": [{"pedido": reference, "cajas": n, "visit_id": id}]}
-        ],
+            {"tienda": str, "cajas": int, "orden_sugerido": int, "pedidos": [{"pedido": reference, "cajas": n, "visit_id": id}]}
+        ],  # "destinos" ya viene ORDENADO según el optimizador de SR (campo
+            # `order` de sus Visitas) — es un punto de partida sugerido, no
+            # definitivo; en Control de Ruta se puede reordenar con las
+            # flechitas antes de guardar el viaje.
       }
     """
     ok, rutas_raw = _sr_request("GET", "routes/routes/", token=token, timeout=45, params={"planned_date": fecha})
@@ -485,7 +508,7 @@ def importar_rutas_sr(fecha, token=None):
 
             tienda = v.get("title") or "(sin nombre)"
             if tienda not in por_tienda:
-                por_tienda[tienda] = {"tienda": tienda, "cajas": 0, "pedidos": []}
+                por_tienda[tienda] = {"tienda": tienda, "cajas": 0, "pedidos": [], "orden_sugerido": None}
             cajas_visita = v.get("load_3") or 0
             por_tienda[tienda]["cajas"] += cajas_visita
             por_tienda[tienda]["pedidos"].append({
@@ -494,6 +517,20 @@ def importar_rutas_sr(fecha, token=None):
                 "visit_id": v.get("id"),
                 "origen": "SR",
             })
+            # El orden más bajo entre todas las visitas de esta tienda —
+            # SR numera cada parada según su optimizador; una tienda con
+            # varias visitas (varios pedidos) se ubica donde llegaría la
+            # primera de ellas.
+            orden_visita = v.get("order")
+            if orden_visita is not None:
+                actual = por_tienda[tienda]["orden_sugerido"]
+                if actual is None or orden_visita < actual:
+                    por_tienda[tienda]["orden_sugerido"] = orden_visita
+
+        destinos_ordenados = sorted(
+            por_tienda.values(),
+            key=lambda d: d["orden_sugerido"] if d["orden_sugerido"] is not None else float("inf")
+        )
 
         resultado.append({
             "route_id": route_id,
@@ -501,7 +538,7 @@ def importar_rutas_sr(fecha, token=None):
             "driver_sr_id": ruta.get("driver"),
             "total_visitas": len(visitas_de_ruta),
             "visit_types": visit_types,
-            "destinos": list(por_tienda.values()),
+            "destinos": destinos_ordenados,
         })
 
     return True, resultado
