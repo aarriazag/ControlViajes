@@ -2101,6 +2101,47 @@ if 'form_run' not in st.session_state:
 if 'num_destinos' not in st.session_state:
     st.session_state.num_destinos = 1
 
+# Prefijos de TODAS las claves de session_state que usa el formulario de
+# Despacho, con el número de "corrida" (run) incrustado en el nombre — ver
+# pagina_despacho() más abajo para la lista completa de keys que generan.
+# Incluye también las que deja la importación desde SimpliRoute
+# (route_id_sr, resumen_sr), que también nacen con el número de run.
+_PREFIJOS_FORM_DESPACHO = [
+    "mreg_final", "info_cli", "info_corr", "info_cd", "placa", "piloto", "aux",
+    "furgon", "sin_pedido", "motivo_sin_pedido", "pedido_subrun", "pedidos_lista",
+    "t", "mida", "del_destino", "comp", "cod_pedido", "cajas_pedido",
+    "btn_agregar_pedido", "del_pedido", "c_disabled", "c_calc", "c", "tar", "r",
+    "tipopago", "peso", "remitos", "dev", "cred", "pg", "obs",
+    "route_id_sr", "resumen_sr",
+]
+
+
+def _limpiar_claves_formulario_despacho(run_a_borrar):
+    """Borra del session_state las claves de widgets de una 'corrida' (run) ya
+    cerrada del formulario de Despacho.
+
+    Cada vez que se guarda un viaje, form_run se incrementa para que el
+    formulario nazca limpio con keys nuevas (placa_4, mida_4_0, etc.) — pero
+    Streamlit NUNCA borra solo las keys de la corrida anterior (placa_3,
+    mida_3_0, pedidos_lista_3_0...). Sin esto, cada viaje que se despacha deja
+    "basura" acumulándose en memoria durante toda la sesión — y una sesión de
+    un despachador que trabaja un turno completo sin cerrar sesión puede crear
+    decenas de viajes, cada uno dejando su propio rastro de campos fantasma.
+    Con varias personas trabajando así al mismo tiempo, esto es una causa
+    directa de que el servidor se quede sin memoria (out of memory) después de
+    un rato de uso normal.
+
+    Se identifican por coincidencia exacta de prefijo + número de run (nunca
+    por 'contiene', para no borrar por accidente una clave de otra pantalla
+    que use el mismo número por coincidencia, como un ID de viaje)."""
+    marcador = f"_{run_a_borrar}"
+    for clave in list(st.session_state.keys()):
+        for prefijo in _PREFIJOS_FORM_DESPACHO:
+            objetivo = f"{prefijo}{marcador}"
+            if clave == objetivo or clave.startswith(objetivo + "_"):
+                del st.session_state[clave]
+                break
+
 # ==========================================
 # SIDEBAR + FLUJO DE ENTRADA (Login → Cliente/CD → App)
 # ==========================================
@@ -2884,7 +2925,8 @@ def pagina_despacho():
                                 pass
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.session_state.num_destinos = 1
-                        st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
+                        _limpiar_claves_formulario_despacho(run)  # libera los campos de ESTA corrida ya cerrada
+                        st.session_state.form_run += 1  # el próximo formulario nace con keys nuevas
                         st.session_state["ultimo_viaje_guardado"] = resultado
                         st.rerun()
                     else:
