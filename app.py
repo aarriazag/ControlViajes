@@ -383,7 +383,7 @@ st.markdown("""
         }
 
         /* Reduce el padding superior por defecto de Streamlit para que la topbar quede pegada arriba */
-        .block-container { padding-top: 0.8rem; }
+        .block-container { padding-top: 3.8rem; }
         /* Quita la barra de color ("decoración") que Streamlit pone arriba por
            defecto — es el espacio vacío/resaltado que sobra encima del contenido.
            El menú de los 3 puntos (⋮) se queda intacto, solo se quita esa franja. */
