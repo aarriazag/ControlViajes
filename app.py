@@ -354,13 +354,50 @@ st.markdown("""
             letter-spacing: 0.03em; text-transform: uppercase; margin-left: 8px;
         }
 
+        /* Responsivo: en pantallas angostas (otra resolución/otra computadora),
+           el texto de la barra no se corta a la mitad de una palabra ni se sale
+           del contenedor — se ajusta con normalidad. Esto es correctivo, no
+           estético: sin overflow-wrap, un texto largo en un contenedor angosto
+           se desborda en vez de bajar de línea. */
+        .ransa-topbar .titulo,
+        .ransa-topbar .subtitulo,
+        .ransa-topbar .contexto {
+            overflow-wrap: break-word;
+            word-break: normal;
+            min-width: 0;
+        }
+        @media (max-width: 680px) {
+            .ransa-topbar {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+            }
+            .ransa-topbar .contexto { text-align: left; }
+            .ransa-topbar .titulo { font-size: 17px; }
+        }
+        /* Red de seguridad general: texto normal de la app (párrafos, captions)
+           siempre se ajusta al ancho disponible, en cualquier resolución. */
+        .stMarkdown p, [data-testid="stCaptionContainer"] {
+            overflow-wrap: break-word;
+            word-break: normal;
+        }
+
         /* Reduce el padding superior por defecto de Streamlit para que la topbar quede pegada arriba */
         .block-container { padding-top: 0.8rem; }
         /* Quita la barra de color ("decoración") que Streamlit pone arriba por
            defecto — es el espacio vacío/resaltado que sobra encima del contenido.
            El menú de los 3 puntos (⋮) se queda intacto, solo se quita esa franja. */
         div[data-testid="stDecoration"] { display: none; }
-        header[data-testid="stHeader"] { height: 2.2rem; background: transparent; }
+        /* El logo (st.logo) vive en esta barra nativa de Streamlit — antes quedaba
+           transparente, así que el logo flotaba solo sobre el fondo oscuro de la
+           página, desconectado visualmente de tu barra verde de abajo. Ahora usa
+           el mismo verde de marca, para que se lea como una sola pieza. */
+        header[data-testid="stHeader"] {
+            height: 3.2rem;
+            background: linear-gradient(90deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
+            padding-left: 8px;
+        }
+        [data-testid="stLogo"] { padding-left: 6px; }
 
         /* --- Inputs, selects, textareas: look de producto moderno, no de formulario
            de los 2000s --- */
