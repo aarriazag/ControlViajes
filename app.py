@@ -354,6 +354,50 @@ st.markdown("""
             letter-spacing: 0.03em; text-transform: uppercase; margin-left: 8px;
         }
 
+        /* Panel lateral verde de las pantallas previas al login (Iniciar
+           Sesión, Cambio de Contraseña, Selección de Cliente/CD) — mismo
+           degradado y tokens de marca que el resto de la app, nada de
+           colores nuevos. Se oculta en pantallas angostas (< 900px) para no
+           dejar el formulario apretado en celular/tablet. */
+        .ransa-login-sidebar {
+            background: linear-gradient(165deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
+            border-radius: 12px;
+            min-height: 620px;
+            box-sizing: border-box;
+            padding: 34px 22px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+            overflow: hidden;
+        }
+        .ransa-login-sidebar::before {
+            content: ""; position: absolute; right: -60px; top: -50px;
+            width: 180px; height: 180px; border-radius: 999px;
+            background: rgba(255,255,255,0.05);
+        }
+        .ransa-login-sidebar::after {
+            content: ""; position: absolute; left: -70px; bottom: -50px;
+            width: 180px; height: 180px; border-radius: 999px;
+            background: rgba(255,255,255,0.04);
+        }
+        .ransa-login-sidebar .ransa-login-badge {
+            position: relative; background: #FFFFFF; border-radius: 10px;
+            padding: 12px 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+            margin-top: auto;
+        }
+        .ransa-login-sidebar .ransa-login-badge img { height: 36px; display: block; }
+        .ransa-login-sidebar .ransa-login-caption {
+            position: relative; text-align: center; color: #fff;
+            font-size: 15px; font-weight: 600; margin-top: 18px; margin-bottom: auto;
+        }
+        .ransa-login-sidebar .ransa-login-copyright {
+            position: relative; color: rgba(255,255,255,0.75); font-size: 11px; text-align: center;
+        }
+        @media (max-width: 900px) {
+            .ransa-login-sidebar { display: none; }
+        }
+
         /* Responsivo: en pantallas angostas (otra resolución/otra computadora),
            el texto de la barra no se corta a la mitad de una palabra ni se sale
            del contenedor — se ajusta con normalidad. Esto es correctivo, no
@@ -2162,30 +2206,42 @@ except Exception as e:
 # de texto libre, no una lista desplegable, para no exponer a cualquier
 # visitante qué nombres de usuario existen en el sistema.
 if not st.session_state.get("login_confirmado"):
-    st.markdown("""
-        <div class="ransa-topbar" style="justify-content:center;">
-            <div style="text-align:center;">
-                <div class="titulo">RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
-                <div class="subtitulo">Ingresa con tu usuario para continuar</div>
+    col_sidebar_login, col_form_login = st.columns([1, 2.6])
+    with col_sidebar_login:
+        st.markdown(f"""
+            <div class="ransa-login-sidebar">
+                <div class="ransa-login-badge">
+                    <img src="data:image/png;base64,{_LOGO_TEXTO_B64}" alt="RANSA">
+                </div>
+                <div class="ransa-login-caption">Sistema de Control de Viajes</div>
+                <div class="ransa-login-copyright">© {ahora().year} Ransa · Guatemala</div>
             </div>
-        </div>
-    """, unsafe_allow_html=True)
-    col_izq, col_centro, col_der = st.columns([1, 1.2, 1])
-    with col_centro:
-        with st.container(border=True):
-            st.markdown("#### :material/lock: Iniciar Sesión")
-            usuario_login = st.text_input("Usuario")
-            password_login = st.text_input("Contraseña", type="password")
-            if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
-                resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
-                if resultado_login:
-                    st.session_state["usuario_activo_fijo"] = usuario_login.strip()
-                    st.session_state["perfil_activo_fijo"] = resultado_login["perfil"]
-                    st.session_state["debe_cambiar_password"] = resultado_login["debe_cambiar_password"]
-                    st.session_state["login_confirmado"] = True
-                    st.rerun()
-                else:
-                    st.error("❌ Usuario o contraseña incorrectos.")
+        """, unsafe_allow_html=True)
+    with col_form_login:
+        st.markdown("""
+            <div class="ransa-topbar" style="justify-content:center;">
+                <div style="text-align:center;">
+                    <div class="titulo">RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
+                    <div class="subtitulo">Ingresa con tu usuario para continuar</div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        col_izq, col_centro, col_der = st.columns([1, 1.2, 1])
+        with col_centro:
+            with st.container(border=True):
+                st.markdown("#### :material/lock: Iniciar Sesión")
+                usuario_login = st.text_input("Usuario")
+                password_login = st.text_input("Contraseña", type="password")
+                if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
+                    resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
+                    if resultado_login:
+                        st.session_state["usuario_activo_fijo"] = usuario_login.strip()
+                        st.session_state["perfil_activo_fijo"] = resultado_login["perfil"]
+                        st.session_state["debe_cambiar_password"] = resultado_login["debe_cambiar_password"]
+                        st.session_state["login_confirmado"] = True
+                        st.rerun()
+                    else:
+                        st.error("❌ Usuario o contraseña incorrectos.")
     st.stop()
 
 usuario_activo = st.session_state["usuario_activo_fijo"]
@@ -2220,33 +2276,45 @@ st.session_state["ultima_actividad"] = ahora_actividad
 # --- PANTALLA 1B: Cambio de contraseña obligatorio (primer ingreso, o tras un
 # restablecimiento). No se puede pasar de aquí sin poner una contraseña nueva.
 if st.session_state.get("debe_cambiar_password"):
-    st.markdown("""
-        <div class="ransa-topbar" style="justify-content:center;">
-            <div style="text-align:center;">
-                <div class="titulo">:material/key: Cambio de Contraseña Obligatorio</div>
-                <div class="subtitulo">Define una contraseña nueva para continuar</div>
+    col_sidebar_pw, col_form_pw = st.columns([1, 2.6])
+    with col_sidebar_pw:
+        st.markdown(f"""
+            <div class="ransa-login-sidebar">
+                <div class="ransa-login-badge">
+                    <img src="data:image/png;base64,{_LOGO_TEXTO_B64}" alt="RANSA">
+                </div>
+                <div class="ransa-login-caption">Sistema de Control de Viajes</div>
+                <div class="ransa-login-copyright">© {ahora().year} Ransa · Guatemala</div>
             </div>
-        </div>
-    """, unsafe_allow_html=True)
-    col_izq2, col_centro2, col_der2 = st.columns([1, 1.2, 1])
-    with col_centro2:
-        with st.container(border=True):
-            nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres, con letra y número)", type="password", key="nueva_pw_1")
-            nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="nueva_pw_2")
-            if st.button(":material/check: Guardar Contraseña", use_container_width=True):
-                valida, msg_valida = password_es_valida(nueva1)
-                if not valida:
-                    st.error(f"❌ {msg_valida}")
-                elif nueva1 != nueva2:
-                    st.error("❌ Las dos contraseñas no coinciden.")
-                else:
-                    ok, msg = establecer_password(usuario_activo, nueva1, forzar_cambio_siguiente=False)
-                    if ok:
-                        st.session_state["debe_cambiar_password"] = False
-                        st.success("✅ Contraseña actualizada.")
-                        st.rerun()
+        """, unsafe_allow_html=True)
+    with col_form_pw:
+        st.markdown("""
+            <div class="ransa-topbar" style="justify-content:center;">
+                <div style="text-align:center;">
+                    <div class="titulo">:material/key: Cambio de Contraseña Obligatorio</div>
+                    <div class="subtitulo">Define una contraseña nueva para continuar</div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        col_izq2, col_centro2, col_der2 = st.columns([1, 1.2, 1])
+        with col_centro2:
+            with st.container(border=True):
+                nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres, con letra y número)", type="password", key="nueva_pw_1")
+                nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="nueva_pw_2")
+                if st.button(":material/check: Guardar Contraseña", use_container_width=True):
+                    valida, msg_valida = password_es_valida(nueva1)
+                    if not valida:
+                        st.error(f"❌ {msg_valida}")
+                    elif nueva1 != nueva2:
+                        st.error("❌ Las dos contraseñas no coinciden.")
                     else:
-                        mostrar_resultado_error(msg, perfil_activo)
+                        ok, msg = establecer_password(usuario_activo, nueva1, forzar_cambio_siguiente=False)
+                        if ok:
+                            st.session_state["debe_cambiar_password"] = False
+                            st.success("✅ Contraseña actualizada.")
+                            st.rerun()
+                        else:
+                            mostrar_resultado_error(msg, perfil_activo)
     st.stop()
 
 with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_container_width=True):
@@ -4054,7 +4122,7 @@ def pagina_catalogos():
             else:
                 st.info("Todavía no hay ningún visit_type mapeado.")
 
-            _clientes_disponibles = st.session_state.catalogos["clientes_lista_activos"]
+            _clientes_disponibles = list(st.session_state.catalogos["clientes"].keys())
             _mc1, _mc2, _mc3 = st.columns([2, 2, 1])
             with _mc1:
                 _nuevo_visit_type = st.text_input("visit_type (tal cual aparece en SR)", key="nuevo_visit_type_sr")
