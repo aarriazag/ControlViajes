@@ -683,6 +683,37 @@ def obtener_ruta_sr(route_id_sr, token=None):
 
 
 
+def asegurar_esquema_sr(conn):
+    """Crea (si no existen) las tablas y columnas que usa la integración con
+    SimpliRoute. Antes vivían solo como migraciones manuales en la base, así
+    que una base nueva o vaciada no las tenía. Todo es IF NOT EXISTS: en una
+    base que ya las tiene no cambia nada. Lo llama init_db() de app.py."""
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS id_sr BIGINT")
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS pendiente_completar BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")
+        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS id_sr BIGINT")
+        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS sincronizado_sr BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_pilotos_revision_nombre (
+                nombre TEXT, id_sr BIGINT PRIMARY KEY,
+                fecha_deteccion TIMESTAMP, resuelto BOOLEAN DEFAULT FALSE
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS control_sincronizacion_sr (
+                proceso TEXT PRIMARY KEY, ultima_ejecucion TIMESTAMP, resultado TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cat_mapeo_cliente_sr (
+                visit_type TEXT PRIMARY KEY, cliente TEXT
+            )
+        """)
+    conn.commit()
+
+
 # ===========================================================================
 # CONTROL SR — vínculo viaje <-> Ruta, verificación y reenvío
 # ===========================================================================

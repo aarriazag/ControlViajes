@@ -664,6 +664,7 @@ def init_db():
             )
         """)
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
+        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS capacidad_cajas INTEGER")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_clientes_tiendas (
                 cliente TEXT, tienda TEXT, km REAL,
@@ -686,6 +687,7 @@ def init_db():
                 tipo TEXT PRIMARY KEY, km_por_galon REAL
             )
         """)
+        cur.execute("ALTER TABLE cat_rendimiento_camion ADD COLUMN IF NOT EXISTS capacidad_cajas_default INTEGER")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_cds_por_cliente (
                 cliente TEXT, cd TEXT, PRIMARY KEY (cliente, cd)
@@ -750,62 +752,6 @@ def init_db():
         """)
         conn.commit()
 
-        # Sembrar datos de ejemplo — cada INSERT usa ON CONFLICT DO NOTHING, así
-        # que es seguro que este bloque corra más de una vez (por ejemplo, si un
-        # Borrado Masivo deja alguna de estas tablas en cero: eso no debe hacer
-        # que se vuelvan a sembrar TODAS, chocando con lo que sí sigue ahí).
-        cur.execute("SELECT COUNT(*) FROM cat_clientes_tiendas")
-        if cur.fetchone()[0] == 0:
-            cur.executemany("INSERT INTO cat_transportistas (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
-                             [("Transportes Express",), ("Logística del Norte",), ("Flota Interna",)])
-            cur.executemany("INSERT INTO cat_pilotos (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
-                             [("Juan Pérez",), ("María Rodríguez",), ("Luis Martínez",), ("Andrés Custodio",)])
-            cur.executemany("INSERT INTO cat_auxiliares (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
-                             [("Carlos López",), ("Pedro Gómez",), ("José Hernández",), ("Ramiro Ruiz",)])
-            cur.executemany(
-                "INSERT INTO cat_camiones (placa, tipo, transportista, piloto, auxiliar) VALUES (%s,%s,%s,%s,%s) "
-                "ON CONFLICT (placa) DO NOTHING",
-                [("C-123ABC", "05TM", "Transportes Express", "Juan Pérez", "Carlos López"),
-                 ("C-456DEF", "10TM", "Logística del Norte", "María Rodríguez", "Pedro Gómez"),
-                 ("C-789GHI", "20TM", "Flota Interna", "Luis Martínez", "José Hernández")]
-            )
-            cur.executemany(
-                "INSERT INTO cat_clientes (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
-                [("Dollarcity",), ("UniSuper",), ("UniSuper Importados",), ("UniSuper LTX",)]
-            )
-            cur.executemany(
-                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km) VALUES (%s,%s,%s) "
-                "ON CONFLICT (cliente, tienda) DO NOTHING",
-                [("Dollarcity", "Dollarcity Zona 10", 15.5),
-                 ("Dollarcity", "Dollarcity Mixco", 32.0),
-                 ("UniSuper", "UniSuper Central", 22.1),
-                 ("UniSuper Importados", "UniSuper Importados Norte", 18.0),
-                 ("UniSuper LTX", "UniSuper LTX Sur", 45.3)]
-            )
-            cur.executemany(
-                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon, capacidad_cajas_default) VALUES (%s,%s,%s) ON CONFLICT (tipo) DO NOTHING",
-                [("05TM", 8.0, 480), ("10TM", 6.0, 700), ("20TM", 4.0, 1200)]
-            )
-            cur.executemany(
-                "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s) ON CONFLICT (cliente, cd) DO NOTHING",
-                [("Dollarcity", "CD Barcenas"), ("Dollarcity", "CD Central"),
-                 ("UniSuper", "CD Barcenas"),
-                 ("UniSuper Importados", "CD Barcenas"),
-                 ("UniSuper LTX", "CD Barcenas")]
-            )
-            cur.executemany(
-                "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s) ON CONFLICT (usuario) DO NOTHING",
-                [("Admin_Logistica", "SuperAdministrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
-            )
-            # Por defecto, los usuarios de ejemplo (no-Administrador) ven todos los
-            # clientes sembrados, para no romper nada mientras ajustas los accesos reales.
-            cur.executemany(
-                "INSERT INTO cat_usuario_clientes (usuario, cliente) VALUES (%s,%s) ON CONFLICT (usuario, cliente) DO NOTHING",
-                [(u, c) for u in ("Op_Salidas", "Liq_Transporte")
-                 for c in ("Dollarcity", "UniSuper", "UniSuper Importados", "UniSuper LTX")]
-            )
-            conn.commit()
-
         # Por si "cat_clientes" se creó después de ya tener datos (upgrade de una
         # versión anterior de la app): rellena con cualquier cliente que ya exista
         # disperso en otras tablas, para que las llaves foráneas de abajo no fallen.
@@ -821,19 +767,40 @@ def init_db():
         """)
         conn.commit()
 
-        # Contraseña temporal para cualquier usuario que todavía no tenga una
-        # (los 3 usuarios de ejemplo, o upgrades desde una versión sin login real).
-        # Todos quedan forzados a cambiarla en su primer ingreso.
-        cur.execute("SELECT usuario FROM cat_usuarios WHERE password_hash IS NULL")
-        usuarios_sin_password = [r[0] for r in cur.fetchall()]
-        if usuarios_sin_password:
-            salt_temp, hash_temp = hash_password("Ransa2026")
-            for u in usuarios_sin_password:
+        # Datos mínimos de referencia (no son datos de ejemplo): el piloto y el auxiliar
+        # "Sin ..." que se usan cuando un viaje no lleva uno. Idempotente.
+        cur.execute("INSERT INTO cat_pilotos (nombre, activo) VALUES ('Sin Piloto', TRUE) ON CONFLICT (nombre) DO NOTHING")
+        cur.execute("INSERT INTO cat_auxiliares (nombre, activo) VALUES ('Sin Auxiliar', TRUE) ON CONFLICT (nombre) DO NOTHING")
+        conn.commit()
+
+        # Primer ingreso a una base VACÍA: no hay usuarios de ejemplo ni contraseña conocida.
+        # El primer SuperAdministrador se crea UNA sola vez, con los datos que se pongan en
+        # Secrets (bloque [admin_inicial] con usuario y password). Queda obligado a cambiar
+        # la contraseña en su primer ingreso. Si la base ya tiene usuarios, esto no hace nada.
+        cur.execute("SELECT COUNT(*) FROM cat_usuarios")
+        if cur.fetchone()[0] == 0:
+            try:
+                _cfg_admin = st.secrets.get("admin_inicial")
+                _u_ini = str(_cfg_admin["usuario"]).strip() if _cfg_admin else ""
+                _p_ini = str(_cfg_admin["password"]) if _cfg_admin else ""
+            except Exception:
+                _u_ini, _p_ini = "", ""
+            if _u_ini and _p_ini:
+                _salt_ini, _hash_ini = hash_password(_p_ini)
                 cur.execute(
-                    "UPDATE cat_usuarios SET password_hash=%s, password_salt=%s, debe_cambiar_password=TRUE WHERE usuario=%s",
-                    (hash_temp, salt_temp, u)
+                    "INSERT INTO cat_usuarios (usuario, perfil, password_hash, password_salt, activo, "
+                    "debe_cambiar_password, creado_por) VALUES (%s,'SuperAdministrador',%s,%s,TRUE,TRUE,'Arranque inicial') "
+                    "ON CONFLICT (usuario) DO NOTHING",
+                    (_u_ini, _hash_ini, _salt_ini)
                 )
             conn.commit()
+
+        # Esquema propio de la integración con SimpliRoute (tablas y columnas). Vive en
+        # integracion_simpliroute.py; si fallara, la app arranca igual sin la integración.
+        try:
+            sr_int.asegurar_esquema_sr(conn)
+        except Exception:
+            conn.rollback()
 
         # ---- Llaves foráneas con actualización en cascada ----
         # Esto es lo que de verdad evita que renombrar un piloto/auxiliar/
@@ -2284,6 +2251,16 @@ if not st.session_state.get("login_confirmado"):
                 st.markdown("#### :material/lock: Iniciar Sesión")
                 usuario_login = st.text_input("Usuario")
                 password_login = st.text_input("Contraseña", type="password")
+                try:
+                    with closing(get_conn()) as _c_u, _c_u.cursor() as _cu:
+                        _cu.execute("SELECT COUNT(*) FROM cat_usuarios")
+                        _sin_usuarios = _cu.fetchone()[0] == 0
+                except Exception:
+                    _sin_usuarios = False
+                if _sin_usuarios:
+                    st.error("⚠️ La base está vacía y no hay ningún usuario. Agrega el bloque [admin_inicial] "
+                             "(usuario y password) en los Secrets de la app y reinicia; se creará el "
+                             "primer SuperAdministrador.")
                 if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
                     resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
                     if resultado_login:
@@ -2401,6 +2378,21 @@ with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_conta
 # --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
 # cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
 # jornada alguien cambie sin querer el cliente/CD y se mezclen viajes).
+# Base NUEVA (sin ningún cliente): el Administrador no tiene nada que elegir y, sin esto,
+# quedaría atrapado aquí sin poder llegar a Catálogos para crear el primer cliente. En ese
+# caso se abre solo Catálogos (ver el final del archivo). En cuanto exista un cliente, se
+# sale de este modo y vuelve la selección normal de Cliente y CD.
+if (perfil_activo in ("Administrador", "SuperAdministrador")
+        and not st.session_state.catalogos["clientes_lista"]):
+    st.session_state["_modo_base_vacia"] = True
+    st.session_state["cliente_activo_fijo"] = "(sin clientes)"
+    st.session_state["cd_origen_fijo"] = ""
+    st.session_state["config_bloqueada"] = True
+elif st.session_state.pop("_modo_base_vacia", False):
+    st.session_state["config_bloqueada"] = False
+    st.session_state.pop("cliente_activo_fijo", None)
+    st.session_state.pop("cd_origen_fijo", None)
+
 if not st.session_state.get("config_bloqueada"):
     st.sidebar.markdown("---")
     st.markdown("""
@@ -4440,6 +4432,14 @@ try:
         sr_int.sincronizar_pilotos_desde_sr(get_conn, token=_token_sr_autosync)
 except Exception:
     pass  # sin token, o SR no responde — nunca debe tumbar el arranque de la app
+
+if st.session_state.get("_modo_base_vacia"):
+    st.info("🚀 **Base nueva:** todavía no hay clientes. Empieza cargando los catálogos en este orden: "
+            "Clientes → CDs por cliente → Tiendas → Transportistas → Camiones → Pilotos y Auxiliares → "
+            "Usuarios y su acceso a clientes. Al agregar el primer cliente, el sistema te lleva a la "
+            "selección normal de Cliente y CD para empezar a despachar.")
+    pagina_catalogos()
+    st.stop()
 
 pagina_actual = st.navigation([
     st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:"),
