@@ -1082,6 +1082,16 @@ def crear_usuario(usuario, perfil, creado_por, clientes=None):
             conn.commit()
             registrar_auditoria(creado_por, "Crear usuario", f"Usuario nuevo: {usuario} · Perfil: {perfil} · Clientes: {', '.join(clientes or []) or '(ninguno)'}")
             return True, password_temp
+        except psycopg2.errors.UniqueViolation:
+            # El nombre de usuario es la llave primaria de cat_usuarios: si ya existe
+            # no es una falla del sistema, es un nombre repetido. No se revela el perfil
+            # de la cuenta existente (puede ser uno que quien crea no tiene permiso de ver).
+            conn.rollback()
+            return False, (f"El usuario '{usuario}' ya existe. Revisa la lista de 'Usuarios actuales' "
+                           f"(puede estar desactivado), o pide a un Administrador que lo revise si no "
+                           f"lo ves — puede ser una cuenta de un perfil que no tienes permiso de ver. "
+                           f"Si solo necesita acceso o contraseña, usa 'Generar Nueva Contraseña Temporal' "
+                           f"o reactívalo en vez de crearlo de nuevo.")
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "crear_usuario")
