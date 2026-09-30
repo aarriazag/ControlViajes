@@ -4,6 +4,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import json
+import re
 import io
 import os
 import base64
@@ -26,6 +27,11 @@ import integracion_simpliroute as sr_int
 #   Mayor   (el primero)       = cambio de fondo en cómo funciona la herramienta (ej. 1.9.4 → 2.0.0)
 # Se actualiza a mano en cada entrega — no se calcula solo.
 VERSION_APP = "1.0.0"
+
+# Tonelaje que va con cabezal + furgón como una sola unidad (placa_furgon).
+# Una sola constante en vez de repetir "20 Ton" en 5 lugares del código —
+# si el tonelaje cambia de nombre otra vez, se corrige aquí una sola vez.
+TIPO_CABEZAL_FURGON = "20TM"
 
 # Equivalencia acordada con el cliente: cada paca de cartón retornada equivale
 # a 50 lbs — se usa para reportar el retornable de cartón en libras, que es
@@ -759,9 +765,9 @@ def init_db():
             cur.executemany(
                 "INSERT INTO cat_camiones (placa, tipo, transportista, piloto, auxiliar) VALUES (%s,%s,%s,%s,%s) "
                 "ON CONFLICT (placa) DO NOTHING",
-                [("C-123ABC", "5 Ton", "Transportes Express", "Juan Pérez", "Carlos López"),
-                 ("C-456DEF", "10 Ton", "Logística del Norte", "María Rodríguez", "Pedro Gómez"),
-                 ("C-789GHI", "20 Ton", "Flota Interna", "Luis Martínez", "José Hernández")]
+                [("C-123ABC", "05TM", "Transportes Express", "Juan Pérez", "Carlos López"),
+                 ("C-456DEF", "10TM", "Logística del Norte", "María Rodríguez", "Pedro Gómez"),
+                 ("C-789GHI", "20TM", "Flota Interna", "Luis Martínez", "José Hernández")]
             )
             cur.executemany(
                 "INSERT INTO cat_clientes (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
@@ -777,8 +783,8 @@ def init_db():
                  ("UniSuper LTX", "UniSuper LTX Sur", 45.3)]
             )
             cur.executemany(
-                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon) VALUES (%s,%s) ON CONFLICT (tipo) DO NOTHING",
-                [("5 Ton", 8.0), ("10 Ton", 6.0), ("20 Ton", 4.0)]
+                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon, capacidad_cajas_default) VALUES (%s,%s,%s) ON CONFLICT (tipo) DO NOTHING",
+                [("05TM", 8.0, 480), ("10TM", 6.0, 700), ("20TM", 4.0, 1200)]
             )
             cur.executemany(
                 "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s) ON CONFLICT (cliente, cd) DO NOTHING",
@@ -879,17 +885,24 @@ def cargar_catalogos_desde_db():
         cur.execute("SELECT nombre FROM cat_auxiliares WHERE activo = TRUE ORDER BY nombre")
         auxiliares = [r["nombre"] for r in cur.fetchall()]
 
-        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar FROM cat_camiones WHERE activo = TRUE ORDER BY placa")
+        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar, capacidad_cajas FROM cat_camiones WHERE activo = TRUE ORDER BY placa")
         camiones = {r["placa"]: {"tipo": r["tipo"], "transportista": r["transportista"],
-                                  "piloto": r["piloto"], "auxiliar": r["auxiliar"]} for r in cur.fetchall()}
+                                  "piloto": r["piloto"], "auxiliar": r["auxiliar"],
+                                  "capacidad_cajas": r["capacidad_cajas"]} for r in cur.fetchall()}
 
         cur.execute("SELECT cliente, tienda, km, clasificacion FROM cat_clientes_tiendas ORDER BY cliente, tienda")
         clientes = {}
         for r in cur.fetchall():
             clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "clasificacion": r["clasificacion"] or "Local"}
 
-        cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion ORDER BY tipo")
-        rendimiento = {r["tipo"]: r["km_por_galon"] for r in cur.fetchall()}
+        cur.execute("SELECT tipo, km_por_galon, capacidad_cajas_default FROM cat_rendimiento_camion ORDER BY tipo")
+        _filas_rendimiento = cur.fetchall()
+        rendimiento = {r["tipo"]: r["km_por_galon"] for r in _filas_rendimiento}
+        # El catálogo de Rendimiento es la fuente real de qué tonelajes existen —
+        # agregar un tipo nuevo (ej. "15TM") se hace ahí, y automáticamente queda
+        # disponible para elegir al dar de alta un camión, sin tocar código.
+        tipos_camion = [r["tipo"] for r in _filas_rendimiento]
+        capacidad_cajas_default = {r["tipo"]: r["capacidad_cajas_default"] for r in _filas_rendimiento}
 
         cur.execute("SELECT nombre FROM cat_motivos_sin_pedido ORDER BY nombre")
         motivos_sin_pedido = [r["nombre"] for r in cur.fetchall()]
@@ -930,6 +943,8 @@ def cargar_catalogos_desde_db():
             "clientes_lista_activos": clientes_lista_activos,
             "motivos_sin_pedido": motivos_sin_pedido,
             "rendimiento": rendimiento,
+            "tipos_camion": tipos_camion,
+            "capacidad_cajas_default": capacidad_cajas_default,
             "cds_por_cliente": cds_por_cliente,
             "tipo_operacion_por_cd": tipo_operacion_por_cd,
             "clientes_en_prueba": clientes_en_prueba,
@@ -1147,6 +1162,21 @@ def actualizar_default_camion(placa, piloto, auxiliar):
 
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
+def normalizar_tonelaje(valor):
+    """Convierte variantes conocidas de tonelaje ('5 Ton', '05TN', '20 Ton'...)
+    al formato estándar ##TM. Devuelve None si no reconoce el valor — nunca
+    adivina un tonelaje que no haya visto antes, para no inventar datos."""
+    if not valor:
+        return None
+    limpio = str(valor).strip().upper().replace(" ", "")
+    if re.match(r"^\d{2}TM$", limpio):
+        return limpio
+    m = re.match(r"^0?(\d{1,2})(TON|TM|TN)?$", limpio)
+    if m:
+        return f"{int(m.group(1)):02d}TM"
+    return None
+
+
 CATALOGOS_CONFIG = {
     "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente"], "clave": ["nombre"], "numericas": [],
                 "opciones_desplegable": {"estado_cliente": ["Prueba", "Activo", "Inactivo"]}},
@@ -1156,15 +1186,15 @@ CATALOGOS_CONFIG = {
                "booleanas": ["activo"]},
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
                   "booleanas": ["activo"]},
-    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "activo"],
+    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "capacidad_cajas", "activo"],
                  "clave": ["placa"], "numericas": [], "booleanas": ["activo"],
-                 "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares"}},
+                 "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares", "tipo": "tipos_camion"}},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"],
                            "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]},
                            "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
-    "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
-                               "clave": ["tipo"], "numericas": ["km_por_galon"]},
+    "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon", "capacidad_cajas_default"],
+                               "clave": ["tipo"], "numericas": ["km_por_galon", "capacidad_cajas_default"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd", "tipo_operacion"],
                         "clave": ["cliente", "cd"], "numericas": [],
                         "opciones_desplegable": {"tipo_operacion": ["Distribución", "Transporte"]},
@@ -2657,7 +2687,7 @@ def pagina_despacho():
                         st.caption("Elige una placa para ver el transportista y la capacidad del camión.")
 
                     placa_furgon = ""
-                    if cap_pred == "20 Ton":
+                    if cap_pred == TIPO_CABEZAL_FURGON:
                         # Las unidades de 20 Ton llevan cabezal + furgón por separado —
                         # el furgón tiene su propia placa, y como el proveedor lo puede
                         # cambiar según disponibilidad, no vive en el catálogo de
@@ -2981,7 +3011,7 @@ def pagina_despacho():
                     st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
                 elif not piloto_final or not auxiliar_final:
                     st.error("❌ Error: Falta seleccionar Piloto y/o Auxiliar (revisa que el catálogo tenga al menos uno cargado).")
-                elif cap_pred == "20 Ton" and not placa_furgon:
+                elif cap_pred == TIPO_CABEZAL_FURGON and not placa_furgon:
                     st.error("❌ Error: Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                 elif marchamos_vacios:
                     st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
@@ -3004,7 +3034,7 @@ def pagina_despacho():
                         destinos_viaje=destinos_viaje,
                         cd_origen=cd_origen_final,
                         motivo_sin_pedido=motivo_seleccionado if viaje_sin_pedido else None,
-                        placa_furgon=placa_furgon if cap_pred == "20 Ton" else None,
+                        placa_furgon=placa_furgon if cap_pred == TIPO_CABEZAL_FURGON else None,
                         tipo_camion=cap_pred
                     )
                     if ok:
@@ -3348,7 +3378,7 @@ def pagina_gestion_viajes():
                             auxiliar_edit = viaje_g["auxiliar"]
 
                         placa_furgon_edit = ""
-                        if datos_cam.get("tipo") == "20 Ton":
+                        if datos_cam.get("tipo") == TIPO_CABEZAL_FURGON:
                             placa_furgon_edit = st.text_input(
                                 "Placa del Furgón (unidad de 20 Ton)",
                                 value=viaje_g.get("placa_furgon") or "", key=f"edit_furgon_{viaje_g['id']}"
@@ -3408,7 +3438,7 @@ def pagina_gestion_viajes():
                         if st.button("💾 Guardar Correcciones", key=f"btn_editar_{viaje_g['id']}"):
                             if not marchamo_regreso_edit.strip():
                                 st.error("❌ El Marchamo de Regreso es obligatorio.")
-                            elif datos_cam.get("tipo") == "20 Ton" and not placa_furgon_edit:
+                            elif datos_cam.get("tipo") == TIPO_CABEZAL_FURGON and not placa_furgon_edit:
                                 st.error("❌ Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                             else:
                                 ok, msg = editar_viaje(viaje_g["id"], placa_edit, transportista_edit, piloto_edit,
@@ -3833,16 +3863,42 @@ def pagina_catalogos():
                         st.warning("No hay usuarios disponibles para asignar todavía — créalos primero en la pestaña Usuarios.")
                         valores_form["usuario"] = ""
                 elif col == "tipo" and catalogo_sel == "Rendimiento por Camión":
-                    # Los tonelajes válidos son los que ya existen en el catálogo de
-                    # Camiones — así se evitan variantes como "5 Ton", "5 T", "05 Ton".
-                    tipos_existentes = sorted(set(
-                        c["tipo"] for c in st.session_state.catalogos["camiones"].values() if c["tipo"]
-                    ))
+                    # Este catálogo ES la fuente real de qué tonelajes existen — para
+                    # agregar uno nuevo (ej. "15TM") se escribe aquí. El formato ##TM
+                    # es obligatorio (se valida al guardar) para no volver a tener
+                    # variantes como "5 Ton", "15 TN", "05Ton" regadas en Camiones.
+                    valores_form["tipo"] = st.text_input(
+                        "Tipo (formato: 05TM, 10TM, 15TM...)", key=f"campo_{catalogo_sel}_tipo_txt",
+                        help="Dos dígitos + TM, sin espacios. Este valor es el que luego aparece "
+                             "como opción al dar de alta un camión."
+                    ).strip().upper()
+                elif col == "tipo" and catalogo_sel == "Camiones":
+                    # Ya no es texto libre — se elige de los tonelajes que existen en
+                    # Rendimiento por Camión (la fuente real). Evita por completo que
+                    # se cuele una variante nueva sin querer.
+                    tipos_existentes = st.session_state.catalogos["tipos_camion"]
                     if tipos_existentes:
-                        valores_form["tipo"] = st.selectbox("Tipo", tipos_existentes, key=f"campo_{catalogo_sel}_tipo_sel")
+                        valores_form["tipo"] = st.selectbox(
+                            "Tipo (tonelaje)", tipos_existentes, key=f"campo_{catalogo_sel}_tipo_sel",
+                            help="¿Necesitas un tonelaje que no está en la lista? Agrégalo primero en "
+                                 "el catálogo 'Rendimiento por Camión' — de ahí sale esta lista."
+                        )
                     else:
-                        st.warning("Todavía no hay ningún tonelaje registrado en el catálogo de Camiones.")
+                        st.warning("Todavía no hay ningún tonelaje registrado — agrega uno primero en "
+                                   "'Rendimiento por Camión'.")
                         valores_form["tipo"] = ""
+                elif col == "capacidad_cajas" and catalogo_sel == "Camiones":
+                    # Opcional de verdad (NULL, no 0) — si se deja en blanco, al usarse
+                    # se resuelve con el default de su tipo (cat_rendimiento_camion).
+                    _tipo_elegido = valores_form.get("tipo", "")
+                    _default_tipo = st.session_state.catalogos["capacidad_cajas_default"].get(_tipo_elegido)
+                    _placeholder_cap = f"usa el default de {_tipo_elegido} ({_default_tipo})" if _default_tipo else "sin default definido para este tipo"
+                    _cap_ingresada = st.number_input(
+                        "Capacidad en cajas (opcional — solo si este camión es distinto al estándar de su tipo)",
+                        min_value=0, step=1, value=None, placeholder=_placeholder_cap,
+                        key=f"campo_{catalogo_sel}_capacidad_cajas"
+                    )
+                    valores_form["capacidad_cajas"] = _cap_ingresada
                 elif col == "piloto" and catalogo_sel == "Camiones":
                     pilotos_existentes = sorted(st.session_state.catalogos["pilotos"])
                     valores_form["piloto"] = st.selectbox("Piloto", pilotos_existentes, key=f"campo_{catalogo_sel}_piloto_sel") if pilotos_existentes else ""
@@ -3880,6 +3936,8 @@ def pagina_catalogos():
                 faltan_llave = [c for c in config["clave"] if not str(valores_form[c]).strip()]
                 if faltan_llave:
                     st.error(f"❌ Debes llenar: {', '.join(faltan_llave)} (son la llave del registro).")
+                elif catalogo_sel == "Rendimiento por Camión" and not re.match(r"^\d{2}TM$", valores_form.get("tipo", "")):
+                    st.error("❌ El tipo debe tener el formato exacto ##TM (ej. 05TM, 10TM, 15TM) — dos dígitos, sin espacios.")
                 else:
                     # Si el registro trae un cliente que todavía no existe en el catálogo
                     # de Clientes, hay que crearlo primero — si no, la llave foránea lo rechaza.
@@ -3958,8 +4016,22 @@ def pagina_catalogos():
                 try:
                     df_nuevo = pd.read_excel(archivo, engine="openpyxl")
                     faltantes = [c for c in config["columnas"] if c not in df_nuevo.columns]
+                    _filas_sin_tonelaje_valido = []
+                    if not faltantes and config["tabla"] == "cat_camiones" and "tipo" in df_nuevo.columns:
+                        # Auto-corrige variantes conocidas ("5 Ton", "20TN"...) al formato
+                        # ##TM — y separa aparte las que no se pudieron reconocer, para que
+                        # las corrijas en el Excel en vez de que se suban con un tonelaje
+                        # inventado o inconsistente.
+                        _tipos_normalizados = df_nuevo["tipo"].apply(normalizar_tonelaje)
+                        _filas_sin_tonelaje_valido = df_nuevo.loc[_tipos_normalizados.isna(), ["placa", "tipo"]].values.tolist() if "placa" in df_nuevo.columns else []
+                        df_nuevo["tipo"] = _tipos_normalizados.where(_tipos_normalizados.notna(), df_nuevo["tipo"])
                     if faltantes:
                         st.error(f"❌ Al archivo le faltan estas columnas: {', '.join(faltantes)}")
+                    elif _filas_sin_tonelaje_valido:
+                        st.error("❌ Estas filas tienen un tonelaje que no se pudo reconocer — corrígelas en el "
+                                 "Excel al formato ##TM (05TM, 10TM, 20TM...) y vuelve a subirlo:")
+                        st.dataframe(pd.DataFrame(_filas_sin_tonelaje_valido, columns=["Placa", "Tipo en el archivo"]),
+                                     use_container_width=True, hide_index=True)
                     else:
                         st.markdown("#### Vista previa de lo que se va a cargar")
                         st.dataframe(df_nuevo[config["columnas"]], use_container_width=True)
@@ -4122,7 +4194,7 @@ def pagina_catalogos():
             else:
                 st.info("Todavía no hay ningún visit_type mapeado.")
 
-            _clientes_disponibles = list(st.session_state.catalogos["clientes"].keys())
+            _clientes_disponibles = st.session_state.catalogos["clientes_lista_activos"]
             _mc1, _mc2, _mc3 = st.columns([2, 2, 1])
             with _mc1:
                 _nuevo_visit_type = st.text_input("visit_type (tal cual aparece en SR)", key="nuevo_visit_type_sr")
