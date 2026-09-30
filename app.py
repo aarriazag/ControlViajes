@@ -1617,6 +1617,18 @@ def enviar_visita_simpliroute(viaje_id):
     return False, "SimpliRoute todavía no está conectado — este viaje sigue en modo manual dentro de Control de Ruta."
 
 
+def puente_sr(tipo, id_viaje, route_id_sr=None):
+    """Único punto de contacto de la app con el Control SR (que vive completo en
+    integracion_simpliroute.py). Nunca lanza: si algo falla, el mensaje queda
+    guardado en la sesión para mostrarse después de la recarga de pantalla."""
+    try:
+        ok, msg = sr_int.evento(get_conn, tipo, id_viaje, route_id_sr=route_id_sr)
+        if msg and not ok:
+            st.session_state["flash_sr"] = msg
+    except Exception:
+        pass
+
+
 def obtener_viajes_recientes(limite=10):
     with closing(get_conn()) as conn:
         return pd.read_sql_query(
@@ -3042,30 +3054,9 @@ def pagina_despacho():
                         # El camión "aprende" el piloto/auxiliar usado esta vez, para
                         # que la próxima vez ya salga como default (se puede cambiar).
                         actualizar_default_camion(placa, piloto_final, auxiliar_final)
-                        # Si este viaje vino de "Importar desde SimpliRoute", la Ruta en
-                        # SR probablemente todavía tiene el vehículo/piloto dummy de
-                        # Infor — ahora que el digitador ya eligió el camión/piloto
-                        # real, se reemplaza en SR con un PATCH. Best-effort: si falla,
-                        # el viaje ya quedó guardado igual, solo se avisa.
-                        _route_id_sr_pendiente = st.session_state.get(f"route_id_sr_{run}")
-                        if _route_id_sr_pendiente:
-                            try:
-                                _token_sr_reasignar = sr_int.obtener_token_sr_desde_vault(get_conn)
-                                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                                    _cur.execute("SELECT id_sr FROM cat_camiones WHERE placa = %s", (placa,))
-                                    _fila_cam = _cur.fetchone()
-                                    _cur.execute("SELECT id_sr FROM cat_pilotos WHERE nombre = %s", (piloto_final,))
-                                    _fila_pil = _cur.fetchone()
-                                _id_sr_cam = _fila_cam[0] if _fila_cam else None
-                                _id_sr_pil = _fila_pil[0] if _fila_pil else None
-                                if _id_sr_cam:
-                                    _ok_reasig, _msg_reasig = sr_int.reasignar_vehiculo_piloto_ruta_sr(
-                                        _route_id_sr_pendiente, _id_sr_cam, _id_sr_pil, token=_token_sr_reasignar
-                                    )
-                                    if not _ok_reasig:
-                                        st.warning(f"⚠️ El viaje se guardó bien, pero no se pudo actualizar el vehículo/piloto en SimpliRoute todavía: {_msg_reasig}")
-                            except Exception:
-                                pass
+                        # Control SR: vincula el viaje con su Ruta de SR y (si está activado en
+                        # integracion_simpliroute.py) reasigna camión/piloto reales allá.
+                        puente_sr("viaje_guardado", resultado, route_id_sr=st.session_state.get(f"route_id_sr_{run}"))
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.session_state.num_destinos = 1
                         st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
@@ -3445,6 +3436,7 @@ def pagina_gestion_viajes():
                                                        auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip(),
                                                        usuario_activo, placa_furgon=placa_furgon_edit or None)
                                 if ok:
+                                    puente_sr("viaje_editado", viaje_g["id_viaje"])
                                     st.success(f"Viaje {viaje_g['id_viaje']} corregido.")
                                     del st.session_state["viaje_gestion"]
                                     del st.session_state["destinos_gestion"]
@@ -3466,6 +3458,7 @@ def pagina_gestion_viajes():
                         else:
                             ok, msg = anular_viaje(viaje_g["id"], usuario_activo, motivo_anulacion.strip())
                             if ok:
+                                puente_sr("viaje_anulado", viaje_g["id_viaje"])
                                 st.success(f"Viaje {viaje_g['id_viaje']} anulado.")
                                 del st.session_state["viaje_gestion"]
                                 del st.session_state["destinos_gestion"]
@@ -4213,6 +4206,9 @@ def pagina_catalogos():
                         _conn.commit()
                     st.rerun()
 
+        with st.expander(":material/fact_check: Control SR — ¿lo que cambié llegó a SimpliRoute?", expanded=False):
+            sr_int.render_control_sr(st, get_conn, token=token_sr)
+
 # ==========================================
 # MÓDULO 6: GESTIÓN DE USUARIOS — SuperAdministrador ve y administra a todos;
 # Administrador administra Operador/Liquidador/Supervisor (no puede tocar
@@ -4444,6 +4440,13 @@ pagina_actual = st.navigation([
     st.Page(pagina_usuarios, title="Usuarios", icon=":material/manage_accounts:"),
     st.Page(pagina_dashboards, title="Dashboards", icon=":material/dashboard:"),
 ])
+try:
+    _flash_sr = st.session_state.pop("flash_sr", None)
+    if _flash_sr:
+        st.warning(f"⚠️ SimpliRoute: {_flash_sr}")
+except Exception:
+    pass
+
 pagina_actual.run()
 
 # ==========================================

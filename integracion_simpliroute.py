@@ -547,12 +547,31 @@ def importar_rutas_sr(fecha, token=None):
 def reasignar_vehiculo_piloto_ruta_sr(route_id, id_sr_vehiculo, id_sr_piloto, token=None):
     """PATCH a una Ruta existente para reemplazar el vehículo/piloto (ej. el
     dummy de Infor) por el camión/piloto real que se asignó en Control de
-    Ruta. Nunca lanza — mismo patrón de siempre."""
-    payload = {"vehicle": id_sr_vehiculo, "driver": id_sr_piloto}
+    Ruta. Nunca lanza — mismo patrón de siempre.
+
+    Dos protecciones sobre la versión anterior:
+      - Si el piloto NO tiene id_sr, ya no se manda `driver` (antes se mandaba
+        null, y SR podía dejar la Ruta sin piloto). Solo se cambia el vehículo.
+      - Después del PATCH se consulta la Ruta de nuevo para CONFIRMAR que el
+        vehículo (y el piloto, si se mandó) quedaron como se pidió — que SR
+        responda 200 no garantiza que el cambio haya quedado."""
+    payload = {"vehicle": id_sr_vehiculo}
+    if id_sr_piloto:
+        payload["driver"] = id_sr_piloto
     ok, data = _sr_request("PATCH", f"routes/routes/{route_id}/", token=token, json=payload)
     if not ok:
         return False, data
-    return True, "Vehículo/piloto reasignados en SimpliRoute."
+
+    ok_v, ruta = obtener_ruta_sr(route_id, token=token)
+    if not ok_v:
+        return True, f"Enviado a SimpliRoute, pero no se pudo confirmar con una consulta posterior: {ruta}"
+    if str(ruta.get("vehicle")) != str(id_sr_vehiculo):
+        return False, "SimpliRoute respondió que sí, pero la Ruta sigue con otro vehículo — el cambio no quedó."
+    if id_sr_piloto and str(ruta.get("driver")) != str(id_sr_piloto):
+        return False, "SimpliRoute respondió que sí, pero la Ruta sigue con otro piloto — el cambio no quedó."
+    if id_sr_piloto:
+        return True, "Vehículo y piloto reasignados y confirmados en SimpliRoute."
+    return True, "Vehículo reasignado y confirmado en SimpliRoute (el piloto no se tocó: no tiene id_sr)."
 
 
 def obtener_ruta_sr(route_id_sr, token=None):
@@ -582,3 +601,293 @@ def obtener_ruta_sr(route_id_sr, token=None):
         "start_time": ruta.get("start_time"),
         "end_time": ruta.get("end_time"),
     }
+
+
+
+# ===========================================================================
+# CONTROL SR — vínculo viaje <-> Ruta, verificación y reenvío
+# ===========================================================================
+# Todo el "control" vive aquí. app.py solo tiene un puente delgado
+# (puente_sr) que llama a evento() y a render_control_sr(); cualquier ajuste
+# futuro se hace en este archivo sin volver a tocar app.py.
+#
+# INTERRUPTORES (se cambian aquí, sin tocar app.py):
+SR_CONTROL_ACTIVO = True      # False = apaga TODO este bloque (la app sigue igual)
+ENVIAR_AL_GUARDAR = True      # True = mismo comportamiento que ya tenía la app: al guardar
+                              #        un viaje importado de SR, manda camión/piloto reales a SR
+ENVIAR_CAMBIOS_A_SR = False   # False = "observar": al EDITAR un viaje no se escribe nada en SR
+                              #        (solo se registra y el semáforo lo marca). True = al editar
+                              #        se reenvía camión/piloto, y se habilita el botón "Reenviar"
+MAX_VERIFICACIONES = 40       # tope de Rutas consultadas por clic (cuida el límite 429 de SR)
+
+from contextlib import closing
+
+_TABLA_VINCULO_LISTA = False
+
+
+def _asegurar_tabla_vinculo(conn):
+    """Crea la tabla propia del control la primera vez. No toca `viajes`."""
+    global _TABLA_VINCULO_LISTA
+    if _TABLA_VINCULO_LISTA:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sr_vinculo_viaje (
+                id_viaje TEXT PRIMARY KEY,
+                route_id_sr TEXT NOT NULL,
+                creado TIMESTAMP DEFAULT NOW(),
+                ultimo_evento TEXT,
+                ultimo_intento TIMESTAMP,
+                estado TEXT,
+                ultimo_mensaje TEXT
+            )
+        """)
+    conn.commit()
+    _TABLA_VINCULO_LISTA = True
+
+
+def _registrar(get_conn_fn, id_viaje, evento_txt, estado, mensaje):
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sr_vinculo_viaje SET ultimo_evento=%s, ultimo_intento=NOW(), estado=%s, ultimo_mensaje=%s "
+            "WHERE id_viaje=%s",
+            (evento_txt, estado, (mensaje or "")[:500], id_viaje)
+        )
+        conn.commit()
+
+
+def _leer_vinculo_y_viaje(get_conn_fn, id_viaje):
+    """Devuelve dict con route_id, placa, piloto, estado del viaje e ids de SR
+    del camión/piloto — o None si el viaje no tiene Ruta vinculada."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT s.route_id_sr, v.placa, v.piloto, v.estado FROM sr_vinculo_viaje s "
+            "JOIN viajes v ON v.id_viaje = s.id_viaje WHERE s.id_viaje = %s", (id_viaje,)
+        )
+        fila = cur.fetchone()
+        if not fila:
+            return None
+        route_id, placa, piloto, estado = fila
+        cur.execute("SELECT id_sr FROM cat_camiones WHERE placa = %s", (placa,))
+        f = cur.fetchone()
+        id_cam = f[0] if f else None
+        id_pil = None
+        if piloto:
+            cur.execute("SELECT id_sr FROM cat_pilotos WHERE nombre = %s", (piloto,))
+            f = cur.fetchone()
+            id_pil = f[0] if f else None
+    return {"route_id": route_id, "placa": placa, "piloto": piloto, "estado": estado,
+            "id_sr_camion": id_cam, "id_sr_piloto": id_pil}
+
+
+def reenviar_viaje(get_conn_fn, id_viaje, token=None):
+    """Manda a SR el camión/piloto que Control de Ruta tiene AHORA para este
+    viaje, y confirma que quedó. Devuelve (ok, mensaje). Nunca lanza."""
+    try:
+        d = _leer_vinculo_y_viaje(get_conn_fn, id_viaje)
+        if not d:
+            return False, "Este viaje no tiene una Ruta de SimpliRoute vinculada."
+        if d["estado"] == "Anulado":
+            return False, "El viaje está anulado en Control de Ruta — no se reenvía nada."
+        if not d["id_sr_camion"]:
+            return False, (f"El camión {d['placa']} no tiene id_sr — sincronízalo primero en "
+                           "Catálogos → Integración SimpliRoute.")
+        token = token or obtener_token_sr_desde_vault(get_conn_fn)
+        if not token:
+            return False, "No hay token de SimpliRoute configurado en el Vault."
+        ok, msg = reasignar_vehiculo_piloto_ruta_sr(
+            d["route_id"], d["id_sr_camion"], d["id_sr_piloto"], token=token
+        )
+        _registrar(get_conn_fn, id_viaje, "reenvio", "ok" if ok else "error", msg)
+        return ok, msg
+    except Exception as e:
+        return False, f"Error inesperado al reenviar a SimpliRoute: {e}"
+
+
+def evento(get_conn_fn, tipo, id_viaje, route_id_sr=None, token=None):
+    """Único punto de entrada desde app.py. `tipo`: 'viaje_guardado',
+    'viaje_editado' o 'viaje_anulado'. Devuelve (ok, mensaje): app.py solo
+    muestra el mensaje si ok=False. Nunca lanza."""
+    if not SR_CONTROL_ACTIVO:
+        return True, ""
+    try:
+        with closing(get_conn_fn()) as conn:
+            _asegurar_tabla_vinculo(conn)
+
+        if tipo == "viaje_guardado":
+            if not route_id_sr:
+                return True, ""  # viaje creado a mano: no hay Ruta de SR que vincular
+            with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sr_vinculo_viaje (id_viaje, route_id_sr, ultimo_evento, ultimo_intento, estado) "
+                    "VALUES (%s, %s, 'guardado', NOW(), 'vinculado') "
+                    "ON CONFLICT (id_viaje) DO UPDATE SET route_id_sr = EXCLUDED.route_id_sr",
+                    (id_viaje, str(route_id_sr))
+                )
+                conn.commit()
+            if ENVIAR_AL_GUARDAR:
+                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token)
+                if not ok:
+                    return False, (f"El viaje {id_viaje} se guardó bien, pero no se pudo actualizar el "
+                                   f"vehículo/piloto en SimpliRoute: {msg}")
+            return True, ""
+
+        if tipo == "viaje_editado":
+            if not _leer_vinculo_y_viaje(get_conn_fn, id_viaje):
+                return True, ""  # este viaje nunca tuvo Ruta de SR
+            if ENVIAR_CAMBIOS_A_SR:
+                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token)
+                if not ok:
+                    return False, (f"El viaje {id_viaje} se corrigió bien, pero el cambio no llegó a "
+                                   f"SimpliRoute: {msg}")
+            else:
+                _registrar(get_conn_fn, id_viaje, "editado", "cambio_sin_enviar",
+                           "Se editó en Control de Ruta; el envío a SR está en modo observar.")
+            return True, ""
+
+        if tipo == "viaje_anulado":
+            if _leer_vinculo_y_viaje(get_conn_fn, id_viaje):
+                _registrar(get_conn_fn, id_viaje, "anulado", "anulado_en_cr",
+                           "Viaje anulado en Control de Ruta; la Ruta en SR no se toca.")
+            return True, ""
+
+        return True, ""
+    except Exception as e:
+        return False, f"Control SR: {e}"
+
+
+def verificar_viaje(get_conn_fn, id_viaje, token=None):
+    """Compara lo que Control de Ruta tiene del viaje contra la Ruta real en
+    SR. Devuelve dict {id_viaje, route_id, semaforo, detalle, reenviable}.
+    Solo LEE de SR. No compara cajas (son medidas distintas) ni estado de
+    entrega (ahí manda SR)."""
+    base = {"id_viaje": id_viaje, "route_id": None, "semaforo": "⚠️", "detalle": "", "reenviable": False}
+    try:
+        d = _leer_vinculo_y_viaje(get_conn_fn, id_viaje)
+        if not d:
+            base["detalle"] = "Sin Ruta de SR vinculada."
+            return base
+        base["route_id"] = d["route_id"]
+        ok, ruta = obtener_ruta_sr(d["route_id"], token=token)
+        if not ok:
+            if "404" in str(ruta):
+                base.update(semaforo="❌", detalle="La Ruta ya no existe en SimpliRoute.")
+            else:
+                base["detalle"] = f"No se pudo consultar SR: {ruta}"
+            return base
+
+        problemas = []
+        cambio_reenviable = False
+        if d["estado"] == "Anulado":
+            problemas.append("Viaje anulado en Control de Ruta, pero la Ruta sigue viva en SR")
+        else:
+            if not d["id_sr_camion"]:
+                problemas.append(f"El camión {d['placa']} no tiene id_sr")
+            elif str(ruta.get("vehicle")) != str(d["id_sr_camion"]):
+                problemas.append(f"SR tiene otro vehículo distinto a {d['placa']} (posible dummy de Infor)")
+                cambio_reenviable = True
+            if not d["id_sr_piloto"]:
+                problemas.append(f"El piloto {d['piloto']} no tiene id_sr")
+            elif str(ruta.get("driver")) != str(d["id_sr_piloto"]):
+                problemas.append(f"SR tiene otro piloto distinto a {d['piloto']}")
+                cambio_reenviable = True
+
+        if problemas:
+            base.update(semaforo="⚠️", detalle="; ".join(problemas),
+                        reenviable=bool(cambio_reenviable and d["id_sr_camion"]))
+        else:
+            base.update(semaforo="✅", detalle="Camión y piloto coinciden con SR.")
+        return base
+    except Exception as e:
+        base["detalle"] = f"Error inesperado al verificar: {e}"
+        return base
+
+
+def render_control_sr(st, get_conn_fn, token=None):
+    """Pantalla 'Control SR' (Administrador/SuperAdministrador/Supervisor).
+    Recibe `st` como parámetro para que el módulo siga sin depender de
+    Streamlit al importarse. Cualquier fallo se muestra aquí adentro y nunca
+    afecta al resto de la pantalla."""
+    try:
+        _render_control_sr(st, get_conn_fn, token)
+    except Exception as e:
+        st.error(f"⚠️ El Control SR no pudo cargarse: {e}. El resto de la app no se afecta.")
+
+
+def _render_control_sr(st, get_conn_fn, token):
+    if not SR_CONTROL_ACTIVO:
+        st.info("El Control SR está apagado (SR_CONTROL_ACTIVO = False en integracion_simpliroute.py).")
+        return
+
+    with closing(get_conn_fn()) as conn:
+        _asegurar_tabla_vinculo(conn)
+
+    modo = "ENVIAR cambios a SR" if ENVIAR_CAMBIOS_A_SR else "OBSERVAR (al editar no se escribe nada en SR)"
+    st.caption(f"Modo actual: **{modo}**. Compara camión y piloto del viaje contra la Ruta real en SimpliRoute. "
+               "No compara cajas ni estado de entrega.")
+
+    fecha = st.date_input("Fecha de los viajes", value=datetime.now().date(), key="ctl_sr_fecha")
+    fecha_txt = str(fecha)
+
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT v.id_viaje, v.cliente, v.placa, v.piloto, v.estado, s.estado, s.ultimo_mensaje "
+            "FROM viajes v JOIN sr_vinculo_viaje s ON s.id_viaje = v.id_viaje "
+            "WHERE v.fecha_creacion = %s ORDER BY v.id_viaje", (fecha_txt,)
+        )
+        filas = cur.fetchall()
+        cur.execute(
+            "SELECT COUNT(*) FROM viajes v WHERE v.fecha_creacion = %s AND v.estado != 'Anulado' "
+            "AND NOT EXISTS (SELECT 1 FROM sr_vinculo_viaje s WHERE s.id_viaje = v.id_viaje)", (fecha_txt,)
+        )
+        sin_vinculo = cur.fetchone()[0]
+
+    if sin_vinculo:
+        st.caption(f"{sin_vinculo} viaje(s) de ese día no tienen Ruta de SR vinculada (creados a mano, "
+                   "o antes de activar este control) — no se pueden verificar.")
+    if not filas:
+        st.info("No hay viajes con Ruta de SR vinculada en esa fecha.")
+        return
+
+    st.dataframe(
+        [{"Viaje": f[0], "Cliente": f[1], "Camión": f[2], "Piloto": f[3], "Estado viaje": f[4],
+          "Último envío a SR": f[5] or "", "Detalle": f[6] or ""} for f in filas],
+        use_container_width=True, hide_index=True
+    )
+
+    token = token or obtener_token_sr_desde_vault(get_conn_fn)
+    if not token:
+        st.warning("⚠️ No hay token de SimpliRoute en el Vault — no se puede verificar contra SR.")
+        return
+
+    if st.button(":material/fact_check: Verificar contra SimpliRoute", key="ctl_sr_verificar"):
+        resultados = []
+        lote = filas[:MAX_VERIFICACIONES]
+        barra = st.progress(0.0)
+        for i, f in enumerate(lote):
+            resultados.append(verificar_viaje(get_conn_fn, f[0], token=token))
+            barra.progress((i + 1) / len(lote))
+        barra.empty()
+        st.session_state["ctl_sr_resultado"] = {"fecha": fecha_txt, "filas": resultados,
+                                                "recortado": len(filas) > MAX_VERIFICACIONES}
+        st.rerun()
+
+    res = st.session_state.get("ctl_sr_resultado")
+    if res and res["fecha"] == fecha_txt:
+        if res["recortado"]:
+            st.caption(f"Se verificaron solo los primeros {MAX_VERIFICACIONES} viajes (para no saturar a SR).")
+        st.dataframe(
+            [{"": r["semaforo"], "Viaje": r["id_viaje"], "Ruta SR": r["route_id"] or "", "Resultado": r["detalle"]}
+             for r in res["filas"]],
+            use_container_width=True, hide_index=True
+        )
+        pendientes = [r for r in res["filas"] if r["reenviable"]]
+        if pendientes and not ENVIAR_CAMBIOS_A_SR:
+            st.caption("Hay diferencias que se podrían corregir con 'Reenviar', pero el modo actual es OBSERVAR: "
+                       "el botón se habilita al poner ENVIAR_CAMBIOS_A_SR = True en integracion_simpliroute.py.")
+        elif pendientes:
+            for r in pendientes:
+                if st.button(f":material/send: Reenviar {r['id_viaje']} a SR", key=f"ctl_sr_reenviar_{r['id_viaje']}"):
+                    ok, msg = reenviar_viaje(get_conn_fn, r["id_viaje"], token=token)
+                    st.session_state.pop("ctl_sr_resultado", None)
+                    (st.success if ok else st.error)(f"{r['id_viaje']}: {msg}")
