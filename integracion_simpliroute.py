@@ -143,6 +143,44 @@ def normalizar_placa(placa):
     return limpio
 
 
+# Formato de nombres de catálogo (pilotos, transportistas, tiendas...).
+# Las dos listas se editan aquí, en un solo lugar.
+CONECTORES_NOMBRE = {"de", "del", "la", "las", "los", "y", "e", "da", "do", "van", "von"}
+SIGLAS_NOMBRE = {"S.A.", "S.A", "SA", "S.A.S.", "CD", "KFC", "IVA", "TM", "II", "III"}
+
+
+def normalizar_nombre_catalogo(valor, modo="entidad"):
+    """Da un formato uniforme (Mayúscula Inicial) a un nombre de catálogo.
+
+    modo="persona" (pilotos, auxiliares): SIEMPRE Mayúscula Inicial; los
+      conectores (de, del, la, los, y...) quedan en minúscula.
+    modo="entidad" (clientes, transportistas, tiendas, CDs...): solo corrige
+      lo que viene TODO en mayúsculas o TODO en minúsculas. Si ya trae formato
+      propio (ej. "UniSuper Importados") no se toca.
+    En ambos: se quitan espacios sobrantes, se respetan los acentos y las
+    siglas de SIGLAS_NOMBRE se conservan en mayúsculas. Nunca lanza."""
+    try:
+        if valor is None:
+            return valor
+        s = re.sub(r"\s+", " ", str(valor)).strip()
+        s = re.sub(r"\s+,", ",", s)
+        if not s:
+            return s
+        if modo == "entidad" and any(c.isupper() for c in s) and any(c.islower() for c in s):
+            return s
+        palabras = []
+        for i, p in enumerate(s.split(" ")):
+            if p.strip(",").upper() in SIGLAS_NOMBRE:
+                palabras.append(p.upper())
+            elif i > 0 and p.lower() in CONECTORES_NOMBRE:
+                palabras.append(p.lower())
+            else:
+                palabras.append("-".join(t[:1].upper() + t[1:].lower() for t in p.split("-")))
+        return " ".join(palabras)
+    except Exception:
+        return valor
+
+
 def buscar_vehiculo_sr_por_placa(placa, token=None):
     """GET /routes/vehicles/ y busca coincidencia exacta por license_plate
     (ya normalizada). Se usa SOLO la primera vez que un camión se sincroniza
@@ -354,45 +392,83 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
     if not ok:
         return False, f"No se pudo consultar SimpliRoute: {drivers}"
 
-    nuevos, actualizados, en_revision, con_error = 0, 0, 0, []
+    nuevos, actualizados, renombrados, en_revision, con_error = 0, 0, 0, 0, []
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
         for d in drivers:
             id_sr = d.get("id")
-            nombre_sr = (d.get("name") or "").strip() or d.get("username", f"Piloto SR {id_sr}")
+            nombre_raw = (d.get("name") or "").strip() or d.get("username", f"Piloto SR {id_sr}")
+            # Mismo formato que la captura manual, ANTES de comparar nada: así
+            # SR puede mandar "JUAN PEREZ" y en Control de Ruta sigue siendo
+            # "Juan Perez". La vinculación es siempre por id_sr, nunca por nombre.
+            nombre_sr = normalizar_nombre_catalogo(nombre_raw, "persona")
+            cur.execute("SAVEPOINT sp_piloto")  # un fallo en un piloto no debe abortar a los demás
             try:
                 cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (id_sr,))
                 fila = cur.fetchone()
                 if fila:
+                    nombre_actual = fila[0]
+                    if nombre_actual == f"{nombre_sr} (SR {id_sr})":
+                        # Homónimo que esta misma sincronización creó aparte a propósito:
+                        # no se vuelve a intentar renombrar (evitaría avisar en cada corrida).
+                        cur.execute("UPDATE cat_pilotos SET fecha_sincronizacion_sr = %s WHERE id_sr = %s",
+                                    (datetime.now(), id_sr))
+                        actualizados += 1
+                        cur.execute("RELEASE SAVEPOINT sp_piloto")
+                        continue
+                    if nombre_actual != nombre_sr:
+                        # ¿otro piloto (otra persona) ya se llama así? Entonces NO se renombra.
+                        cur.execute(
+                            "SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s) "
+                            "AND id_sr IS DISTINCT FROM %s",
+                            (nombre_sr, id_sr)
+                        )
+                        if cur.fetchone():
+                            con_error.append((id_sr, f"'{nombre_sr}' ya lo usa otro piloto — no se renombró '{nombre_actual}'"))
+                            cur.execute("UPDATE cat_pilotos SET fecha_sincronizacion_sr = %s WHERE id_sr = %s",
+                                        (datetime.now(), id_sr))
+                            cur.execute("RELEASE SAVEPOINT sp_piloto")
+                            continue
+                        renombrados += 1
                     cur.execute(
                         "UPDATE cat_pilotos SET nombre = %s, fecha_sincronizacion_sr = %s WHERE id_sr = %s",
                         (nombre_sr, datetime.now(), id_sr)
                     )
                     actualizados += 1
+                    cur.execute("RELEASE SAVEPOINT sp_piloto")
                     continue
 
-                # id_sr nuevo — ¿el nombre choca con un piloto local sin vincular?
+                # id_sr nuevo — ¿ya hay un piloto local con ese nombre (sin distinguir mayúsculas)?
                 cur.execute(
-                    "SELECT nombre FROM cat_pilotos WHERE nombre = %s AND id_sr IS NULL",
+                    "SELECT nombre, id_sr FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)",
                     (nombre_sr,)
                 )
                 choque = cur.fetchone()
-                if choque:
+                if choque and choque[1] is None:
+                    # Mismo nombre que un piloto local SIN vincular: no se fusiona solo
+                    # (podrían ser dos personas). Se guarda el nombre LOCAL para que los
+                    # botones de la cola de revisión encuentren a ese piloto.
                     cur.execute(
                         "INSERT INTO cat_pilotos_revision_nombre (nombre, id_sr, fecha_deteccion) "
                         "VALUES (%s, %s, %s) ON CONFLICT (id_sr) DO NOTHING",
-                        (nombre_sr, id_sr, datetime.now())
+                        (choque[0], id_sr, datetime.now())
                     )
                     en_revision += 1
                 else:
+                    # Sin choque, o el nombre ya pertenece a un piloto vinculado a OTRO id_sr
+                    # (dos personas con el mismo nombre): se crea pendiente, con el id_sr al
+                    # final del nombre para no pisar ni fusionar con el otro.
+                    nombre_nuevo = nombre_sr if not choque else f"{nombre_sr} (SR {id_sr})"
                     cur.execute(
                         "INSERT INTO cat_pilotos (nombre, id_sr, activo, pendiente_completar, "
                         "fecha_sincronizacion_sr) VALUES (%s, %s, FALSE, TRUE, %s) "
                         "ON CONFLICT (nombre) DO NOTHING",
-                        (nombre_sr, id_sr, datetime.now())
+                        (nombre_nuevo, id_sr, datetime.now())
                     )
                     nuevos += 1
+                cur.execute("RELEASE SAVEPOINT sp_piloto")
             except Exception as e:
-                con_error.append((id_sr, str(e)))
+                cur.execute("ROLLBACK TO SAVEPOINT sp_piloto")
+                con_error.append((id_sr, (str(e).splitlines() or ["error"])[0]))
         conn.commit()
 
         cur.execute(
@@ -406,9 +482,12 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
         conn.commit()
 
     resumen = (f"{nuevos} piloto(s) nuevo(s) (pendientes de completar), "
-               f"{actualizados} actualizado(s), {en_revision} en revisión por nombre duplicado.")
+               f"{actualizados} actualizado(s) ({renombrados} con el nombre ajustado), "
+               f"{en_revision} en revisión por nombre duplicado.")
     if con_error:
-        resumen += f" {len(con_error)} con error — revisar logs."
+        resumen += (f" {len(con_error)} sin procesar: "
+                    + "; ".join(f"id_sr {i}: {m}" for i, m in con_error[:3])
+                    + ("…" if len(con_error) > 3 else "."))
     return True, resumen
 
 
