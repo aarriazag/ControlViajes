@@ -144,41 +144,101 @@ def normalizar_placa(placa):
 
 
 # Formato de nombres de catálogo (pilotos, transportistas, tiendas...).
-# Las dos listas se editan aquí, en un solo lugar.
 CONECTORES_NOMBRE = {"de", "del", "la", "las", "los", "y", "e", "da", "do", "van", "von"}
-SIGLAS_NOMBRE = {"S.A.", "S.A", "SA", "S.A.S.", "CD", "KFC", "IVA", "TM", "II", "III"}
+# Siglas de respaldo, SOLO si no se puede leer la tabla cat_siglas. La lista de verdad vive en
+# Catálogos → Siglas (la puede editar un Administrador sin tocar el código).
+SIGLAS_NOMBRE = {"S.A.", "S.A", "SA", "SAS", "S.A.S.", "CD", "CEDI", "KFC", "IVA", "TM", "II", "III", "IV", "DHL", "UPS"}
 
 
-def normalizar_nombre_catalogo(valor, modo="entidad"):
+def _es_sigla(token, siglas):
+    """¿Esta palabra es una sigla que debe ir TODA en mayúsculas?
+    Sí si: (1) está en la lista de siglas; (2) son letras separadas por puntos (S.A., S.R.L.);
+    (3) es una palabra corta de hasta 4 letras SIN vocales (MYM, SRL, LTDA, JC); o (4) empieza con
+    número y trae letras (10TM, 5T, 4X4)."""
+    base = token.strip(",")
+    if not base:
+        return False
+    if base.upper() in siglas:
+        return True
+    if re.fullmatch(r"[A-Za-z](\.[A-Za-z])+\.?", base):
+        return True
+    if re.fullmatch(r"[A-Za-z]{1,4}", base) and not re.search(r"[aeiou]", base, re.I) and base.lower() != "y":
+        return True
+    if re.fullmatch(r"[0-9][0-9A-Za-z]*", base) and re.search(r"[A-Za-z]", base):
+        return True
+    return False
+
+
+def normalizar_nombre_catalogo(valor, modo="entidad", siglas=None):
     """Da un formato uniforme (Mayúscula Inicial) a un nombre de catálogo.
 
-    modo="persona" (pilotos, auxiliares): SIEMPRE Mayúscula Inicial; los
-      conectores (de, del, la, los, y...) quedan en minúscula.
-    modo="entidad" (clientes, transportistas, tiendas, CDs...): solo corrige
-      lo que viene TODO en mayúsculas o TODO en minúsculas. Si ya trae formato
-      propio (ej. "UniSuper Importados") no se toca.
-    En ambos: se quitan espacios sobrantes, se respetan los acentos y las
-    siglas de SIGLAS_NOMBRE se conservan en mayúsculas. Nunca lanza."""
+    modo="persona" (pilotos, auxiliares): SIEMPRE Mayúscula Inicial; los conectores
+      (de, del, la, los, y...) quedan en minúscula.
+    modo="entidad" (clientes, transportistas, tiendas, CDs...): lo que viene TODO en mayúsculas o TODO
+      en minúsculas pasa a Mayúscula Inicial; si ya trae formato propio (ej. "UniSuper Importados")
+      se respeta, salvo que las siglas se ponen siempre en mayúsculas ("Transportes Mym" -> "Transportes MYM").
+    `siglas`: conjunto de siglas (de Catálogos → Siglas). Si no se da, se usa la lista de respaldo.
+    En ambos: se quitan espacios sobrantes y se respetan los acentos. Nunca lanza."""
     try:
         if valor is None:
             return valor
+        siglas = SIGLAS_NOMBRE if siglas is None else siglas
         s = re.sub(r"\s+", " ", str(valor)).strip()
         s = re.sub(r"\s+,", ",", s)
         if not s:
             return s
+        # "(SR 123)" / "(SR)" al final lo pone el sistema al separar pilotos homónimos: se respeta tal cual
+        sufijo = ""
+        m_suf = re.search(r"\s\(SR(?: [0-9]+)?\)$", s)
+        if m_suf:
+            sufijo = m_suf.group(0)
+            s = s[:m_suf.start()]
+        partes = s.split(" ")
         if modo == "entidad" and any(c.isupper() for c in s) and any(c.islower() for c in s):
-            return s
+            return " ".join(p.upper() if _es_sigla(p, siglas) else p for p in partes) + sufijo
         palabras = []
-        for i, p in enumerate(s.split(" ")):
-            if p.strip(",").upper() in SIGLAS_NOMBRE:
+        for i, p in enumerate(partes):
+            siguiente = partes[i + 1] if i + 1 < len(partes) else ""
+            if _es_sigla(p, siglas):
                 palabras.append(p.upper())
-            elif i > 0 and p.lower() in CONECTORES_NOMBRE:
+            elif i > 0 and p.lower() in CONECTORES_NOMBRE and not siguiente[:1].isdigit():
+                # (un conector seguido de número es parte del nombre: "Los 4", "Las 3 Marías")
                 palabras.append(p.lower())
             else:
                 palabras.append("-".join(t[:1].upper() + t[1:].lower() for t in p.split("-")))
-        return " ".join(palabras)
+        return " ".join(palabras) + sufijo
     except Exception:
         return valor
+
+
+def _cargar_siglas(cur):
+    """Lee Catálogos → Siglas. Devuelve un conjunto en mayúsculas, o None si no se pudo leer
+    (en ese caso se usa la lista de respaldo). Aislado en un SAVEPOINT para que un fallo aquí
+    nunca arruine la operación de guardado que está en curso."""
+    try:
+        cur.execute("SAVEPOINT sp_siglas")
+        cur.execute("SELECT sigla FROM cat_siglas")
+        lista = {str(r[0]).strip().upper() for r in cur.fetchall() if r[0]}
+        cur.execute("RELEASE SAVEPOINT sp_siglas")
+        return lista
+    except Exception:
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_siglas")
+        except Exception:
+            pass
+        return None
+
+
+def asegurar_esquema_formato(conn):
+    """Crea Catálogos → Siglas (tabla cat_siglas) la primera vez y la llena con las siglas
+    comunes. Si ya existe, no toca nada (así lo que se borre a propósito no reaparece)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.cat_siglas')")
+        if cur.fetchone()[0] is None:
+            cur.execute("CREATE TABLE cat_siglas (sigla TEXT PRIMARY KEY)")
+            for s in sorted(SIGLAS_NOMBRE):
+                cur.execute("INSERT INTO cat_siglas (sigla) VALUES (%s) ON CONFLICT DO NOTHING", (s,))
+    conn.commit()
 
 
 def buscar_vehiculo_sr_por_placa(placa, token=None):
@@ -394,13 +454,14 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
 
     nuevos, actualizados, renombrados, en_revision, con_error = 0, 0, 0, 0, []
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        siglas = _cargar_siglas(cur)
         for d in drivers:
             id_sr = d.get("id")
             nombre_raw = (d.get("name") or "").strip() or d.get("username", f"Piloto SR {id_sr}")
             # Mismo formato que la captura manual, ANTES de comparar nada: así
             # SR puede mandar "JUAN PEREZ" y en Control de Ruta sigue siendo
             # "Juan Perez". La vinculación es siempre por id_sr, nunca por nombre.
-            nombre_sr = normalizar_nombre_catalogo(nombre_raw, "persona")
+            nombre_sr = normalizar_nombre_catalogo(nombre_raw, "persona", siglas)
             cur.execute("SAVEPOINT sp_piloto")  # un fallo en un piloto no debe abortar a los demás
             try:
                 cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (id_sr,))
@@ -712,6 +773,112 @@ def asegurar_esquema_sr(conn):
             )
         """)
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Formato de nombres al GUARDAR en catálogos (formulario, tabla en pantalla y Excel)
+# ---------------------------------------------------------------------------
+# Cada catálogo dice qué columnas son nombres, de qué tipo (persona/entidad) y contra
+# qué se comparan para reutilizar el nombre que YA existe (sin distinguir mayúsculas):
+#   ("tabla", "columna")            -> nombre existente en esa tabla (ej. el cliente de una tienda
+#                                      se ajusta al nombre que ya tiene cat_clientes)
+#   ("tabla", "columna", "cliente") -> igual, pero solo entre filas del mismo cliente (tiendas, CDs)
+#   None                            -> solo se le da formato, no se compara con nada
+# Un nombre que YA existe se respeta tal cual está (no se pelea con lo que hay en la base);
+# solo a lo NUEVO se le da formato. Lo ya existente se corrige con el SQL de formato de nombres.
+FORMATO_CATALOGOS = {
+    "cat_clientes":           [("nombre", "entidad", ("cat_clientes", "nombre"))],
+    "cat_transportistas":     [("nombre", "entidad", ("cat_transportistas", "nombre")),
+                               ("razon_social", "entidad", None)],
+    "cat_pilotos":            [("nombre", "persona", ("cat_pilotos", "nombre"))],
+    "cat_auxiliares":         [("nombre", "persona", ("cat_auxiliares", "nombre"))],
+    "cat_camiones":           [("transportista", "entidad", ("cat_transportistas", "nombre")),
+                               ("piloto", "persona", ("cat_pilotos", "nombre")),
+                               ("auxiliar", "persona", ("cat_auxiliares", "nombre"))],
+    "cat_clientes_tiendas":   [("cliente", "entidad", ("cat_clientes", "nombre")),
+                               ("tienda", "entidad", ("cat_clientes_tiendas", "tienda", "cliente"))],
+    "cat_cds_por_cliente":    [("cliente", "entidad", ("cat_clientes", "nombre")),
+                               ("cd", "entidad", ("cat_cds_por_cliente", "cd", "cliente"))],
+    "cat_motivos_sin_pedido": [("nombre", "entidad", ("cat_motivos_sin_pedido", "nombre"))],
+    "cat_usuario_clientes":   [("cliente", "entidad", ("cat_clientes", "nombre"))],
+    "cat_siglas":             [("sigla", "sigla", ("cat_siglas", "sigla"))],
+}
+
+
+def _clave_nombre(v):
+    return re.sub(r"\s+", " ", str(v)).strip().lower()
+
+
+def _mapa_existentes(cur, fuente):
+    """{clave sin mayúsculas: nombre como está guardado}; con 3er elemento en `fuente`,
+    la clave es (cliente, nombre) para comparar solo dentro del mismo cliente."""
+    if fuente is None:
+        return {}
+    tabla, col = fuente[0], fuente[1]
+    if len(fuente) == 3:
+        cur.execute(f"SELECT {fuente[2]}, {col} FROM {tabla}")
+        return {(_clave_nombre(a), _clave_nombre(b)): b for a, b in cur.fetchall() if a is not None and b is not None}
+    cur.execute(f"SELECT {col} FROM {tabla}")
+    return {_clave_nombre(a): a for (a,) in cur.fetchall() if a is not None}
+
+
+def _formatear_un_valor(valor, modo, mapa, alcance=None, siglas=None):
+    if valor is None or valor != valor:          # None o NaN
+        return valor
+    s = str(valor).strip()
+    if not s:
+        return valor
+    clave = (alcance, _clave_nombre(s)) if alcance is not None else _clave_nombre(s)
+    if clave in mapa:
+        return mapa[clave]                        # ya existe: se usa tal cual está guardado
+    if modo == "sigla":
+        return s.upper()                          # las siglas siempre se guardan en mayúsculas
+    return normalizar_nombre_catalogo(s, modo, siglas)
+
+
+def formatear_df_catalogo(cur, tabla, df):
+    """Devuelve una COPIA del DataFrame con los nombres ya formateados. Nunca lanza:
+    si algo fallara, devuelve el DataFrame original y el guardado sigue como antes."""
+    try:
+        especs = FORMATO_CATALOGOS.get(tabla)
+        if not especs:
+            return df
+        df = df.copy()
+        siglas = _cargar_siglas(cur)
+        for col, modo, fuente in especs:
+            if col not in df.columns:
+                continue
+            mapa = _mapa_existentes(cur, fuente)
+            col_alcance = fuente[2] if (fuente and len(fuente) == 3) else None
+            if col_alcance and col_alcance in df.columns:
+                df[col] = [_formatear_un_valor(v, modo, mapa, _clave_nombre(a), siglas)
+                           for v, a in zip(df[col], df[col_alcance])]
+            else:
+                df[col] = [_formatear_un_valor(v, modo, mapa, None, siglas) for v in df[col]]
+        return df
+    except Exception:
+        return df
+
+
+def formatear_valores_catalogo(cur, tabla, valores):
+    """Igual que formatear_df_catalogo, para un solo registro (dict del formulario)."""
+    try:
+        especs = FORMATO_CATALOGOS.get(tabla)
+        if not especs:
+            return valores
+        nuevos = dict(valores)
+        siglas = _cargar_siglas(cur)
+        for col, modo, fuente in especs:
+            if col not in nuevos:
+                continue
+            mapa = _mapa_existentes(cur, fuente)
+            alcance = None
+            if fuente and len(fuente) == 3 and fuente[2] in nuevos and nuevos[fuente[2]] is not None:
+                alcance = _clave_nombre(nuevos[fuente[2]])
+            nuevos[col] = _formatear_un_valor(nuevos[col], modo, mapa, alcance, siglas)
+        return nuevos
+    except Exception:
+        return valores
 
 
 # ===========================================================================

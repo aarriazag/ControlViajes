@@ -801,6 +801,10 @@ def init_db():
             sr_int.asegurar_esquema_sr(conn)
         except Exception:
             conn.rollback()
+        try:
+            sr_int.asegurar_esquema_formato(conn)
+        except Exception:
+            conn.rollback()
 
         # ---- Llaves foráneas con actualización en cascada ----
         # Esto es lo que de verdad evita que renombrar un piloto/auxiliar/
@@ -1178,6 +1182,9 @@ CATALOGOS_CONFIG = {
                         "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
     "Motivos de Viaje sin Pedido": {"tabla": "cat_motivos_sin_pedido", "columnas": ["nombre"],
                                     "clave": ["nombre"], "numericas": []},
+    # Siglas que siempre van en MAYÚSCULAS dentro de los nombres (MYM, TESA, S.A., KFC...). Aquí se
+    # agregan las que falten; el formato de nombres de todos los catálogos las respeta.
+    "Siglas": {"tabla": "cat_siglas", "columnas": ["sigla"], "clave": ["sigla"], "numericas": []},
     # "Usuarios" ya no se gestiona aquí como catálogo genérico — crear una cuenta
     # necesita generarle una contraseña, así que vive en la pestaña "Usuarios"
     # dedicada (Gestión de Usuarios), no en un data_editor de texto plano.
@@ -1234,13 +1241,15 @@ def _mensaje_foreign_key_amigable(e):
 def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clientes_permitidos=None):
     """Inserta un registro nuevo, o lo actualiza si la llave ya existe (upsert),
     para poder corregir un solo dato sin tener que resubir todo el Excel."""
-    if clientes_permitidos is not None and "cliente" in columnas:
-        if str(valores.get("cliente", "")).strip() not in clientes_permitidos:
-            return False, f"No tienes acceso al cliente '{valores.get('cliente')}'."
     with closing(get_conn()) as conn:
         try:
             _validar_identificadores_sql(tabla, columnas)
             with conn.cursor() as cur:
+                # Formato de nombres (Mayúscula Inicial) — vive en integracion_simpliroute.py
+                valores = sr_int.formatear_valores_catalogo(cur, tabla, valores)
+                if clientes_permitidos is not None and "cliente" in columnas:
+                    if str(valores.get("cliente", "")).strip() not in clientes_permitidos:
+                        return False, f"No tienes acceso al cliente '{valores.get('cliente')}'."
                 cols_sql = ", ".join(columnas)
                 placeholders = ", ".join(["%s"] * len(columnas))
                 no_clave = [c for c in columnas if c not in clave]
@@ -1344,6 +1353,8 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
         try:
             _validar_identificadores_sql(tabla, columnas)
             with conn.cursor() as cur:
+                # Formato de nombres (Mayúscula Inicial) — vive en integracion_simpliroute.py
+                df_nuevo = sr_int.formatear_df_catalogo(cur, tabla, df_nuevo)
                 if clientes_permitidos is not None and "cliente" in columnas:
                     fuera_de_alcance = {str(row["cliente"]).strip() for _, row in df_nuevo.iterrows()
                                         if str(row["cliente"]).strip() not in clientes_permitidos}
