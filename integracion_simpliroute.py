@@ -881,6 +881,24 @@ def formatear_valores_catalogo(cur, tabla, valores):
         return valores
 
 
+def preparar_auxiliar_libre(cur, texto):
+    """El Auxiliar se escribe libre en el viaje. Esto lo deja listo para guardarse:
+      - vacío -> "Sin Auxiliar";
+      - con formato Mayúscula Inicial (o el nombre que YA existe, sin distinguir mayúsculas);
+      - si es nuevo, se agrega a Catálogos → Auxiliares (activo) para que aparezca como
+        sugerencia la próxima vez. Va dentro de la MISMA transacción del viaje: si el viaje
+        no se guarda, el auxiliar tampoco. Devuelve el nombre final. Puede lanzar ValueError
+        (nombre demasiado largo) o un error de base de datos; quien lo llama ya lo maneja."""
+    nombre = re.sub(r"\s+", " ", str(texto or "")).strip()
+    if not nombre:
+        nombre = "Sin Auxiliar"
+    if len(nombre) > 100:
+        raise ValueError("El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
+    nombre = formatear_valores_catalogo(cur, "cat_auxiliares", {"nombre": nombre})["nombre"]
+    cur.execute("INSERT INTO cat_auxiliares (nombre, activo) VALUES (%s, TRUE) ON CONFLICT (nombre) DO NOTHING", (nombre,))
+    return nombre
+
+
 # ===========================================================================
 # CONTROL SR — vínculo viaje <-> Ruta, verificación y reenvío
 # ===========================================================================

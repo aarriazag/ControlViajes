@@ -1132,6 +1132,7 @@ def actualizar_default_camion(placa, piloto, auxiliar):
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
+                auxiliar = sr_int.preparar_auxiliar_libre(cur, auxiliar)  # mismo nombre que quedó en el viaje
                 cur.execute(
                     "UPDATE cat_camiones SET piloto=%s, auxiliar=%s WHERE placa=%s",
                     (piloto, auxiliar, placa)
@@ -1139,6 +1140,20 @@ def actualizar_default_camion(placa, piloto, auxiliar):
             conn.commit()
         except Exception:
             conn.rollback()  # si falla, no es crítico — el viaje ya se guardó bien
+
+
+def campo_auxiliar(etiqueta, opciones, valor_inicial, key):
+    """El Auxiliar es un campo LIBRE: se escribe el nombre (o se elige uno ya guardado, que sale
+    como sugerencia). Cada nombre nuevo se guarda solo al guardar el viaje, siempre con Mayúscula
+    Inicial. Si esta versión de Streamlit no permite escribir un valor nuevo dentro del
+    desplegable, se usa una caja de texto normal."""
+    try:
+        idx = opciones.index(valor_inicial) if valor_inicial in opciones else None
+        elegido = st.selectbox(etiqueta, opciones, index=idx, accept_new_options=True,
+                               placeholder="Escribe o elige el nombre", key=key)
+        return (elegido or "").strip()
+    except TypeError:
+        return st.text_input(etiqueta, value=valor_inicial or "", placeholder="Nombre del auxiliar", key=key).strip()
 
 
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
@@ -1525,6 +1540,9 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
+                # Auxiliar libre: formato Mayúscula Inicial y alta en el catálogo si es nuevo
+                # (dentro de esta misma transacción: si el viaje no se guarda, el auxiliar tampoco)
+                auxiliar = sr_int.preparar_auxiliar_libre(cur, auxiliar)
                 # Revalidar marchamos DENTRO de la transacción (evita condiciones de
                 # carrera entre dos digitadores guardando al mismo tiempo)
                 for dest in destinos_viaje:
@@ -1866,6 +1884,7 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
+                auxiliar = sr_int.preparar_auxiliar_libre(cur, auxiliar)  # libre + Mayúscula Inicial + alta si es nuevo
                 # Revalidar que ningún marchamo de ida corregido choque con el de
                 # OTRO destino que no sea el mismo que estamos editando.
                 for d in destinos_actualizados:
@@ -2694,12 +2713,7 @@ def pagina_despacho():
                             st.warning("Sin pilotos en el catálogo.")
                             piloto_final = ""
                     with col_aux:
-                        auxiliares = st.session_state.catalogos["auxiliares"]
-                        if auxiliares:
-                            auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
-                        else:
-                            st.warning("Sin auxiliares en el catálogo.")
-                            auxiliar_final = ""
+                        auxiliar_final = campo_auxiliar("Auxiliar de Carga", st.session_state.catalogos["auxiliares"], aux_pred, f"aux_{run}_{placa}")
 
                     if placa:
                         st.markdown(
@@ -3035,7 +3049,9 @@ def pagina_despacho():
                 if not placa or len(destinos_viaje) == 0:
                     st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
                 elif not piloto_final or not auxiliar_final:
-                    st.error("❌ Error: Falta seleccionar Piloto y/o Auxiliar (revisa que el catálogo tenga al menos uno cargado).")
+                    st.error("❌ Error: Falta el Piloto y/o el Auxiliar (escribe el nombre del auxiliar, o elige \"Sin Auxiliar\").")
+                elif len(auxiliar_final) > 100:
+                    st.error("❌ Error: El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
                 elif cap_pred == TIPO_CABEZAL_FURGON and not placa_furgon:
                     st.error("❌ Error: Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                 elif marchamos_vacios:
@@ -3373,13 +3389,7 @@ def pagina_gestion_viajes():
                             st.warning(f"Catálogo de Pilotos vacío — se mantiene el piloto actual: {viaje_g['piloto']}")
                             piloto_edit = viaje_g["piloto"]
 
-                        aux_disp = st.session_state.catalogos["auxiliares"]
-                        if aux_disp:
-                            aux_idx = aux_disp.index(viaje_g["auxiliar"]) if viaje_g["auxiliar"] in aux_disp else 0
-                            auxiliar_edit = st.selectbox("Auxiliar", aux_disp, index=aux_idx, key=f"edit_aux_{viaje_g['id']}")
-                        else:
-                            st.warning(f"Catálogo de Auxiliares vacío — se mantiene el auxiliar actual: {viaje_g['auxiliar']}")
-                            auxiliar_edit = viaje_g["auxiliar"]
+                        auxiliar_edit = campo_auxiliar("Auxiliar", st.session_state.catalogos["auxiliares"], viaje_g["auxiliar"], f"edit_aux_{viaje_g['id']}")
 
                         placa_furgon_edit = ""
                         if datos_cam.get("tipo") == TIPO_CABEZAL_FURGON:
@@ -3442,6 +3452,8 @@ def pagina_gestion_viajes():
                         if st.button("💾 Guardar Correcciones", key=f"btn_editar_{viaje_g['id']}"):
                             if not marchamo_regreso_edit.strip():
                                 st.error("❌ El Marchamo de Regreso es obligatorio.")
+                            elif len(auxiliar_edit) > 100:
+                                st.error("❌ El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
                             elif datos_cam.get("tipo") == TIPO_CABEZAL_FURGON and not placa_furgon_edit:
                                 st.error("❌ Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                             else:
@@ -3450,6 +3462,7 @@ def pagina_gestion_viajes():
                                                        usuario_activo, placa_furgon=placa_furgon_edit or None)
                                 if ok:
                                     puente_sr("viaje_editado", viaje_g["id_viaje"])
+                                    st.session_state.catalogos = cargar_catalogos_desde_db()  # por si el auxiliar es nuevo
                                     st.success(f"Viaje {viaje_g['id_viaje']} corregido.")
                                     del st.session_state["viaje_gestion"]
                                     del st.session_state["destinos_gestion"]
