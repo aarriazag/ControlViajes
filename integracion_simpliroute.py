@@ -143,6 +143,36 @@ def normalizar_placa(placa):
     return limpio
 
 
+# --- Placas: Control de Ruta guarda "896BYM" y SimpliRoute guarda "C-896BYM". Para COMPARARLAS se usa
+# una clave que ignora el prefijo (C-, P-, TC-...): los 3 números + las 3 letras.
+_PATRON_PLACA_GT = re.compile(r"^(?:[A-Z]{1,3})?(\d{3}[A-Z]{3})$")
+_PATRON_PLACA_ESTANDAR = re.compile(r"^\d{3}[A-Z]{3}$")
+
+
+def clave_placa(placa):
+    """Clave para comparar placas sin importar mayúsculas, espacios, guiones ni el prefijo:
+    '896BYM', 'C-896BYM', 'c 896 bym' y 'TC-896BYM' dan todas '896BYM'. Si la placa no sigue ese
+    patrón (remolques, placas especiales) se compara tal cual, solo limpia."""
+    if not placa:
+        return ""
+    limpio = re.sub(r"[^A-Z0-9]", "", str(placa).upper())
+    m = _PATRON_PLACA_GT.match(limpio)
+    return m.group(1) if m else limpio
+
+
+def placa_para_sr(placa):
+    """Formato con el que SimpliRoute guarda las placas: C-XXXBBB. Es lo que se manda a SR
+    cuando hay que CREAR un vehículo allá."""
+    k = clave_placa(placa)
+    return "C-" + k if _PATRON_PLACA_ESTANDAR.match(k) else normalizar_placa(placa)
+
+
+def placa_formato_local(placa):
+    """Formato con el que Control de Ruta guarda las placas: XXXBBB (sin prefijo)."""
+    k = clave_placa(placa)
+    return k if _PATRON_PLACA_ESTANDAR.match(k) else normalizar_placa(placa)
+
+
 # Formato de nombres de catálogo (pilotos, transportistas, tiendas...).
 CONECTORES_NOMBRE = {"de", "del", "la", "las", "los", "y", "e", "da", "do", "van", "von"}
 # Siglas de respaldo, SOLO si no se puede leer la tabla cat_siglas. La lista de verdad vive en
@@ -248,13 +278,15 @@ def buscar_vehiculo_sr_por_placa(placa, token=None):
     alguien ya lo había dado de alta manualmente en SR antes de hoy.
     Nunca se debe volver a llamar una vez que el camión ya tiene id_sr —
     ahí el camino correcto es actualizar_vehiculo_sr() directo por id_sr."""
-    placa_norm = normalizar_placa(placa)
+    clave = clave_placa(placa)
     ok, data = _sr_request("GET", "routes/vehicles/", token=token)
     if not ok:
         return False, data
     lista = data.get("results", data) if isinstance(data, dict) else data
     for v in lista:
-        if normalizar_placa(v.get("license_plate")) == placa_norm:
+        if es_placa_dummy_sr(v.get("license_plate")):
+            continue
+        if clave_placa(v.get("license_plate")) == clave:   # "896BYM" (aquí) = "C-896BYM" (SR)
             return True, v.get("id")
     return True, None  # búsqueda exitosa, simplemente no existe todavía
 
@@ -288,7 +320,7 @@ def _payload_vehiculo(placa, tipo, id_sr_piloto):
     datos que ya viven en cat_camiones. `id_sr_piloto` puede ser None si el
     piloto asignado todavía no tiene vínculo con SR — en ese caso se manda
     default_driver=None (SR permite el vehículo sin conductor por defecto)."""
-    placa = normalizar_placa(placa)
+    placa = placa_para_sr(placa)   # SR guarda C-XXXBBB; aquí se guarda XXXBBB
     return {
         "name": placa,
         "license_plate": placa,
@@ -315,8 +347,12 @@ def crear_vehiculo_sr(placa, tipo, id_sr_piloto=None, token=None):
 def actualizar_vehiculo_sr(id_sr, placa, tipo, id_sr_piloto=None, token=None):
     """PATCH /routes/vehicles/{id_sr}/ — usar cuando el camión YA tiene id_sr
     (por ejemplo, cambió de piloto asignado)."""
-    payload = _payload_vehiculo(placa, tipo, id_sr_piloto)
-    ok, data = _sr_request("PATCH", f"routes/vehicles/{id_sr}/", token=token, json=payload)
+    # Un vehículo que YA existe en SR (muchos los crea la integración de Infor) NO se renombra ni se
+    # le cambia la placa: solo se le asigna su conductor por defecto, y solo si hay uno que asignar
+    # (nunca se borra el que SR ya tenga).
+    if not id_sr_piloto:
+        return True, id_sr
+    ok, data = _sr_request("PATCH", f"routes/vehicles/{id_sr}/", token=token, json={"default_driver": id_sr_piloto})
     if not ok:
         return False, data
     return True, id_sr
@@ -552,17 +588,141 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
     return True, resumen
 
 
-def debe_sincronizar_pilotos(get_conn_fn, horas=12):
-    """True si nunca se ha sincronizado, o si pasaron >= `horas` desde la
-    última vez — para el disparo automático al abrir la app."""
+def debe_sincronizar(get_conn_fn, proceso, horas=12):
+    """True si el proceso ('pilotos' o 'camiones') nunca se ha sincronizado, o si pasaron
+    >= `horas` desde la última vez — para el disparo automático al abrir la app."""
     from contextlib import closing
 
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
-        cur.execute("SELECT ultima_ejecucion FROM control_sincronizacion_sr WHERE proceso = 'pilotos'")
+        cur.execute("SELECT ultima_ejecucion FROM control_sincronizacion_sr WHERE proceso = %s", (proceso,))
         fila = cur.fetchone()
     if not fila or not fila[0]:
         return True
     return (datetime.now() - fila[0]).total_seconds() >= horas * 3600
+
+
+def debe_sincronizar_pilotos(get_conn_fn, horas=12):
+    return debe_sincronizar(get_conn_fn, "pilotos", horas)
+
+
+def debe_sincronizar_camiones(get_conn_fn, horas=12):
+    return debe_sincronizar(get_conn_fn, "camiones", horas)
+
+
+# ---------------------------------------------------------------------------
+# CAMIONES — SR manda, Control de Ruta recibe (misma idea que los pilotos)
+# ---------------------------------------------------------------------------
+
+def obtener_vehiculos_sr(token=None):
+    """GET /routes/vehicles/ — lista cruda de vehículos en SR."""
+    ok, data = _sr_request("GET", "routes/vehicles/", token=token)
+    if not ok:
+        return False, data
+    lista = data.get("results", data) if isinstance(data, dict) else data
+    return True, list(lista)
+
+
+def sincronizar_camiones_desde_sr(get_conn_fn, token=None):
+    """Trae los vehículos de SR y los refleja en cat_camiones (para que cada camión real tenga su
+    id_sr y se pueda prellenar al importar una Ruta). Las placas se comparan por su CLAVE (los 3
+    números y las 3 letras), así "C-896BYM" de SR y "896BYM" de Control de Ruta son el mismo camión:
+      - Vehículos "dummy" de planeación de Infor: se ignoran.
+      - id_sr ya vinculado -> solo se marca la fecha de sincronización (la placa NO se renombra).
+      - id_sr nuevo y la placa ya existe en el catálogo sin vínculo -> se vincula solo.
+      - La placa existe pero vinculada a OTRO id_sr (vehículo repetido en SR) -> no se toca, se avisa.
+      - No existe -> se crea INACTIVO y 'pendiente de completar', con la placa en formato local
+        (sin "C-"); SR no trae transportista ni tipo de camión: un Administrador lo completa.
+      - Auto-corrección: si una sincronización anterior (con el formato distinto) dejó un camión
+        pendiente DUPLICADO ("C-896BYM") junto al camión real ("896BYM"), se fusionan: el duplicado
+        se borra y el real queda vinculado.
+    Devuelve (ok, resumen). Nunca lanza."""
+    from contextlib import closing
+
+    try:
+        ok, vehiculos = obtener_vehiculos_sr(token=token)
+        if not ok:
+            return False, f"No se pudieron traer los vehículos de SimpliRoute: {vehiculos}"
+
+        nuevos = vinculados = actualizados = dummies = fusionados = 0
+        avisos, con_error = [], []
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            for v in vehiculos:
+                id_sr = v.get("id")
+                placa_sr = v.get("license_plate") or v.get("name")
+                if es_placa_dummy_sr(placa_sr):
+                    dummies += 1
+                    continue
+                clave = clave_placa(placa_sr)
+                cur.execute("SAVEPOINT sp_camion")
+                try:
+                    cur.execute("SELECT placa, id_sr, activo, COALESCE(pendiente_completar, FALSE) FROM cat_camiones")
+                    todas = cur.fetchall()
+                    por_id = next((f for f in todas if f[1] == id_sr), None)
+                    misma_clave = [f for f in todas if clave_placa(f[0]) == clave]
+                    if por_id:
+                        gemelos = [f for f in misma_clave if f[0] != por_id[0] and f[1] is None]
+                        if clave_placa(por_id[0]) != clave:
+                            avisos.append(f"SR trae la placa {placa_sr} para el camión {por_id[0]} (no se renombró)")
+                        if gemelos and por_id[3] and not por_id[2]:
+                            # el pendiente creado antes con otro formato es un duplicado del camión real
+                            cur.execute("DELETE FROM cat_camiones WHERE placa = %s", (por_id[0],))
+                            cur.execute(
+                                "UPDATE cat_camiones SET id_sr = %s, sincronizado_sr = TRUE, "
+                                "fecha_sincronizacion_sr = %s WHERE placa = %s",
+                                (id_sr, datetime.now(), gemelos[0][0]))
+                            fusionados += 1
+                        else:
+                            cur.execute(
+                                "UPDATE cat_camiones SET sincronizado_sr = TRUE, fecha_sincronizacion_sr = %s WHERE placa = %s",
+                                (datetime.now(), por_id[0]))
+                            actualizados += 1
+                    else:
+                        sin_vinculo = [f for f in misma_clave if f[1] is None]
+                        if sin_vinculo:
+                            if len(sin_vinculo) > 1:
+                                avisos.append(f"Hay {len(sin_vinculo)} camiones con la misma placa que {placa_sr} en el catálogo "
+                                              f"({', '.join(f[0] for f in sin_vinculo)}): se vinculó {sin_vinculo[0][0]}")
+                            cur.execute(
+                                "UPDATE cat_camiones SET id_sr = %s, sincronizado_sr = TRUE, "
+                                "fecha_sincronizacion_sr = %s WHERE placa = %s",
+                                (id_sr, datetime.now(), sin_vinculo[0][0]))
+                            vinculados += 1
+                        elif misma_clave:
+                            avisos.append(f"La placa {placa_sr} aparece en SR con otro id (vehículo repetido en SR) — no se tocó")
+                        else:
+                            cur.execute(
+                                "INSERT INTO cat_camiones (placa, activo, id_sr, sincronizado_sr, "
+                                "fecha_sincronizacion_sr, pendiente_completar) "
+                                "VALUES (%s, FALSE, %s, TRUE, %s, TRUE) ON CONFLICT (placa) DO NOTHING",
+                                (placa_formato_local(placa_sr), id_sr, datetime.now()))
+                            nuevos += 1
+                    cur.execute("RELEASE SAVEPOINT sp_camion")
+                except Exception as e:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_camion")
+                    con_error.append((placa_sr, (str(e).splitlines() or ["error"])[0]))
+            conn.commit()
+
+            cur.execute(
+                "INSERT INTO control_sincronizacion_sr (proceso, ultima_ejecucion, resultado) "
+                "VALUES ('camiones', %s, %s) "
+                "ON CONFLICT (proceso) DO UPDATE SET ultima_ejecucion = EXCLUDED.ultima_ejecucion, "
+                "resultado = EXCLUDED.resultado",
+                (datetime.now(), f"{nuevos} nuevo(s), {vinculados} vinculado(s) por placa, {fusionados} fusionado(s), "
+                                 f"{actualizados} al día, {len(con_error)} con error"))
+            conn.commit()
+
+        resumen = (f"{nuevos} camión(es) nuevo(s) (pendientes de completar), {vinculados} vinculado(s) por placa, "
+                   f"{actualizados} ya vinculado(s), {dummies} provisional(es) de Infor omitido(s).")
+        if fusionados:
+            resumen += f" {fusionados} duplicado(s) pendiente(s) fusionado(s) con su camión real."
+        if avisos:
+            resumen += " Avisos: " + "; ".join(avisos[:3]) + ("…" if len(avisos) > 3 else ".")
+        if con_error:
+            resumen += (f" {len(con_error)} sin procesar: "
+                        + "; ".join(f"{p}: {m}" for p, m in con_error[:3]) + ("…" if len(con_error) > 3 else "."))
+        return True, resumen
+    except Exception as e:
+        return False, f"Error inesperado al sincronizar camiones desde SR: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +793,19 @@ def importar_rutas_sr(fecha, token=None):
         return False, f"No se pudieron traer las Visitas de SimpliRoute: {visitas_raw}"
     lista_visitas = visitas_raw.get("results", visitas_raw) if isinstance(visitas_raw, dict) else visitas_raw
 
+    # Placas y nombres legibles (solo para MOSTRAR en pantalla). Si estas dos consultas fallan, la
+    # importación sigue igual, solo que se muestran los ids en vez de placa y nombre.
+    placas_sr, nombres_sr = {}, {}
+    try:
+        ok_v, vehs = obtener_vehiculos_sr(token=token)
+        if ok_v:
+            placas_sr = {v.get("id"): (v.get("license_plate") or v.get("name")) for v in vehs}
+        ok_d, drvs = obtener_drivers_sr(token=token)
+        if ok_d:
+            nombres_sr = {d.get("id"): (d.get("name") or d.get("username")) for d in drvs}
+    except Exception:
+        pass
+
     resultado = []
     for ruta in lista_rutas:
         route_id = ruta.get("id")
@@ -676,6 +849,8 @@ def importar_rutas_sr(fecha, token=None):
             "route_id": route_id,
             "vehicle_sr_id": ruta.get("vehicle"),
             "driver_sr_id": ruta.get("driver"),
+            "vehicle_placa_sr": placas_sr.get(ruta.get("vehicle")),
+            "driver_nombre_sr": nombres_sr.get(ruta.get("driver")),
             "total_visitas": len(visitas_de_ruta),
             "visit_types": visit_types,
             "destinos": destinos_ordenados,
@@ -756,6 +931,7 @@ def asegurar_esquema_sr(conn):
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS id_sr BIGINT")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS sincronizado_sr BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")
+        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS pendiente_completar BOOLEAN DEFAULT FALSE")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_pilotos_revision_nombre (
                 nombre TEXT, id_sr BIGINT PRIMARY KEY,
@@ -897,6 +1073,65 @@ def preparar_auxiliar_libre(cur, texto):
     nombre = formatear_valores_catalogo(cur, "cat_auxiliares", {"nombre": nombre})["nombre"]
     cur.execute("INSERT INTO cat_auxiliares (nombre, activo) VALUES (%s, TRUE) ON CONFLICT (nombre) DO NOTHING", (nombre,))
     return nombre
+
+
+def resolver_ruta_para_formulario(get_conn_fn, ruta):
+    """Al usar una Ruta importada de SR: decide qué camión y piloto prellenar en el formulario.
+    Devuelve {"placa": str|None, "piloto": str|None, "sin_piloto": bool, "avisos": [str]}.
+      - Camión: se prellena si el vehículo de SR es un camión REAL, ya está en el catálogo (por id_sr,
+        o por placa — en ese caso se vincula de paso) y está ACTIVO. Si es el provisional (dummy) de
+        Infor, no se prellena y no se avisa: es lo normal, se elige el real.
+      - Piloto: si SR no tiene conductor asignado, queda EN BLANCO (sin_piloto=True). Si lo tiene y
+        está activo en el catálogo, se prellena. Si está pendiente/inactivo o no existe, se deja en
+        blanco y se avisa por qué.
+    Nunca lanza: ante cualquier fallo devuelve todo vacío y el digitador elige a mano."""
+    from contextlib import closing
+
+    r = {"placa": None, "piloto": None, "sin_piloto": ruta.get("driver_sr_id") is None, "avisos": []}
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            # ---- Camión ----
+            id_veh, placa_sr = ruta.get("vehicle_sr_id"), ruta.get("vehicle_placa_sr")
+            if id_veh is not None and not (placa_sr is not None and es_placa_dummy_sr(placa_sr)):
+                cur.execute("SELECT placa, activo FROM cat_camiones WHERE id_sr = %s", (id_veh,))
+                fila = cur.fetchone()
+                if not fila and placa_sr:
+                    # "C-896BYM" en SR = "896BYM" en Control de Ruta (se compara por la clave de la placa)
+                    cur.execute("SELECT placa, activo, id_sr FROM cat_camiones")
+                    clave = clave_placa(placa_sr)
+                    por_placa = next((f for f in cur.fetchall() if clave_placa(f[0]) == clave), None)
+                    if por_placa:
+                        if por_placa[2] is None:
+                            cur.execute("UPDATE cat_camiones SET id_sr = %s, sincronizado_sr = TRUE, "
+                                        "fecha_sincronizacion_sr = %s WHERE placa = %s",
+                                        (id_veh, datetime.now(), por_placa[0]))
+                            conn.commit()
+                        fila = (por_placa[0], por_placa[1])
+                if fila and fila[1]:
+                    r["placa"] = fila[0]
+                elif fila:
+                    r["avisos"].append(f"El camión {fila[0]} de la Ruta está pendiente de completar o inactivo en "
+                                       "Catálogos → Camiones: complétalo y actívalo para poder usarlo.")
+                else:
+                    r["avisos"].append(f"El vehículo {placa_sr or id_veh} de la Ruta no está en el catálogo de camiones: "
+                                       "sincroniza camiones desde SimpliRoute (Catálogos → Integración SimpliRoute).")
+            # ---- Piloto ----
+            id_drv = ruta.get("driver_sr_id")
+            if id_drv is not None:
+                cur.execute("SELECT nombre, activo FROM cat_pilotos WHERE id_sr = %s", (id_drv,))
+                fila = cur.fetchone()
+                nombre_sr = ruta.get("driver_nombre_sr") or id_drv
+                if fila and fila[1]:
+                    r["piloto"] = fila[0]
+                elif fila:
+                    r["avisos"].append(f"El piloto {fila[0]} de la Ruta está pendiente de completar o inactivo en "
+                                       "Catálogos → Pilotos: complétalo y actívalo para poder usarlo.")
+                else:
+                    r["avisos"].append(f"El piloto {nombre_sr} de la Ruta no está en el catálogo: "
+                                       "sincroniza pilotos desde SimpliRoute.")
+    except Exception:
+        pass
+    return r
 
 
 # ===========================================================================

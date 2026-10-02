@@ -2602,7 +2602,8 @@ def pagina_despacho():
                         with st.container(border=True):
                             st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {len(_ruta_sr['destinos'])} parada(s)/tienda(s) "
                                         f"({_ruta_sr['total_visitas']} registro(s) de pedido/transferencia en SR) · "
-                                        f"Vehículo SR: {_ruta_sr['vehicle_sr_id']} · Piloto SR: {_ruta_sr['driver_sr_id']}")
+                                        f"Vehículo SR: {_ruta_sr.get('vehicle_placa_sr') or _ruta_sr['vehicle_sr_id']} · "
+                                        f"Piloto SR: {_ruta_sr.get('driver_nombre_sr') or ('sin asignar' if _ruta_sr['driver_sr_id'] is None else _ruta_sr['driver_sr_id'])}")
                             st.caption("Tipos de visita: " + ", ".join(f"{k} ({v})" for k, v in _ruta_sr["visit_types"].items()))
                             st.caption("⚠️ La columna 'Unidades' es la suma de `load_3` de SR — confirmado antes con datos reales "
                                        "que para Zona Sur eso cuenta UNIDADES sueltas de producto, no bultos físicos "
@@ -2643,29 +2644,24 @@ def pagina_despacho():
                                         "unidades": _d["cajas"],
                                     }
 
-                                # Vehículo/piloto real: solo se prellena si el vehicle_sr_id de la
-                                # Ruta ya corresponde a un camión REAL tuyo (no el dummy de Infor) —
-                                # si es dummy o no se encuentra, se deja en blanco para que el
-                                # digitador elija uno, y el PATCH que reemplaza el dummy se dispara
-                                # al guardar el viaje (ver el hook después de guardar_viaje()).
-                                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                                    _cur.execute("SELECT placa FROM cat_camiones WHERE id_sr = %s", (_ruta_sr["vehicle_sr_id"],))
-                                    _fila_placa = _cur.fetchone()
-                                    _cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (_ruta_sr["driver_sr_id"],))
-                                    _fila_piloto = _cur.fetchone()
-                                if _fila_placa:
-                                    st.session_state[f"placa_{_run_destino}"] = _fila_placa[0]
-                                if _fila_piloto:
-                                    st.session_state[f"piloto_{_run_destino}"] = _fila_piloto[0]
+                                # Camión y piloto de la Ruta de SR: la lógica vive en integracion_simpliroute.py
+                                # (resolver_ruta_para_formulario). El camión se prellena si es un camión real, ya
+                                # está en el catálogo y está activo; el piloto se prellena si SR tiene uno asignado
+                                # y está activo — si SR no tiene piloto, queda EN BLANCO para elegirlo.
+                                _sel_sr = sr_int.resolver_ruta_para_formulario(get_conn, _ruta_sr)
+                                if _sel_sr["placa"]:
+                                    st.session_state[f"placa_{_run_destino}"] = _sel_sr["placa"]
+                                st.session_state[f"sr_piloto_{_run_destino}"] = _sel_sr["piloto"] or ""
 
                                 st.session_state[f"route_id_sr_{_run_destino}"] = _ruta_sr["route_id"]
                                 st.session_state.modo_importar_sr = False
+                                _avisos_import = []
                                 if _sin_match:
-                                    st.session_state["flash_importar_sr"] = (
-                                        "warning",
-                                        f"⚠️ {len(_sin_match)} tienda(s) de SR no se pudieron emparejar automáticamente, "
-                                        f"elígelas a mano: {', '.join(_sin_match)}"
-                                    )
+                                    _avisos_import.append(f"⚠️ {len(_sin_match)} tienda(s) de SR no se pudieron emparejar automáticamente, "
+                                                          f"elígelas a mano: {', '.join(_sin_match)}")
+                                _avisos_import += [f"⚠️ {a}" for a in _sel_sr["avisos"]]
+                                if _avisos_import:
+                                    st.session_state["flash_importar_sr"] = ("warning", "\n\n".join(_avisos_import))
                                 st.rerun()
             st.markdown("---")
 
@@ -2705,10 +2701,18 @@ def pagina_despacho():
                         pil_pred = datos_c["piloto"]
                         aux_pred = datos_c["auxiliar"]
 
+                    # Si el viaje viene de una Ruta de SR, el piloto lo manda SR (en blanco si no tiene).
+                    _pil_de_sr = st.session_state.get(f"sr_piloto_{run}")
+                    if _pil_de_sr is not None:
+                        pil_pred = _pil_de_sr
+
                     with col_pil:
                         pilotos = st.session_state.catalogos["pilotos"]
                         if pilotos:
-                            piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
+                            # Sin piloto previsto queda EN BLANCO (antes se elegía el primero de la lista sin avisar).
+                            # La llave lleva la placa: al cambiar de camión, el piloto se reinicia con el de ese camión.
+                            piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else None,
+                                                        placeholder="Elige el piloto", key=f"piloto_{run}_{placa}") or ""
                         else:
                             st.warning("Sin pilotos en el catálogo.")
                             piloto_final = ""
@@ -3048,8 +3052,10 @@ def pagina_despacho():
 
                 if not placa or len(destinos_viaje) == 0:
                     st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
-                elif not piloto_final or not auxiliar_final:
-                    st.error("❌ Error: Falta el Piloto y/o el Auxiliar (escribe el nombre del auxiliar, o elige \"Sin Auxiliar\").")
+                elif not piloto_final:
+                    st.error("❌ Error: Falta elegir el Piloto (la Ruta de SimpliRoute no trae uno, o no está activo en el catálogo).")
+                elif not auxiliar_final:
+                    st.error("❌ Error: Falta el Auxiliar (escribe el nombre, o elige \"Sin Auxiliar\").")
                 elif len(auxiliar_final) > 100:
                     st.error("❌ Error: El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
                 elif cap_pred == TIPO_CABEZAL_FURGON and not placa_furgon:
@@ -4154,9 +4160,20 @@ def pagina_catalogos():
                     st.session_state["flash_catalogos"] = ("success", resumen)
                     st.rerun()
 
+        with st.expander(":material/local_shipping: Camiones nuevos desde SR (pendientes de completar)", expanded=False):
+            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                _cur.execute("SELECT placa, id_sr FROM cat_camiones WHERE pendiente_completar = TRUE AND activo = FALSE ORDER BY placa")
+                _camiones_pend_sr = _cur.fetchall()
+            if not _camiones_pend_sr:
+                st.success("✅ No hay camiones nuevos pendientes de completar.")
+            else:
+                st.dataframe(pd.DataFrame(_camiones_pend_sr, columns=["Placa (de SR)", "ID en SR"]), use_container_width=True, hide_index=True)
+                st.caption("SR no trae el tipo ni el transportista. Complétalos en el catálogo de Camiones (arriba) y márcalos "
+                           "activos cuando estén listos; al activarlos desaparecen de esta lista y ya se pueden usar en Despacho.")
+
         with st.expander(":material/person: Pilotos pendientes de completar (nuevos desde SR)", expanded=False):
             with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                _cur.execute("SELECT nombre, id_sr FROM cat_pilotos WHERE pendiente_completar = TRUE ORDER BY nombre")
+                _cur.execute("SELECT nombre, id_sr FROM cat_pilotos WHERE pendiente_completar = TRUE AND activo = FALSE ORDER BY nombre")
                 _pilotos_pendientes = _cur.fetchall()
             if not _pilotos_pendientes:
                 st.success("✅ No hay pilotos pendientes de completar.")
@@ -4195,6 +4212,11 @@ def pagina_catalogos():
                                 _cur.execute("UPDATE cat_pilotos_revision_nombre SET resuelto = TRUE WHERE id_sr = %s", (_id_sr_rev,))
                                 _conn.commit()
                             st.rerun()
+
+        if hay_token_sr and st.button(":material/sync: Sincronizar Camiones desde SimpliRoute ahora", key="btn_sync_camiones_manual"):
+            ok_sync_c, resumen_sync_c = sr_int.sincronizar_camiones_desde_sr(get_conn, token=token_sr)
+            st.session_state["flash_catalogos"] = ("success" if ok_sync_c else "error", resumen_sync_c)
+            st.rerun()
 
         if hay_token_sr and st.button(":material/sync: Sincronizar Pilotos desde SimpliRoute ahora", key="btn_sync_pilotos_manual"):
             ok_sync, resumen_sync = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token_sr)
@@ -4456,6 +4478,11 @@ try:
         sr_int.sincronizar_pilotos_desde_sr(get_conn, token=_token_sr_autosync)
 except Exception:
     pass  # sin token, o SR no responde — nunca debe tumbar el arranque de la app
+try:
+    if _token_sr_autosync and sr_int.debe_sincronizar_camiones(get_conn, horas=12):
+        sr_int.sincronizar_camiones_desde_sr(get_conn, token=_token_sr_autosync)
+except Exception:
+    pass
 
 if st.session_state.get("_modo_base_vacia"):
     st.info("🚀 **Base nueva:** todavía no hay clientes. Empieza cargando los catálogos en este orden: "
