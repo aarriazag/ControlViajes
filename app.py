@@ -1623,14 +1623,14 @@ def enviar_visita_simpliroute(viaje_id):
     return False, "SimpliRoute todavía no está conectado — este viaje sigue en modo manual dentro de Control de Ruta."
 
 
-def puente_sr(tipo, id_viaje, route_id_sr=None):
+def puente_sr(tipo, id_viaje, route_id_sr=None, cambio_camion_piloto=None):
     """Único punto de contacto de la app con el Control SR (que vive completo en
     integracion_simpliroute.py). Nunca lanza: si algo falla, el mensaje queda
     guardado en la sesión para mostrarse después de la recarga de pantalla."""
     try:
-        ok, msg = sr_int.evento(get_conn, tipo, id_viaje, route_id_sr=route_id_sr)
-        if msg and not ok:
-            st.session_state["flash_sr"] = msg
+        ok, msg = sr_int.evento(get_conn, tipo, id_viaje, route_id_sr=route_id_sr, cambio_camion_piloto=cambio_camion_piloto)
+        if msg:
+            st.session_state["flash_sr" if not ok else "flash_sr_ok"] = msg
     except Exception:
         pass
 
@@ -2562,6 +2562,9 @@ def pagina_despacho():
                 if st.button(":material/refresh: Consultar Rutas", key="btn_consultar_rutas_sr"):
                     ok_imp, rutas_o_error = sr_int.importar_rutas_sr(str(_fecha_import), token=_token_sr_import)
                     st.session_state["rutas_sr_encontradas"] = rutas_o_error if ok_imp else []
+                    if ok_imp:
+                        # Cada visit_type que SR manda queda anotado: solo esos se pueden mapear a un cliente
+                        sr_int.registrar_visit_types_vistos(get_conn, {t for _r in rutas_o_error for t in _r["visit_types"]})
                     if not ok_imp:
                         st.error(f"❌ {rutas_o_error}")
 
@@ -2596,10 +2599,33 @@ def pagina_despacho():
                                "para que aparezcan en la importación del cliente correcto.")
 
                 if _rutas_sr:
-                    st.success(f"✅ {len(_rutas_sr)} ruta(s) de **{cliente_activo}** encontrada(s) con visitas ese día.")
+                    # Rutas que ya tienen un viaje: se muestran MARCADAS y no se pueden volver a usar
+                    # (para cambiar algo se edita ese viaje en Gestión de Viajes). Las libres van primero.
+                    _usadas_sr = sr_int.rutas_ya_utilizadas(get_conn, [_r["route_id"] for _r in _rutas_sr])
+                    _rutas_sr = sorted(_rutas_sr, key=lambda _r: bool(_usadas_sr.get(str(_r["route_id"]), {}).get("viajes")))
+                    _n_usadas = sum(1 for _r in _rutas_sr if _usadas_sr.get(str(_r["route_id"]), {}).get("viajes"))
+                    st.success(f"✅ {len(_rutas_sr)} ruta(s) de **{cliente_activo}** encontrada(s) con visitas ese día "
+                               f"— {len(_rutas_sr) - _n_usadas} por usar, {_n_usadas} ya utilizada(s).")
                     _tiendas_cliente_import = st.session_state.catalogos["clientes"].get(cliente_activo, {})
                     for _idx_ruta, _ruta_sr in enumerate(_rutas_sr):
+                        _info_uso = _usadas_sr.get(str(_ruta_sr["route_id"]), {"viajes": [], "anulados": []})
+                        _ruta_usada = bool(_info_uso["viajes"])
                         with st.container(border=True):
+                            if _ruta_usada:
+                                _folio_uso, _estado_uso = _info_uso["viajes"][0]
+                                st.success(f"✅ **YA UTILIZADA** en el viaje **{_folio_uso}** ({_estado_uso}). "
+                                           "Para cambiar algo, edita ese viaje en Gestión de Viajes.")
+                                if perfil_activo in ("Administrador", "SuperAdministrador", "Operador") and st.button(
+                                        f":material/edit_document: Abrir {_folio_uso} en Gestión de Viajes",
+                                        key=f"abrir_viaje_ruta_{_idx_ruta}"):
+                                    _mis_cli_g = None if perfil_activo in ("Administrador", "SuperAdministrador") else clientes_permitidos_para(usuario_activo, perfil_activo)
+                                    st.session_state["valor_gestion"] = _folio_uso
+                                    st.session_state["resultados_gestion"] = buscar_viajes(_folio_uso, clientes_permitidos=_mis_cli_g)
+                                    st.session_state.pop("viaje_gestion", None)
+                                    st.session_state.pop("destinos_gestion", None)
+                                    st.switch_page(_PAGINA_GESTION_VIAJES)
+                            elif _info_uso["anulados"]:
+                                st.info(f"El viaje {', '.join(_info_uso['anulados'])} de esta ruta fue anulado: puedes usarla de nuevo.")
                             st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {len(_ruta_sr['destinos'])} parada(s)/tienda(s) "
                                         f"({_ruta_sr['total_visitas']} registro(s) de pedido/transferencia en SR) · "
                                         f"Vehículo SR: {_ruta_sr.get('vehicle_placa_sr') or _ruta_sr['vehicle_sr_id']} · "
@@ -2614,7 +2640,8 @@ def pagina_despacho():
                                 for d in _ruta_sr["destinos"]
                             ])
                             st.dataframe(_df_destinos_sr, use_container_width=True, hide_index=True)
-                            if st.button(":material/check: Usar esta ruta", key=f"usar_ruta_sr_{_idx_ruta}", use_container_width=True):
+                            if st.button(":material/check: Usar esta ruta" if not _ruta_usada else ":material/block: Ruta ya utilizada",
+                                         key=f"usar_ruta_sr_{_idx_ruta}", use_container_width=True, disabled=_ruta_usada):
                                 _run_destino = st.session_state.form_run
                                 _sin_match = []
                                 st.session_state.num_destinos = len(_ruta_sr["destinos"])
@@ -3070,6 +3097,10 @@ def pagina_despacho():
                     st.error("❌ Error: El Marchamo de Regreso no puede ser igual a un Marchamo de Ida de este mismo viaje.")
                 elif viaje_sin_pedido and not motivo_seleccionado:
                     st.error("❌ Error: Elige un Motivo para este viaje sin pedido antes de generarlo.")
+                elif st.session_state.get(f"route_id_sr_{run}") and sr_int.ruta_en_uso(get_conn, st.session_state.get(f"route_id_sr_{run}")):
+                    _folio_en_uso, _estado_en_uso = sr_int.ruta_en_uso(get_conn, st.session_state.get(f"route_id_sr_{run}"))
+                    st.error(f"❌ Esta ruta de SimpliRoute ya se utilizó en el viaje {_folio_en_uso} ({_estado_en_uso}). "
+                             "Para cambiar algo, edítalo en Gestión de Viajes; si es otro viaje, usa la Creación Manual.")
                 else:
                     ok, resultado = guardar_viaje(
                         cliente=cliente_activo,
@@ -3455,6 +3486,8 @@ def pagina_gestion_viajes():
                             value=marchamo_regreso_actual_g, key=f"emreg_viaje_{viaje_g['id']}"
                         )
 
+                        sr_int.render_panel_ruta_sr(st, get_conn, viaje_g)
+
                         if st.button("💾 Guardar Correcciones", key=f"btn_editar_{viaje_g['id']}"):
                             if not marchamo_regreso_edit.strip():
                                 st.error("❌ El Marchamo de Regreso es obligatorio.")
@@ -3467,7 +3500,8 @@ def pagina_gestion_viajes():
                                                        auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip(),
                                                        usuario_activo, placa_furgon=placa_furgon_edit or None)
                                 if ok:
-                                    puente_sr("viaje_editado", viaje_g["id_viaje"])
+                                    puente_sr("viaje_editado", viaje_g["id_viaje"],
+                                              cambio_camion_piloto=(placa_edit != viaje_g["placa"] or piloto_edit != viaje_g["piloto"]))
                                     st.session_state.catalogos = cargar_catalogos_desde_db()  # por si el auxiliar es nuevo
                                     st.success(f"Viaje {viaje_g['id_viaje']} corregido.")
                                     del st.session_state["viaje_gestion"]
@@ -3726,6 +3760,7 @@ def _tipos_sin_mapear_de_hoy(token_cache_key):
     ok, rutas = sr_int.importar_rutas_sr(str(datetime.now().date()), token=token_cache_key)
     if not ok:
         return None
+    sr_int.registrar_visit_types_vistos(get_conn, {t for r in rutas for t in r["visit_types"]})
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute("SELECT visit_type FROM cat_mapeo_cliente_sr")
         ya_mapeados = {r[0] for r in cur.fetchall()}
@@ -4224,35 +4259,7 @@ def pagina_catalogos():
             st.rerun()
 
         with st.expander(":material/link: Mapeo Cliente ↔ visit_type de SR", expanded=False):
-            st.caption("Un cliente de facturación puede tener varios visit_type en SR (ej. Grupo Premium = "
-                       "pizza_hut_frio + pizza_hut_seco + kfc_frio + kfc_seco...). Sin mapear, ese visit_type "
-                       "queda 'sin cliente identificado' al importar — nunca se asume solo.")
-            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                _cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr ORDER BY cliente, visit_type")
-                _mapeos_actuales = _cur.fetchall()
-            if _mapeos_actuales:
-                st.dataframe(pd.DataFrame(_mapeos_actuales, columns=["visit_type", "Cliente"]), use_container_width=True, hide_index=True)
-            else:
-                st.info("Todavía no hay ningún visit_type mapeado.")
-
-            _clientes_disponibles = st.session_state.catalogos["clientes_lista_activos"]
-            _mc1, _mc2, _mc3 = st.columns([2, 2, 1])
-            with _mc1:
-                _nuevo_visit_type = st.text_input("visit_type (tal cual aparece en SR)", key="nuevo_visit_type_sr")
-            with _mc2:
-                _cliente_para_mapeo = st.selectbox("Cliente en Control de Ruta", _clientes_disponibles, key="cliente_para_mapeo_sr")
-            with _mc3:
-                st.write("")
-                st.write("")
-                if st.button(":material/save: Guardar", key="btn_guardar_mapeo_sr") and _nuevo_visit_type.strip():
-                    with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                        _cur.execute(
-                            "INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s, %s) "
-                            "ON CONFLICT (visit_type) DO UPDATE SET cliente = EXCLUDED.cliente",
-                            (_nuevo_visit_type.strip(), _cliente_para_mapeo)
-                        )
-                        _conn.commit()
-                    st.rerun()
+            sr_int.render_mapeo_visit_type(st, get_conn, st.session_state.catalogos["clientes_lista_activos"], token=token_sr)
 
         with st.expander(":material/fact_check: Control SR — ¿lo que cambié llegó a SimpliRoute?", expanded=False):
             sr_int.render_control_sr(st, get_conn, token=token_sr)
@@ -4492,10 +4499,11 @@ if st.session_state.get("_modo_base_vacia"):
     pagina_catalogos()
     st.stop()
 
+_PAGINA_GESTION_VIAJES = st.Page(pagina_gestion_viajes, title="Gestión de Viajes", icon=":material/edit_document:")
 pagina_actual = st.navigation([
     st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:"),
     st.Page(pagina_liquidaciones, title="Recepción (Liquidaciones)", icon=":material/receipt_long:"),
-    st.Page(pagina_gestion_viajes, title="Gestión de Viajes", icon=":material/edit_document:"),
+    _PAGINA_GESTION_VIAJES,
     st.Page(pagina_reportes, title="Reportes", icon=":material/bar_chart:"),
     st.Page(pagina_catalogos, title="Catálogos", icon=":material/settings:"),
     st.Page(pagina_usuarios, title="Usuarios", icon=":material/manage_accounts:"),
@@ -4505,6 +4513,9 @@ try:
     _flash_sr = st.session_state.pop("flash_sr", None)
     if _flash_sr:
         st.warning(f"⚠️ SimpliRoute: {_flash_sr}")
+    _flash_sr_ok = st.session_state.pop("flash_sr_ok", None)
+    if _flash_sr_ok:
+        st.success(f"✅ SimpliRoute: {_flash_sr_ok}")
 except Exception:
     pass
 

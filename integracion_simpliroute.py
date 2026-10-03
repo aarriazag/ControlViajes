@@ -944,6 +944,13 @@ def asegurar_esquema_sr(conn):
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS sr_visit_types_vistos (
+                visit_type TEXT PRIMARY KEY,
+                primera_vez TIMESTAMP DEFAULT NOW(),
+                ultima_vez TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_mapeo_cliente_sr (
                 visit_type TEXT PRIMARY KEY, cliente TEXT
             )
@@ -1134,6 +1141,369 @@ def resolver_ruta_para_formulario(get_conn_fn, ruta):
     return r
 
 
+def rutas_ya_utilizadas(get_conn_fn, route_ids):
+    """Para la lista de Rutas importadas: cuáles YA tienen un viaje en Control de Ruta.
+    Devuelve {route_id: {"viajes": [(id_viaje, estado), ...], "anulados": [id_viaje, ...]}} solo para
+    las Rutas que ya se usaron. Un viaje ANULADO libera su Ruta (se puede volver a usar): por eso se
+    separan "viajes" (activos o liquidados) de "anulados". Nunca lanza: si falla, devuelve {} y la lista
+    se muestra como antes."""
+    from contextlib import closing
+
+    try:
+        ids = [str(r) for r in route_ids if r]
+        if not ids:
+            return {}
+        with closing(get_conn_fn()) as conn:
+            _asegurar_tabla_vinculo(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT s.route_id_sr, s.id_viaje, v.estado FROM sr_vinculo_viaje s "
+                    "JOIN viajes v ON v.id_viaje = s.id_viaje WHERE s.route_id_sr = ANY(%s) ORDER BY s.id_viaje",
+                    (ids,))
+                filas = cur.fetchall()
+        usadas = {}
+        for route_id, id_viaje, estado in filas:
+            d = usadas.setdefault(route_id, {"viajes": [], "anulados": []})
+            if estado == "Anulado":
+                d["anulados"].append(id_viaje)
+            else:
+                d["viajes"].append((id_viaje, estado))
+        return usadas
+    except Exception:
+        return {}
+
+
+def ruta_en_uso(get_conn_fn, route_id):
+    """Candado al GUARDAR: devuelve (id_viaje, estado) si esa Ruta ya tiene un viaje no anulado, o None.
+    Cubre el caso de dos personas con la misma Ruta abierta a la vez, o una lista que se quedó vieja en
+    pantalla. Nunca lanza."""
+    d = rutas_ya_utilizadas(get_conn_fn, [route_id]).get(str(route_id))
+    if d and d["viajes"]:
+        return d["viajes"][0]
+    return None
+
+
+def estado_vinculo_viaje(get_conn_fn, id_viaje):
+    """Estado del vínculo de un viaje con su Ruta de SR, o None si no tiene. Nunca lanza."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn:
+            _asegurar_tabla_vinculo(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT route_id_sr, estado, ultimo_evento, ultimo_intento, ultimo_mensaje "
+                            "FROM sr_vinculo_viaje WHERE id_viaje = %s", (id_viaje,))
+                f = cur.fetchone()
+        if not f:
+            return None
+        return {"route_id": f[0], "estado": f[1], "evento": f[2], "intento": f[3], "mensaje": f[4]}
+    except Exception:
+        return None
+
+
+def vincular_viaje_con_ruta(get_conn_fn, id_viaje, route_id, token=None):
+    """Vincula un viaje YA guardado con una Ruta de SR y le envía su camión y piloto. Sirve para viajes
+    creados a mano o antes de que existiera el vínculo. Devuelve (ok, mensaje). Nunca lanza."""
+    from contextlib import closing
+    try:
+        usada = ruta_en_uso(get_conn_fn, route_id)
+        if usada and usada[0] != id_viaje:
+            return False, f"Esa Ruta ya se utilizó en el viaje {usada[0]} ({usada[1]})."
+        with closing(get_conn_fn()) as conn:
+            _asegurar_tabla_vinculo(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sr_vinculo_viaje (id_viaje, route_id_sr, ultimo_evento, ultimo_intento, estado) "
+                    "VALUES (%s, %s, 'vinculado', NOW(), 'vinculado') "
+                    "ON CONFLICT (id_viaje) DO UPDATE SET route_id_sr = EXCLUDED.route_id_sr",
+                    (id_viaje, str(route_id)))
+            conn.commit()
+        ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token, evento_txt="vinculado")
+        return ok, (f"Viaje vinculado con la Ruta. {msg}" if ok else f"Viaje vinculado con la Ruta, pero: {msg}")
+    except Exception as e:
+        return False, f"No se pudo vincular: {e}"
+
+
+def render_panel_ruta_sr(st, get_conn_fn, viaje, token=None):
+    """Recuadro «Ruta de SimpliRoute» dentro de Gestión de Viajes → editar. Muestra si el viaje está
+    vinculado y qué pasó la última vez que se envió algo a SR (por eso una edición puede NO viajar), deja
+    reenviar con un clic y, si el viaje no está vinculado, permite vincularlo a una Ruta de SR del día.
+    Nunca rompe la pantalla de edición."""
+    try:
+        _render_panel_ruta_sr(st, get_conn_fn, viaje, token)
+    except Exception as e:
+        st.caption(f"(El recuadro de SimpliRoute no pudo cargarse: {e})")
+
+
+def _render_panel_ruta_sr(st, get_conn_fn, viaje, token):
+    from contextlib import closing
+    if not SR_CONTROL_ACTIVO:
+        return
+    id_viaje = viaje["id_viaje"]
+    est = estado_vinculo_viaje(get_conn_fn, id_viaje)
+    with st.container(border=True):
+        st.markdown("##### :material/sync: Ruta de SimpliRoute")
+        if est:
+            icono = {"ok": "✅", "error": "⚠️"}.get(est["estado"], "ℹ️")
+            cuando = est["intento"].strftime("%d/%m %H:%M") if est["intento"] else "—"
+            st.caption(f"Vinculado a la Ruta `{str(est['route_id'])[:8]}…` · último envío {icono} "
+                       f"{est['estado'] or 'sin envíos'} ({est['evento'] or '—'}, {cuando})")
+            if est["mensaje"]:
+                (st.warning if est["estado"] == "error" else st.caption)(est["mensaje"])
+            st.caption("Al guardar una corrección con otro camión o piloto, el cambio se envía a SimpliRoute solo. "
+                       "Este botón envía lo que está GUARDADO en el viaje (no lo que estés escribiendo y aún no guardaste).")
+            if st.button(":material/send: Reenviar camión y piloto a SimpliRoute ahora", key=f"panel_sr_reenviar_{id_viaje}"):
+                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token, evento_txt="reenvio")
+                (st.success if ok else st.error)(msg)
+            return
+
+        st.warning("Este viaje **no está vinculado** a una Ruta de SimpliRoute, por eso un cambio de camión o piloto "
+                   "aquí NO se envía. Si es un viaje manual, no hace falta nada; si debió venir de una Ruta, vincúlalo.")
+        with st.expander(":material/link: Vincular con una Ruta de SimpliRoute", expanded=False):
+            with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+                cur.execute("SELECT cliente, fecha_creacion, placa FROM viajes WHERE id_viaje = %s", (id_viaje,))
+                cliente, fecha_viaje, placa_viaje = cur.fetchone()
+                cur.execute("SELECT visit_type FROM cat_mapeo_cliente_sr WHERE cliente = %s", (cliente,))
+                tipos_cliente = {r[0] for r in cur.fetchall()}
+            token = token or obtener_token_sr_desde_vault(get_conn_fn)
+            if not token:
+                st.error("No hay token de SimpliRoute configurado en el Vault.")
+                return
+            try:
+                fecha_ini = datetime.strptime(str(fecha_viaje)[:10], "%Y-%m-%d").date()
+            except Exception:
+                fecha_ini = datetime.now().date()
+            fecha = st.date_input("Fecha de la Ruta", value=fecha_ini, key=f"panel_sr_fecha_{id_viaje}")
+            clave_rutas = f"panel_sr_rutas_{id_viaje}"
+            if st.button(":material/search: Buscar Rutas de ese día", key=f"panel_sr_buscar_{id_viaje}"):
+                ok, rutas = importar_rutas_sr(str(fecha), token=token)
+                if not ok:
+                    st.error(rutas)
+                else:
+                    st.session_state[clave_rutas] = rutas
+            rutas = st.session_state.get(clave_rutas)
+            if rutas is None:
+                return
+            usadas = rutas_ya_utilizadas(get_conn_fn, [r["route_id"] for r in rutas])
+            libres = [r for r in rutas
+                      if not usadas.get(str(r["route_id"]), {}).get("viajes")
+                      and (not tipos_cliente or set(r["visit_types"]) & tipos_cliente)]
+            # primero las que traen el mismo camión del viaje
+            libres.sort(key=lambda r: 0 if clave_placa(r.get("vehicle_placa_sr")) == clave_placa(placa_viaje) else 1)
+            if not libres:
+                st.info("No hay Rutas libres de este cliente ese día (las ya utilizadas no se pueden vincular).")
+                return
+            for i, r in enumerate(libres[:15]):
+                tiendas = ", ".join(d["tienda"] for d in r["destinos"][:3]) + ("…" if len(r["destinos"]) > 3 else "")
+                misma = "⭐ mismo camión · " if clave_placa(r.get("vehicle_placa_sr")) == clave_placa(placa_viaje) else ""
+                st.write(f"{misma}**{r.get('vehicle_placa_sr') or r['vehicle_sr_id']}** · piloto "
+                         f"{r.get('driver_nombre_sr') or 'sin asignar'} · {len(r['destinos'])} parada(s): {tiendas}")
+                if st.button(":material/link: Vincular esta Ruta y enviar camión/piloto", key=f"panel_sr_vincular_{id_viaje}_{i}"):
+                    ok, msg = vincular_viaje_con_ruta(get_conn_fn, id_viaje, r["route_id"], token=token)
+                    st.session_state.pop(clave_rutas, None)
+                    st.session_state["flash_sr" if not ok else "flash_sr_ok"] = msg
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# MAPEO visit_type de SR  ->  cliente de Control de Ruta
+# ---------------------------------------------------------------------------
+# El visit_type es un texto libre que viene en las Visitas de SR. Para que el mapeo no dependa de
+# escribirlo a mano (y de equivocarse), solo se pueden mapear los visit_type que SR YA HA ENVIADO:
+# se anotan en sr_visit_types_vistos cada vez que se consultan Rutas, o al "Actualizar la lista".
+
+def registrar_visit_types_vistos(get_conn_fn, tipos):
+    """Anota los visit_type que SR acaba de enviar. Nunca lanza."""
+    from contextlib import closing
+    try:
+        tipos = {str(x).strip() for x in tipos if x and str(x).strip() and str(x).strip() != "(sin tipo)"}
+        if not tipos:
+            return
+        with closing(get_conn_fn()) as conn:
+            _asegurar_esquema_visit_types(conn)
+            with conn.cursor() as cur:
+                for x in tipos:
+                    cur.execute(
+                        "INSERT INTO sr_visit_types_vistos (visit_type) VALUES (%s) "
+                        "ON CONFLICT (visit_type) DO UPDATE SET ultima_vez = NOW()", (x,))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _asegurar_esquema_visit_types(conn):
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE IF NOT EXISTS sr_visit_types_vistos (visit_type TEXT PRIMARY KEY, "
+                    "primera_vez TIMESTAMP DEFAULT NOW(), ultima_vez TIMESTAMP DEFAULT NOW())")
+        cur.execute("CREATE TABLE IF NOT EXISTS cat_mapeo_cliente_sr (visit_type TEXT PRIMARY KEY, cliente TEXT)")
+    conn.commit()
+
+
+def escanear_visit_types_sr(get_conn_fn, token=None, dias=7):
+    """Recorre las Visitas de SR de los últimos `dias` días (y de mañana) y anota los visit_type que
+    encuentra. Devuelve (ok, resumen). Nunca lanza."""
+    from datetime import timedelta
+    try:
+        hoy = datetime.now().date()
+        fechas = [hoy + timedelta(days=d) for d in range(-int(dias), 2)]
+        encontrados, dias_ok, dias_fallo = set(), 0, 0
+        for f in fechas:
+            ok, raw = _sr_request("GET", "routes/visits/", token=token, timeout=45, params={"planned_date": str(f)})
+            if not ok:
+                dias_fallo += 1
+                continue
+            dias_ok += 1
+            visitas = raw.get("results", raw) if isinstance(raw, dict) else raw
+            encontrados |= {v.get("visit_type") for v in visitas if v.get("visit_type")}
+        if dias_ok == 0:
+            return False, "No se pudo consultar SimpliRoute en ninguno de los días."
+        antes = {x for x, _ in visit_types_vistos(get_conn_fn)}
+        registrar_visit_types_vistos(get_conn_fn, encontrados)
+        nuevos = len({x for x in encontrados if x and x not in antes})
+        resumen = f"Se revisaron {dias_ok} día(s) de SimpliRoute: {len(encontrados)} visit_type encontrado(s), {nuevos} nuevo(s) en la lista."
+        if dias_fallo:
+            resumen += f" {dias_fallo} día(s) no respondieron."
+        return True, resumen
+    except Exception as e:
+        return False, f"Error inesperado al revisar SimpliRoute: {e}"
+
+
+def visit_types_vistos(get_conn_fn):
+    """[(visit_type, ultima_vez)] de lo que SR ha enviado. Nunca lanza."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn:
+            _asegurar_esquema_visit_types(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT visit_type, ultima_vez FROM sr_visit_types_vistos ORDER BY visit_type")
+                return cur.fetchall()
+    except Exception:
+        return []
+
+
+def guardar_mapeo_visit_type(get_conn_fn, visit_type, cliente):
+    """Mapea un visit_type a un cliente. SOLO acepta un visit_type que SR ya haya enviado."""
+    from contextlib import closing
+    try:
+        visit_type = str(visit_type or "").strip()
+        with closing(get_conn_fn()) as conn:
+            _asegurar_esquema_visit_types(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM sr_visit_types_vistos WHERE visit_type = %s", (visit_type,))
+                if not cur.fetchone():
+                    return False, f"«{visit_type}» no es un visit_type que SimpliRoute haya enviado: elígelo de la lista."
+                cur.execute("SELECT 1 FROM cat_clientes WHERE nombre = %s", (cliente,))
+                if not cur.fetchone():
+                    return False, f"El cliente «{cliente}» no existe en el catálogo."
+                cur.execute("INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s, %s) "
+                            "ON CONFLICT (visit_type) DO UPDATE SET cliente = EXCLUDED.cliente", (visit_type, cliente))
+            conn.commit()
+        return True, f"«{visit_type}» quedó asignado a {cliente}."
+    except Exception as e:
+        return False, f"No se pudo guardar: {e}"
+
+
+def aplicar_cambios_mapeo(get_conn_fn, cambios_cliente, borrar):
+    """cambios_cliente: {visit_type: cliente_nuevo}; borrar: [visit_type]. Todo o nada. Devuelve (ok, mensaje)."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn:
+            with conn.cursor() as cur:
+                for vt in borrar:
+                    cur.execute("DELETE FROM cat_mapeo_cliente_sr WHERE visit_type = %s", (vt,))
+                for vt, cli in cambios_cliente.items():
+                    if vt in borrar:
+                        continue
+                    cur.execute("SELECT 1 FROM cat_clientes WHERE nombre = %s", (cli,))
+                    if not cur.fetchone():
+                        conn.rollback()
+                        return False, f"El cliente «{cli}» no existe en el catálogo."
+                    cur.execute("UPDATE cat_mapeo_cliente_sr SET cliente = %s WHERE visit_type = %s", (cli, vt))
+            conn.commit()
+        partes = []
+        if borrar:
+            partes.append(f"{len(borrar)} borrado(s)")
+        cambiados = [vt for vt in cambios_cliente if vt not in borrar]
+        if cambiados:
+            partes.append(f"{len(cambiados)} reasignado(s)")
+        return True, "Cambios guardados: " + (", ".join(partes) if partes else "ninguno.")
+    except Exception as e:
+        return False, f"No se pudieron guardar los cambios: {e}"
+
+
+def render_mapeo_visit_type(st, get_conn_fn, clientes, token=None):
+    """Pantalla del mapeo visit_type de SR -> cliente (Catálogos → Integración SimpliRoute). Se puede
+    CORREGIR el cliente y BORRAR cualquier mapeo; al agregar uno nuevo solo se puede elegir un visit_type
+    que SR ya haya enviado. Nunca rompe el resto de la pantalla."""
+    try:
+        _render_mapeo_visit_type(st, get_conn_fn, list(clientes), token)
+    except Exception as e:
+        st.error(f"⚠️ El mapeo no pudo cargarse: {e}. El resto de la app no se afecta.")
+
+
+def _render_mapeo_visit_type(st, get_conn_fn, clientes, token):
+    from contextlib import closing
+    with closing(get_conn_fn()) as conn:
+        _asegurar_esquema_visit_types(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr ORDER BY cliente, visit_type")
+            mapeos = cur.fetchall()
+    vistos = {x for x, _ in visit_types_vistos(get_conn_fn)}
+
+    st.caption("Un cliente puede tener varios visit_type en SR. Un visit_type sin mapear queda «sin cliente identificado» al "
+               "importar — nunca se asume solo. Aquí solo se pueden elegir visit_type que SimpliRoute ya envió.")
+
+    # ---- Lo que ya está mapeado: corregir o borrar ----
+    st.markdown("**Mapeos actuales**")
+    if not mapeos:
+        st.info("Todavía no hay ningún visit_type mapeado.")
+    else:
+        h1, h2, h3, h4 = st.columns([3, 1, 3, 1])
+        h1.caption("visit_type"); h2.caption("¿Existe en SR?"); h3.caption("Cliente"); h4.caption("Borrar")
+        cambios, borrar = {}, []
+        for i, (vt, cli) in enumerate(mapeos):
+            c1, c2, c3, c4 = st.columns([3, 1, 3, 1])
+            c1.write(f"`{vt}`")
+            c2.write("✅" if vt in vistos else "⚠️ no aparece")
+            opciones = clientes if cli in clientes else clientes + [cli]
+            nuevo = c3.selectbox("Cliente", opciones, index=opciones.index(cli), key=f"mapeo_cli_{i}", label_visibility="collapsed")
+            if nuevo != cli:
+                cambios[vt] = nuevo
+            if c4.checkbox("Borrar", key=f"mapeo_del_{i}", label_visibility="collapsed"):
+                borrar.append(vt)
+        if any(vt not in vistos for vt, _ in mapeos):
+            st.caption("⚠️ = SimpliRoute nunca ha enviado ese visit_type (puede ser un error de captura): corrígelo o bórralo. "
+                       "Si es un visit_type nuevo, usa «Actualizar la lista» abajo antes de decidir.")
+        if st.button(":material/save: Guardar cambios", key="mapeo_guardar_cambios", disabled=not (cambios or borrar)):
+            ok, msg = aplicar_cambios_mapeo(get_conn_fn, cambios, borrar)
+            st.session_state["flash_catalogos"] = ("success" if ok else "error", msg)
+            st.rerun()
+
+    # ---- Agregar uno nuevo: solo de la lista de SR ----
+    st.markdown("**Agregar un visit_type**")
+    ya_mapeados = {vt for vt, _ in mapeos}
+    sin_mapear = sorted(vistos - ya_mapeados)
+    if not token:
+        st.warning("No hay token de SimpliRoute configurado: no se puede actualizar la lista.")
+    ca, cb = st.columns([1, 2])
+    dias = ca.number_input("Días a revisar", min_value=1, max_value=31, value=7, step=1, key="mapeo_dias_escaneo")
+    cb.write(""); cb.write("")
+    if token and cb.button(":material/sync: Actualizar la lista desde SimpliRoute", key="mapeo_escanear"):
+        ok, msg = escanear_visit_types_sr(get_conn_fn, token=token, dias=int(dias))
+        st.session_state["flash_catalogos"] = ("success" if ok else "error", msg)
+        st.rerun()
+    if not sin_mapear:
+        st.info("No hay visit_type de SimpliRoute pendientes de mapear. Si esperas uno nuevo, pulsa «Actualizar la lista».")
+        return
+    d1, d2, d3 = st.columns([3, 3, 1])
+    elegido = d1.selectbox("visit_type de SR", sin_mapear, key="mapeo_nuevo_vt")
+    cliente = d2.selectbox("Cliente en Control de Ruta", clientes, key="mapeo_nuevo_cli") if clientes else None
+    d3.write(""); d3.write("")
+    if d3.button(":material/add: Agregar", key="mapeo_agregar", disabled=not cliente):
+        ok, msg = guardar_mapeo_visit_type(get_conn_fn, elegido, cliente)
+        st.session_state["flash_catalogos"] = ("success" if ok else "error", msg)
+        st.rerun()
+
+
 # ===========================================================================
 # CONTROL SR — vínculo viaje <-> Ruta, verificación y reenvío
 # ===========================================================================
@@ -1145,9 +1515,9 @@ def resolver_ruta_para_formulario(get_conn_fn, ruta):
 SR_CONTROL_ACTIVO = True      # False = apaga TODO este bloque (la app sigue igual)
 ENVIAR_AL_GUARDAR = True      # True = mismo comportamiento que ya tenía la app: al guardar
                               #        un viaje importado de SR, manda camión/piloto reales a SR
-ENVIAR_CAMBIOS_A_SR = False   # False = "observar": al EDITAR un viaje no se escribe nada en SR
-                              #        (solo se registra y el semáforo lo marca). True = al editar
-                              #        se reenvía camión/piloto, y se habilita el botón "Reenviar"
+ENVIAR_CAMBIOS_A_SR = True    # True = al EDITAR un viaje (camión o piloto) el cambio se envía a SR, y se habilita
+                              #        el botón "Reenviar" del Control SR. False = "observar": al editar no se
+                              #        escribe nada en SR (solo se registra y el semáforo lo marca)
 MAX_VERIFICACIONES = 40       # tope de Rutas consultadas por clic (cuida el límite 429 de SR)
 
 from contextlib import closing
@@ -1210,9 +1580,12 @@ def _leer_vinculo_y_viaje(get_conn_fn, id_viaje):
             "id_sr_camion": id_cam, "id_sr_piloto": id_pil}
 
 
-def reenviar_viaje(get_conn_fn, id_viaje, token=None):
-    """Manda a SR el camión/piloto que Control de Ruta tiene AHORA para este
-    viaje, y confirma que quedó. Devuelve (ok, mensaje). Nunca lanza."""
+def reenviar_viaje(get_conn_fn, id_viaje, token=None, evento_txt="reenvio"):
+    """Manda a SR el camión/piloto que Control de Ruta tiene AHORA para este viaje y confirma que quedó.
+    Primero CONSULTA la Ruta en SR: si ya tiene ese camión y ese piloto, no escribe nada (editar, por
+    ejemplo, las cajas de un destino no toca SR). Devuelve (ok, mensaje). Nunca lanza.
+    Si el piloto elegido NO tiene vínculo con SR (id_sr), el cambio de piloto no puede enviarse: se
+    devuelve ok=False con el motivo, para que no parezca que SR quedó igual que Control de Ruta."""
     try:
         d = _leer_vinculo_y_viaje(get_conn_fn, id_viaje)
         if not d:
@@ -1220,24 +1593,49 @@ def reenviar_viaje(get_conn_fn, id_viaje, token=None):
         if d["estado"] == "Anulado":
             return False, "El viaje está anulado en Control de Ruta — no se reenvía nada."
         if not d["id_sr_camion"]:
-            return False, (f"El camión {d['placa']} no tiene id_sr — sincronízalo primero en "
-                           "Catálogos → Integración SimpliRoute.")
+            msg = (f"El camión {d['placa']} no tiene id_sr — sincronízalo primero en "
+                   "Catálogos → Integración SimpliRoute.")
+            _registrar(get_conn_fn, id_viaje, evento_txt, "error", msg)
+            return False, msg
         token = token or obtener_token_sr_desde_vault(get_conn_fn)
         if not token:
-            return False, "No hay token de SimpliRoute configurado en el Vault."
-        ok, msg = reasignar_vehiculo_piloto_ruta_sr(
-            d["route_id"], d["id_sr_camion"], d["id_sr_piloto"], token=token
-        )
-        _registrar(get_conn_fn, id_viaje, "reenvio", "ok" if ok else "error", msg)
+            msg = "No hay token de SimpliRoute configurado en el Vault."
+            _registrar(get_conn_fn, id_viaje, evento_txt, "error", msg)
+            return False, msg
+
+        piloto_sin_vinculo = bool(d["piloto"]) and d["piloto"] != "Sin Piloto" and not d["id_sr_piloto"]
+        aviso_piloto = (f"El piloto {d['piloto']} no tiene vínculo con SimpliRoute (id_sr): el cambio de piloto NO se "
+                        "envió. Sincroniza los pilotos desde SimpliRoute y vuelve a intentarlo.")
+
+        ok_g, ruta = obtener_ruta_sr(d["route_id"], token=token)
+        if not ok_g:
+            msg = f"No se pudo consultar la Ruta en SimpliRoute: {ruta}"
+            _registrar(get_conn_fn, id_viaje, evento_txt, "error", msg)
+            return False, msg
+        camion_igual = str(ruta.get("vehicle")) == str(d["id_sr_camion"])
+        piloto_igual = (not d["id_sr_piloto"]) or str(ruta.get("driver")) == str(d["id_sr_piloto"])
+        if camion_igual and piloto_igual:
+            if d["id_sr_piloto"]:
+                ok, msg = True, "SimpliRoute ya tenía este camión y este piloto: no hubo nada que enviar."
+            else:
+                ok, msg = True, ("El camión ya coincide en SimpliRoute. Sin piloto asignado no se envía nada: "
+                                 "SimpliRoute conserva el conductor que ya tenga.")
+        else:
+            ok, msg = reasignar_vehiculo_piloto_ruta_sr(
+                d["route_id"], d["id_sr_camion"], d["id_sr_piloto"], token=token
+            )
+        if ok and piloto_sin_vinculo:
+            ok, msg = False, aviso_piloto
+        _registrar(get_conn_fn, id_viaje, evento_txt, "ok" if ok else "error", msg)
         return ok, msg
     except Exception as e:
         return False, f"Error inesperado al reenviar a SimpliRoute: {e}"
 
 
-def evento(get_conn_fn, tipo, id_viaje, route_id_sr=None, token=None):
+def evento(get_conn_fn, tipo, id_viaje, route_id_sr=None, token=None, cambio_camion_piloto=None):
     """Único punto de entrada desde app.py. `tipo`: 'viaje_guardado',
-    'viaje_editado' o 'viaje_anulado'. Devuelve (ok, mensaje): app.py solo
-    muestra el mensaje si ok=False. Nunca lanza."""
+    'viaje_editado' o 'viaje_anulado'. Devuelve (ok, mensaje): app.py muestra el mensaje
+    (en verde si ok=True, en amarillo si ok=False); mensaje vacío = nada que decir. Nunca lanza."""
     if not SR_CONTROL_ACTIVO:
         return True, ""
     try:
@@ -1256,20 +1654,27 @@ def evento(get_conn_fn, tipo, id_viaje, route_id_sr=None, token=None):
                 )
                 conn.commit()
             if ENVIAR_AL_GUARDAR:
-                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token)
+                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token, evento_txt="guardado")
                 if not ok:
                     return False, (f"El viaje {id_viaje} se guardó bien, pero no se pudo actualizar el "
                                    f"vehículo/piloto en SimpliRoute: {msg}")
+                return True, f"Viaje {id_viaje}: {msg}"
             return True, ""
 
         if tipo == "viaje_editado":
             if not _leer_vinculo_y_viaje(get_conn_fn, id_viaje):
-                return True, ""  # este viaje nunca tuvo Ruta de SR
+                # Un viaje manual no tiene Ruta de SR: editarlo en silencio es lo normal. Pero si se cambió el
+                # camión o el piloto, hay que decir por qué NO llegó a SimpliRoute (antes se callaba).
+                if cambio_camion_piloto and ENVIAR_CAMBIOS_A_SR:
+                    return False, (f"El viaje {id_viaje} no está vinculado a una Ruta de SimpliRoute, por eso el cambio de "
+                                   "camión/piloto NO se envió. Vincúlalo en el recuadro «Ruta de SimpliRoute» de esta pantalla.")
+                return True, ""
             if ENVIAR_CAMBIOS_A_SR:
-                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token)
+                ok, msg = reenviar_viaje(get_conn_fn, id_viaje, token=token, evento_txt="editado")
                 if not ok:
                     return False, (f"El viaje {id_viaje} se corrigió bien, pero el cambio no llegó a "
                                    f"SimpliRoute: {msg}")
+                return True, f"Viaje {id_viaje}: {msg}"
             else:
                 _registrar(get_conn_fn, id_viaje, "editado", "cambio_sin_enviar",
                            "Se editó en Control de Ruta; el envío a SR está en modo observar.")
