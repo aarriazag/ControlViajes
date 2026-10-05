@@ -3,6 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql as psql
 import json
 import re
 import io
@@ -19,6 +20,7 @@ from zoneinfo import ZoneInfo
 from contextlib import closing
 import requests
 import integracion_simpliroute as sr_int
+
 
 # --- VERSIÓN DE LA APP ---
 # Formato estándar Mayor.Menor.Parche:
@@ -729,6 +731,29 @@ def init_db():
             UPDATE cat_clientes SET estado_cliente = CASE WHEN activo THEN 'Activo' ELSE 'Inactivo' END
             WHERE estado_cliente IS NULL
         """)
+        # Segmento del cliente: ¿hay integración con su WMS (pedidos, etc.) o solo se le transporta mercadería?
+        # Sin valor por defecto a propósito: un cliente sin clasificar sale como "Sin clasificar" en los reportes.
+        cur.execute("ALTER TABLE cat_clientes ADD COLUMN IF NOT EXISTS integracion_wms TEXT")
+        cur.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_cliente_integracion_wms') THEN
+                    ALTER TABLE cat_clientes ADD CONSTRAINT chk_cliente_integracion_wms
+                        CHECK (integracion_wms IN ('Integración WMS', 'No Integración WMS'));
+                END IF;
+            END $$
+        """)
+        # Vehículos que pide cada cliente por día (base del reporte de Posicionamiento).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS solicitudes_transporte (
+                fecha DATE NOT NULL,
+                cliente TEXT NOT NULL REFERENCES cat_clientes(nombre) ON UPDATE CASCADE ON DELETE RESTRICT,
+                vehiculos_solicitados INTEGER NOT NULL CHECK (vehiculos_solicitados >= 0),
+                observaciones TEXT,
+                registrado_por TEXT,
+                actualizado TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (fecha, cliente)
+            )
+        """)
         # Bitácora de auditoría: quién hizo qué y cuándo, en toda la app.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS auditoria (
@@ -1174,8 +1199,14 @@ def normalizar_tonelaje(valor):
 
 
 CATALOGOS_CONFIG = {
-    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente"], "clave": ["nombre"], "numericas": [],
-                "opciones_desplegable": {"estado_cliente": ["Prueba", "Activo", "Inactivo"]}},
+    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente", "integracion_wms"], "clave": ["nombre"], "numericas": [],
+                "opciones_desplegable": {"estado_cliente": ["Prueba", "Activo", "Inactivo"],
+                                         "integracion_wms": ["Integración WMS", "No Integración WMS"]},
+                "opcionales": ["integracion_wms"]},
+    "Solicitudes de Transporte": {"tabla": "solicitudes_transporte",
+                                  "columnas": ["fecha", "cliente", "vehiculos_solicitados", "observaciones"],
+                                  "clave": ["fecha", "cliente"], "numericas": ["vehiculos_solicitados"],
+                                  "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
     "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social", "activo"], "clave": ["nombre"],
                        "numericas": [], "booleanas": ["activo"]},
     "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
@@ -1239,6 +1270,10 @@ def _mensaje_foreign_key_amigable(e):
     en vez del texto técnico crudo — usado tanto al agregar/corregir un
     registro individual como al guardar la tabla completa."""
     detalle = str(e)
+    if "vehiculos_solicitados" in detalle:
+        return "No se pudo guardar — la cantidad de vehículos solicitados no puede ser negativa."
+    if "chk_cliente_integracion_wms" in detalle:
+        return "No se pudo guardar — «Integración con WMS» solo puede ser «Integración WMS» o «No Integración WMS» (o quedar vacío)."
     if "piloto" in detalle:
         pista = "el Piloto"
     elif "auxiliar" in detalle:
@@ -1279,9 +1314,12 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clie
             registrar_auditoria(usuario, "Agregar/Actualizar registro de catálogo",
                                  f"Tabla {tabla} · {', '.join(f'{c}={valores[c]}' for c in clave)}")
             return True, "OK"
-        except psycopg2.errors.ForeignKeyViolation as e:
+        except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.CheckViolation) as e:
             conn.rollback()
             return False, _mensaje_foreign_key_amigable(e)
+        except (psycopg2.errors.InvalidDatetimeFormat, psycopg2.errors.DatetimeFieldOverflow):
+            conn.rollback()
+            return False, "Una fecha no es válida — usa el formato AAAA-MM-DD (por ejemplo 2026-10-05)."
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "agregar_o_actualizar_registro")
@@ -1444,9 +1482,12 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
             if no_borrables:
                 return True, f"⚠️ Guardado, pero esto sigue existiendo porque está en uso en Camiones o Viajes: {', '.join(no_borrables)}"
             return True, "OK"
-        except psycopg2.errors.ForeignKeyViolation as e:
+        except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.CheckViolation) as e:
             conn.rollback()
             return False, _mensaje_foreign_key_amigable(e)
+        except (psycopg2.errors.InvalidDatetimeFormat, psycopg2.errors.DatetimeFieldOverflow):
+            conn.rollback()
+            return False, "Una fecha no es válida — usa el formato AAAA-MM-DD (por ejemplo 2026-10-05)."
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "sincronizar_catalogo")
@@ -1641,132 +1682,6 @@ def obtener_viajes_recientes(limite=10):
             "SELECT id_viaje, cliente, placa, piloto, fecha_creacion, hora_creacion, estado "
             "FROM viajes ORDER BY id DESC LIMIT %s", conn, params=(limite,)
         )
-
-
-def _despachos_de_pedidos_json(texto):
-    """'[{"pedido": "779657", ...}, ...]' -> ['779657', ...]. Tolera vacíos y texto dañado."""
-    try:
-        return [str(p["pedido"]) for p in (json.loads(texto) if texto else []) if p.get("pedido")]
-    except (json.JSONDecodeError, TypeError, AttributeError, KeyError):
-        return []
-
-
-def obtener_reporte_anexo_viajes(fecha_inicio, fecha_fin, cliente="Todos"):
-    """REPORTE ANEXO DE VIAJES: un renglón por viaje, con TODOS sus destinos en una sola celda
-    (en el orden de la ruta), como referencia de los viajes realizados. Incluye el No. de viaje
-    de SimpliRoute (los primeros 8 caracteres del id de la Ruta, como se ve en SR). BULTOS = solo cajas."""
-    sr_int.asegurar_vinculo(get_conn)
-    with closing(get_conn()) as conn:
-        query = """
-            WITH agregado AS (
-                SELECT viaje_id,
-                       STRING_AGG(marchamo_ida, ' / ' ORDER BY orden) AS marchamos,
-                       STRING_AGG(tienda, ', ' ORDER BY orden) AS destinos,
-                       COUNT(*) AS cantidad_tiendas,
-                       SUM(cajas) AS bultos
-                FROM destinos
-                GROUP BY viaje_id
-            ),
-            mas_lejano AS (
-                SELECT DISTINCT ON (viaje_id) viaje_id, tipo_pago
-                FROM destinos
-                ORDER BY viaje_id, km DESC NULLS LAST
-            )
-            SELECT
-                v.fecha_creacion AS "Fecha",
-                v.id_viaje AS "No. Despacho",
-                LEFT(s.route_id_sr, 8) AS "No. de Viaje SimpliRoute",
-                v.usuario_creador AS "Supervisor/Coordinador",
-                ag.marchamos AS "No. de Marchamo",
-                ag.destinos AS "Destinos",
-                ag.cantidad_tiendas AS "Cantidad de Tiendas",
-                v.placa AS "Placa",
-                v.piloto AS "Piloto a Cargo",
-                v.cd_origen AS "Origen",
-                ml.tipo_pago AS "Clasificación de Destino",
-                cam.tipo AS "Tonelaje",
-                v.transportista AS "Transportista",
-                tr.razon_social AS "Razón Social",
-                ag.bultos AS "Bultos",
-                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje",
-                COALESCE(v.placa_furgon, '') AS "Placa Furgón"
-            FROM viajes v
-            JOIN agregado ag ON ag.viaje_id = v.id
-            JOIN mas_lejano ml ON ml.viaje_id = v.id
-            LEFT JOIN sr_vinculo_viaje s ON s.id_viaje = v.id_viaje
-            LEFT JOIN cat_camiones cam ON cam.placa = v.placa
-            LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
-            WHERE v.estado != 'Anulado'
-              AND v.fecha_creacion BETWEEN %s AND %s
-              AND (%s = 'Todos' OR v.cliente = %s)
-            ORDER BY v.fecha_creacion DESC, v.id DESC
-        """
-        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
-
-
-def obtener_reporte_bitacora_destinos(fecha_inicio, fecha_fin, cliente="Todos"):
-    """BITÁCORA DE VIAJES: un renglón por DESTINO (tienda). Cada renglón trae el destino más lejano
-    de su viaje y los km de la ruta lejana, el detalle de cajas, roles y tarimas de esa tienda, y el
-    detalle de la Ruta en SimpliRoute (guardado; se puede actualizar al generar)."""
-    sr_int.asegurar_vinculo(get_conn)
-    with closing(get_conn()) as conn:
-        query = """
-            SELECT
-                v.fecha_creacion AS "Fecha",
-                v.id_viaje AS "No. de Viaje",
-                LEFT(s.route_id_sr, 8) AS "No. de Viaje SimpliRoute",
-                v.cliente AS "Cliente",
-                v.cd_origen AS "Origen",
-                d.orden AS "Orden de Parada",
-                d.tienda AS "Destino (Tienda)",
-                d.km AS "Km del Destino",
-                FIRST_VALUE(d.tienda) OVER w AS "Destino más Lejano del Viaje",
-                MAX(d.km) OVER (PARTITION BY d.viaje_id) AS "Km Ruta Lejana",
-                CASE WHEN ROW_NUMBER() OVER w = 1 THEN 'Sí' ELSE '' END AS "¿Es el más Lejano?",
-                d.tipo_pago AS "Clasificación de Destino",
-                d.pedidos AS _pedidos,
-                d.marchamo_ida AS "Marchamo de Ida",
-                d.marchamo_regreso AS "Marchamo de Regreso",
-                d.cajas AS "Cajas",
-                d.roles AS "Roles",
-                d.tarimas AS "Tarimas",
-                d.peso AS "Peso",
-                COALESCE(d.roles_devueltos, 0) AS "Roles Devueltos",
-                COALESCE(d.tarimas_devueltas, 0) AS "Tarimas Devueltas",
-                COALESCE(d.pacas_carton_devueltas, 0) AS "Pacas de Cartón Devueltas",
-                d.estado_entrega AS "Estado de Entrega",
-                v.placa AS "Placa",
-                COALESCE(v.placa_furgon, '') AS "Placa Furgón",
-                v.piloto AS "Piloto a Cargo",
-                v.auxiliar AS "Auxiliar",
-                cam.tipo AS "Tonelaje",
-                v.transportista AS "Transportista",
-                tr.razon_social AS "Razón Social",
-                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje",
-                v.estado AS "Estado del Viaje",
-                s.detalle_sr AS _detalle_sr,
-                s.detalle_sr_fecha AS _detalle_sr_fecha
-            FROM destinos d
-            JOIN viajes v ON v.id = d.viaje_id
-            LEFT JOIN sr_vinculo_viaje s ON s.id_viaje = v.id_viaje
-            LEFT JOIN cat_camiones cam ON cam.placa = v.placa
-            LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
-            WHERE v.estado != 'Anulado'
-              AND v.fecha_creacion BETWEEN %s AND %s
-              AND (%s = 'Todos' OR v.cliente = %s)
-            WINDOW w AS (PARTITION BY d.viaje_id ORDER BY d.km DESC NULLS LAST, d.orden)
-            ORDER BY v.fecha_creacion DESC, v.id DESC, d.orden
-        """
-        df = pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
-    if df.empty:
-        return df.drop(columns=["_pedidos", "_detalle_sr", "_detalle_sr_fecha"])
-    # No. de Despacho(s) de cada tienda, unidos con "-" (como en la bitácora del cliente)
-    df.insert(df.columns.get_loc("Clasificación de Destino") + 1, "No. de Despacho(s) de la Tienda",
-              df["_pedidos"].apply(lambda t: "-".join(_despachos_de_pedidos_json(t))))
-    # Detalle de la Ruta en SimpliRoute (columnas al final)
-    detalle = pd.DataFrame([sr_int.columnas_detalle_sr(t, f) for t, f in zip(df["_detalle_sr"], df["_detalle_sr_fecha"])])
-    df = pd.concat([df.drop(columns=["_pedidos", "_detalle_sr", "_detalle_sr_fecha"]).reset_index(drop=True), detalle], axis=1)
-    return df
 
 
 def _sanear_formulas(df):
@@ -2589,6 +2504,161 @@ st.markdown("---")
 # ==========================================
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
+def guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario):
+    """Guarda (o corrige) cuántos vehículos pidió el cliente ese día. Un renglón por fecha y cliente."""
+    try:
+        with closing(get_conn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO solicitudes_transporte (fecha, cliente, vehiculos_solicitados, registrado_por, actualizado) "
+                    "VALUES (%s, %s, %s, %s, NOW()) ON CONFLICT (fecha, cliente) DO UPDATE SET "
+                    "vehiculos_solicitados = EXCLUDED.vehiculos_solicitados, registrado_por = EXCLUDED.registrado_por, "
+                    "actualizado = NOW()", (str(fecha), cliente, int(cantidad), usuario))
+            conn.commit()
+        registrar_auditoria(usuario, "Solicitud de vehículos", f"{cliente} · {fecha}: {int(cantidad)}")
+        return True, f"Solicitud guardada: {cliente} pidió {int(cantidad)} vehículo(s) para el {fecha}."
+    except Exception as e:
+        return False, f"No se pudo guardar la solicitud: {str(e).splitlines()[0]}"
+
+
+def posicionamiento_del_dia(cliente, fecha):
+    """(solicitados o None, posicionados) del cliente ese día. Posicionados = viajes no anulados creados ese día."""
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT vehiculos_solicitados FROM solicitudes_transporte WHERE fecha = %s AND cliente = %s",
+                    (str(fecha), cliente))
+        f = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM viajes WHERE cliente = %s AND fecha_creacion = %s AND estado <> 'Anulado'",
+                    (cliente, str(fecha)))
+        return (f[0] if f else None), cur.fetchone()[0]
+
+
+def panel_solicitud_vehiculos(cliente):
+    """Recuadro de Despacho: cuántos vehículos pidió el cliente hoy y cuántos van posicionados."""
+    try:
+        with st.expander(":material/call_received: Vehículos que pidió el cliente", expanded=False):
+            fecha = st.date_input("Fecha de la solicitud", value=ahora().date(), key="sol_fecha")
+            solicitados, posicionados = posicionamiento_del_dia(cliente, fecha)
+            if solicitados is None:
+                st.caption(f"Todavía no hay solicitud registrada. Posicionados ese día: **{posicionados}**.")
+            else:
+                st.caption(f"Solicitados **{solicitados}** · Posicionados **{posicionados}** · Pendientes **{max(solicitados - posicionados, 0)}**"
+                           + (f" · Excedente **{posicionados - solicitados}**" if posicionados > solicitados else ""))
+            c1, c2 = st.columns([2, 1])
+            cantidad = c1.number_input("Vehículos solicitados", min_value=0, max_value=500, step=1,
+                                       value=int(solicitados or 0), key=f"sol_cant_{cliente}_{fecha}")
+            c2.write("")
+            if c2.button(":material/save: Guardar", key="sol_guardar", use_container_width=True):
+                ok, msg = guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario_activo)
+                st.session_state["flash_solicitud"] = ("success" if ok else "error", msg)
+                st.rerun()
+            flash = st.session_state.pop("flash_solicitud", None)
+            if flash:
+                getattr(st, flash[0])(flash[1])
+    except Exception as e:
+        st.caption(f"(El recuadro de solicitudes no pudo cargarse: {str(e).splitlines()[0]})")
+
+
+_AVISO_FALTA_SQL = "⚠️ Reportes (falta ejecutar reportes_supabase.sql)"
+
+
+def catalogo_reportes():
+    """Reportes activos registrados en Supabase (tabla reportes_catalogo) que este perfil puede ver:
+    [(nombre, vista, descripcion, actualiza_sr, nombre_archivo)]. None si el catálogo aún no existe."""
+    consultas = (
+        "SELECT nombre, vista, descripcion, COALESCE(actualiza_sr, FALSE), nombre_archivo, perfiles "
+        "FROM reportes_catalogo WHERE COALESCE(activo, TRUE) ORDER BY orden, nombre",
+        "SELECT nombre, vista, descripcion, COALESCE(actualiza_sr, FALSE), nombre_archivo, NULL "
+        "FROM reportes_catalogo WHERE COALESCE(activo, TRUE) ORDER BY orden, nombre",   # catálogo creado antes de la columna "perfiles"
+    )
+    for q in consultas:
+        try:
+            with closing(get_conn()) as conn, conn.cursor() as cur:
+                cur.execute(q)
+                filas = cur.fetchall()
+            visibles = []
+            for f in filas:
+                if not re.match(r"^rpt_[a-z0-9_]+$", str(f[1])):
+                    continue
+                perfiles = [x.strip() for x in str(f[5] or "").split(",") if x.strip()]
+                if perfiles and perfil_activo not in perfiles:
+                    continue
+                visibles.append(f[:5])
+            return visibles
+        except Exception:
+            continue
+    return None
+
+
+def mostrar_reporte_supabase(fila):
+    """Visor genérico: consulta la vista del reporte con rango de fechas y clientes permitidos, y ofrece filtro
+    rápido y exportación. Los reportes se crean o cambian en Supabase; esto no cambia con cada reporte."""
+    nombre, vista, descripcion, actualiza_sr, archivo = fila
+    clave = vista
+    st.subheader(":material/receipt_long: " + nombre)
+    if descripcion:
+        st.caption(descripcion)
+    permitidos = clientes_permitidos_para(usuario_activo, perfil_activo)
+    c1, c2, c3, c4 = st.columns([1, 1, 1.3, 0.8])
+    with c1:
+        fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key=f"rep_{clave}_ini")
+    with c2:
+        fecha_fin = st.date_input("Hasta", value=ahora().date(), key=f"rep_{clave}_fin")
+    with c3:
+        cliente = st.selectbox("Cliente", ["Todos"] + list(permitidos), key=f"rep_{clave}_cli")
+    with c4:
+        st.write("")
+        generar = st.button(":material/search: Generar", use_container_width=True, key=f"rep_{clave}_gen")
+    actualizar = False
+    if actualiza_sr:
+        actualizar = st.checkbox("Actualizar el detalle desde SimpliRoute antes de generar (más lento: consulta cada "
+                                 "ruta, hasta 60)", key=f"rep_{clave}_sr")
+    if generar:
+        if actualizar:
+            with st.spinner("Consultando SimpliRoute..."):
+                ok_sr, msg_sr = sr_int.refrescar_detalle_rango(get_conn, fecha_ini, fecha_fin, cliente)
+            (st.success if ok_sr else st.warning)(msg_sr)
+        consulta = psql.SQL('SELECT * FROM {} WHERE "Fecha" BETWEEN %s AND %s AND "Cliente" = ANY(%s)').format(psql.Identifier(vista))
+        try:
+            with closing(get_conn()) as conn:
+                st.session_state[f"df_rep_{clave}"] = pd.read_sql_query(
+                    consulta.as_string(conn), conn,
+                    params=(str(fecha_ini), str(fecha_fin), list(permitidos) if cliente == "Todos" else [cliente]))
+        except Exception as e:
+            st.session_state.pop(f"df_rep_{clave}", None)
+            st.error(f"No se pudo consultar la vista {vista}: {str(e).splitlines()[0]}. "
+                     'Recuerda que debe tener las columnas "Fecha" y "Cliente".')
+    df = st.session_state.get(f"df_rep_{clave}")
+    if df is None:
+        st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
+        return
+    if df.empty:
+        st.info("No hay datos en ese rango de fechas para ese cliente.")
+        return
+    # Filtro rápido: sirve para cualquier reporte, sin configurar nada
+    cols_filtro = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and 1 < df[c].nunique() <= 300]
+    if cols_filtro:
+        with st.expander(":material/filter_alt: Filtrar los resultados", expanded=False):
+            fc1, fc2 = st.columns([1, 2])
+            col_f = fc1.selectbox("Columna", ["(sin filtro)"] + cols_filtro, key=f"rep_{clave}_fcol")
+            if col_f != "(sin filtro)":
+                valores = fc2.multiselect("Valores", sorted(df[col_f].dropna().astype(str).unique()), key=f"rep_{clave}_fval")
+                if valores:
+                    df = df[df[col_f].astype(str).isin(valores)]
+    st.caption(f"{len(df)} renglón(es)" + (f" en {df['No. de Viaje'].nunique()} viaje(s)." if "No. de Viaje" in df else "."))
+    st.dataframe(df, use_container_width=True, height=420)
+    base = archivo or vista
+    e1, e2 = st.columns(2)
+    with e1:
+        st.download_button(":material/download: Exportar a Excel", data=exportar_excel(df),
+                           file_name=f"{base}_{fecha_ini}_a_{fecha_fin}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True, key=f"rep_{clave}_xlsx")
+    with e2:
+        st.download_button(":material/download: Exportar a CSV", data=exportar_csv(df),
+                           file_name=f"{base}_{fecha_ini}_a_{fecha_fin}.csv", mime="text/csv",
+                           use_container_width=True, key=f"rep_{clave}_csv")
+
+
 def pagina_despacho():
     if perfil_activo in ["Administrador", "SuperAdministrador", "Operador", "Supervisor"]:
         st.header(":material/local_shipping: Creación de Viaje")
@@ -2596,6 +2666,9 @@ def pagina_despacho():
 
         if "modo_importar_sr" not in st.session_state:
             st.session_state.modo_importar_sr = False
+
+        if cliente_activo and cliente_activo != "(sin clientes)":
+            panel_solicitud_vehiculos(cliente_activo)
 
         with st.container(border=True):
             _c_texto, _c_boton = st.columns([3, 1], vertical_alignment="center")
@@ -3617,77 +3690,24 @@ def pagina_gestion_viajes():
 # MÓDULO 3: REPORTES (pendiente de construir)
 # ==========================================
 def pagina_reportes():
+    # Los reportes viven en Supabase (vistas rpt_... + tabla reportes_catalogo): se cambian o se agregan SIN tocar
+    # este archivo. Si ese archivo faltara o fallara, solo desaparecen esos reportes; la app sigue.
+    reportes_sb = catalogo_reportes()          # [(nombre, vista, descripcion, actualiza_sr, archivo)] o None
+    nombres_sb = [_AVISO_FALTA_SQL] if reportes_sb is None else [f[0] for f in reportes_sb]
     reporte_sel = st.selectbox(
-        "Reporte", ["Reporte Anexo de Viajes", "Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
-                    "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
+        "Reporte", nombres_sb + ["Resumen de Liquidaciones", "Control de Retornable",
+                                 "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
     )
 
-    if reporte_sel in ("Reporte Anexo de Viajes", "Bitácora de Viajes"):
-        es_anexo = reporte_sel == "Reporte Anexo de Viajes"
-        clave_rep = "anexo" if es_anexo else "bitacora"
-        st.subheader(":material/receipt_long: " + reporte_sel)
-        if es_anexo:
-            st.caption("Un renglón por viaje, con todos sus destinos en una sola celda — referencia de los viajes realizados.")
+    if reporte_sel in nombres_sb:
+        if reportes_sb is None:
+            st.warning("Los reportes viven en Supabase y todavía no están creados. Ejecuta el script `reportes_supabase.sql` "
+                       "en el SQL Editor de Supabase (una sola vez) y recarga esta pantalla.")
         else:
-            st.caption("Un renglón por destino (tienda), con el destino más lejano del viaje, el detalle de cajas, roles y "
-                       "tarimas por tienda y el detalle de la Ruta en SimpliRoute.")
-
-        fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1.3, 0.8])
-        with fcol1:
-            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key=f"rep_{clave_rep}_ini")
-        with fcol2:
-            fecha_fin = st.date_input("Hasta", value=ahora().date(), key=f"rep_{clave_rep}_fin")
-        with fcol3:
-            clientes_reporte = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
-            cliente_reporte = st.selectbox("Cliente", clientes_reporte, key=f"rep_{clave_rep}_cli")
-        with fcol4:
-            st.write("")
-            generar = st.button(":material/search: Generar", use_container_width=True, key=f"rep_{clave_rep}_gen")
-        actualizar_sr = False
-        if not es_anexo:
-            actualizar_sr = st.checkbox("Actualizar el detalle desde SimpliRoute antes de generar (más lento: consulta cada ruta, "
-                                        "hasta 60)", key=f"rep_{clave_rep}_sr")
-
-        if generar:
-            if actualizar_sr:
-                with st.spinner("Consultando SimpliRoute..."):
-                    ok_sr, msg_sr = sr_int.refrescar_detalle_rango(get_conn, fecha_ini, fecha_fin, cliente_reporte)
-                (st.success if ok_sr else st.warning)(msg_sr)
-            funcion = obtener_reporte_anexo_viajes if es_anexo else obtener_reporte_bitacora_destinos
-            st.session_state[f"df_rep_{clave_rep}"] = funcion(fecha_ini, fecha_fin, cliente_reporte)
-
-        df_bitacora = st.session_state.get(f"df_rep_{clave_rep}")
-        if df_bitacora is not None:
-            if df_bitacora.empty:
-                st.info("No hay viajes en ese rango de fechas para ese cliente.")
-            else:
-                if es_anexo:
-                    st.caption(f"{len(df_bitacora)} viaje(s) encontrados.")
-                else:
-                    st.caption(f"{len(df_bitacora)} destino(s) en {df_bitacora['No. de Viaje'].nunique()} viaje(s).")
-                # Ventana con su propio scroll, en vez de empujar toda la página
-                st.dataframe(df_bitacora, use_container_width=True, height=420)
-
-                nombre_base = "reporte_anexo_viajes" if es_anexo else "bitacora_viajes"
-                ecol1, ecol2 = st.columns(2)
-                with ecol1:
-                    st.download_button(
-                        ":material/download: Exportar a Excel",
-                        data=exportar_excel(df_bitacora),
-                        file_name=f"{nombre_base}_{fecha_ini}_a_{fecha_fin}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key=f"rep_{clave_rep}_xlsx"
-                    )
-                with ecol2:
-                    st.download_button(
-                        ":material/download: Exportar a CSV",
-                        data=exportar_csv(df_bitacora),
-                        file_name=f"{nombre_base}_{fecha_ini}_a_{fecha_fin}.csv",
-                        mime="text/csv",
-                        use_container_width=True, key=f"rep_{clave_rep}_csv"
-                    )
-        else:
-            st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
+            try:
+                mostrar_reporte_supabase(next(f for f in reportes_sb if f[0] == reporte_sel))
+            except Exception as e:
+                st.error(f"⚠️ El reporte «{reporte_sel}» no pudo cargarse: {str(e).splitlines()[0]}. El resto de la app no se afecta.")
 
     elif reporte_sel == "Resumen de Liquidaciones":
         st.subheader(":material/fact_check: Resumen de Liquidaciones")
@@ -3889,7 +3909,7 @@ def pagina_catalogos():
             # pertenece a un solo cliente, se asigna viaje por viaje), así que
             # ese catálogo específico NO se puede filtrar por cliente todavía.
             # Un Supervisor ve/edita TODOS los camiones, no solo "los suyos".
-            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Camiones", "Acceso Usuario → Cliente"]
+            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Camiones", "Solicitudes de Transporte", "Acceso Usuario → Cliente"]
             mis_clientes = clientes_permitidos_para(usuario_activo, perfil_activo)
             st.caption(f"Ves y editas Clientes/Tiendas/CDs solo de: **{', '.join(mis_clientes) or '(ningún cliente asignado)'}**. "
                        "El catálogo de Camiones es compartido entre todos los clientes (no se puede filtrar por "
@@ -3923,7 +3943,7 @@ def pagina_catalogos():
                     st.rerun()
             column_config = {c: st.column_config.Column(disabled=True) for c in config.get("solo_lectura", [])}
             for col, opciones in config.get("opciones_desplegable", {}).items():
-                column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=True)
+                column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=col not in config.get("opcionales", []))
             for col, catalogo_key in config.get("opciones_desde_catalogo", {}).items():
                 opciones_vivas = sorted(st.session_state.catalogos.get(catalogo_key, []))
                 # Si quien edita tiene alcance limitado (Supervisor) y esta columna
@@ -4068,6 +4088,12 @@ def pagina_catalogos():
                     valores_form["transportista"] = st.selectbox("Transportista", transportistas_existentes, key=f"campo_{catalogo_sel}_transportista_sel") if transportistas_existentes else ""
                 elif col == "clasificacion":
                     valores_form["clasificacion"] = st.selectbox("Clasificación (Local/Departamental)", ["Local", "Departamental"], key=f"campo_{catalogo_sel}_clasificacion_sel")
+                elif col == "integracion_wms":
+                    _op_wms = st.selectbox(
+                        "Integración con WMS", ["Sin clasificar", "Integración WMS", "No Integración WMS"], key=f"campo_{catalogo_sel}_wms_sel",
+                        help="Integración WMS: se le lleva la integración (pedidos, despacho, etc.). No Integración WMS: solo se "
+                             "transporta su mercadería. Sirve para segmentar los reportes.")
+                    valores_form["integracion_wms"] = None if _op_wms == "Sin clasificar" else _op_wms
                 elif col == "estado_cliente":
                     valores_form["estado_cliente"] = st.selectbox(
                         "Estado del Cliente", ["Prueba", "Activo", "Inactivo"], index=1, key=f"campo_{catalogo_sel}_estado_sel",

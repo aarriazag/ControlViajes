@@ -985,6 +985,7 @@ FORMATO_CATALOGOS = {
     "cat_motivos_sin_pedido": [("nombre", "entidad", ("cat_motivos_sin_pedido", "nombre"))],
     "cat_usuario_clientes":   [("cliente", "entidad", ("cat_clientes", "nombre"))],
     "cat_siglas":             [("sigla", "sigla", ("cat_siglas", "sigla"))],
+    "solicitudes_transporte": [("cliente", "entidad", ("cat_clientes", "nombre"))],
 }
 
 
@@ -1564,22 +1565,23 @@ def refrescar_detalle_rango(get_conn_fn, fecha_ini, fecha_fin, cliente="Todos", 
 
 
 def columnas_detalle_sr(detalle_texto, fecha=None):
-    """Del detalle guardado de la Ruta en SR, solo el estado del viaje: Finalizado / En proceso / Sin iniciar
-    (vacío si el viaje no tiene Ruta vinculada o aún no se ha consultado)."""
+    """Del detalle guardado de la Ruta en SR: estado del viaje (Finalizado / En proceso / Sin iniciar) y los
+    kilómetros (`kilometers` y `total_distance`; SR llena uno u otro según la cuenta). Vacío si el viaje no tiene
+    Ruta vinculada o aún no se ha consultado."""
     import json
     try:
         d = json.loads(detalle_texto) if detalle_texto else None
     except Exception:
         d = None
     if not d:
-        return {"Estado del Viaje en SR": ""}
+        return {"Estado del Viaje en SR": "", "Km SR": None, "Distancia total SR": None}
     if d.get("end_time") or str(d.get("status") or "").lower() in ("completed", "finished", "closed"):
         estado = "Finalizado"
     elif d.get("start_time"):
         estado = "En proceso"
     else:
         estado = "Sin iniciar"
-    return {"Estado del Viaje en SR": estado}
+    return {"Estado del Viaje en SR": estado, "Km SR": d.get("kilometers"), "Distancia total SR": d.get("total_distance")}
 
 
 # ===========================================================================
