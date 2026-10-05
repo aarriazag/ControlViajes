@@ -1504,6 +1504,84 @@ def _render_mapeo_visit_type(st, get_conn_fn, clientes, token):
         st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# REPORTES — detalle de la Ruta de SR para el Reporte Anexo y la Bitácora de Viajes
+# ---------------------------------------------------------------------------
+
+def asegurar_vinculo(get_conn_fn):
+    """Garantiza que la tabla de vínculos (y sus columnas de detalle) existan, para poder unirla en los
+    reportes aunque todavía no se haya guardado ningún viaje desde una Ruta. Nunca lanza."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn:
+            _asegurar_tabla_vinculo(conn)
+    except Exception:
+        pass
+
+
+def refrescar_detalle_rango(get_conn_fn, fecha_ini, fecha_fin, cliente="Todos", token=None, maximo=60):
+    """Consulta a SR el detalle ACTUAL de las Rutas vinculadas a los viajes del rango y lo guarda
+    (estado, kilómetros, visitas, carga, horas). Se hace a pedido desde Reportes: una consulta por Ruta,
+    por eso hay un tope. Devuelve (ok, resumen). Nunca lanza."""
+    import json
+    from contextlib import closing
+    try:
+        token = token or obtener_token_sr_desde_vault(get_conn_fn)
+        if not token:
+            return False, "No hay token de SimpliRoute configurado en el Vault."
+        with closing(get_conn_fn()) as conn:
+            _asegurar_tabla_vinculo(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT v.id_viaje, s.route_id_sr FROM viajes v JOIN sr_vinculo_viaje s ON s.id_viaje = v.id_viaje "
+                    "WHERE v.estado <> 'Anulado' AND v.fecha_creacion BETWEEN %s AND %s AND (%s = 'Todos' OR v.cliente = %s) "
+                    "ORDER BY v.fecha_creacion DESC, v.id DESC LIMIT %s",
+                    (str(fecha_ini), str(fecha_fin), cliente, cliente, int(maximo) + 1))
+                filas = cur.fetchall()
+        recortado = len(filas) > maximo
+        filas = filas[:maximo]
+        if not filas:
+            return True, "No hay viajes vinculados a una Ruta de SimpliRoute en ese rango."
+        actualizados, fallos = 0, []
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            for id_viaje, route_id in filas:
+                ok, d = obtener_ruta_sr(route_id, token=token)
+                if not ok:
+                    fallos.append(id_viaje)
+                    continue
+                cur.execute("UPDATE sr_vinculo_viaje SET detalle_sr = %s, detalle_sr_fecha = NOW() WHERE id_viaje = %s",
+                            (json.dumps(d, default=str), id_viaje))
+                actualizados += 1
+            conn.commit()
+        resumen = f"Detalle de SimpliRoute actualizado en {actualizados} de {len(filas)} viaje(s)."
+        if fallos:
+            resumen += f" No respondieron: {', '.join(fallos[:5])}{'…' if len(fallos) > 5 else ''}."
+        if recortado:
+            resumen += f" Se actualizaron solo los {maximo} más recientes; acorta el rango para el resto."
+        return True, resumen
+    except Exception as e:
+        return False, f"No se pudo actualizar el detalle de SimpliRoute: {e}"
+
+
+def columnas_detalle_sr(detalle_texto, fecha=None):
+    """Del detalle guardado de la Ruta en SR, solo el estado del viaje: Finalizado / En proceso / Sin iniciar
+    (vacío si el viaje no tiene Ruta vinculada o aún no se ha consultado)."""
+    import json
+    try:
+        d = json.loads(detalle_texto) if detalle_texto else None
+    except Exception:
+        d = None
+    if not d:
+        return {"Estado del Viaje en SR": ""}
+    if d.get("end_time") or str(d.get("status") or "").lower() in ("completed", "finished", "closed"):
+        estado = "Finalizado"
+    elif d.get("start_time"):
+        estado = "En proceso"
+    else:
+        estado = "Sin iniciar"
+    return {"Estado del Viaje en SR": estado}
+
+
 # ===========================================================================
 # CONTROL SR — vínculo viaje <-> Ruta, verificación y reenvío
 # ===========================================================================
@@ -1542,6 +1620,9 @@ def _asegurar_tabla_vinculo(conn):
                 ultimo_mensaje TEXT
             )
         """)
+        # Foto del detalle de la Ruta en SR (estado, km, horas...) para los reportes, sin llamar a SR cada vez
+        cur.execute("ALTER TABLE sr_vinculo_viaje ADD COLUMN IF NOT EXISTS detalle_sr TEXT")
+        cur.execute("ALTER TABLE sr_vinculo_viaje ADD COLUMN IF NOT EXISTS detalle_sr_fecha TIMESTAMP")
     conn.commit()
     _TABLA_VINCULO_LISTA = True
 

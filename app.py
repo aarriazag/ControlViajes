@@ -1643,30 +1643,42 @@ def obtener_viajes_recientes(limite=10):
         )
 
 
-def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
-    """Un renglón por viaje: la tienda que se muestra es la más lejana (mayor km)
-    del viaje, junto con cuántas tiendas llevaba en total. BULTOS = solo cajas."""
+def _despachos_de_pedidos_json(texto):
+    """'[{"pedido": "779657", ...}, ...]' -> ['779657', ...]. Tolera vacíos y texto dañado."""
+    try:
+        return [str(p["pedido"]) for p in (json.loads(texto) if texto else []) if p.get("pedido")]
+    except (json.JSONDecodeError, TypeError, AttributeError, KeyError):
+        return []
+
+
+def obtener_reporte_anexo_viajes(fecha_inicio, fecha_fin, cliente="Todos"):
+    """REPORTE ANEXO DE VIAJES: un renglón por viaje, con TODOS sus destinos en una sola celda
+    (en el orden de la ruta), como referencia de los viajes realizados. Incluye el No. de viaje
+    de SimpliRoute (los primeros 8 caracteres del id de la Ruta, como se ve en SR). BULTOS = solo cajas."""
+    sr_int.asegurar_vinculo(get_conn)
     with closing(get_conn()) as conn:
         query = """
             WITH agregado AS (
                 SELECT viaje_id,
                        STRING_AGG(marchamo_ida, ' / ' ORDER BY orden) AS marchamos,
+                       STRING_AGG(tienda, ', ' ORDER BY orden) AS destinos,
                        COUNT(*) AS cantidad_tiendas,
                        SUM(cajas) AS bultos
                 FROM destinos
                 GROUP BY viaje_id
             ),
             mas_lejano AS (
-                SELECT DISTINCT ON (viaje_id) viaje_id, tienda, tipo_pago
+                SELECT DISTINCT ON (viaje_id) viaje_id, tipo_pago
                 FROM destinos
                 ORDER BY viaje_id, km DESC NULLS LAST
             )
             SELECT
                 v.fecha_creacion AS "Fecha",
                 v.id_viaje AS "No. Despacho",
+                LEFT(s.route_id_sr, 8) AS "No. de Viaje SimpliRoute",
                 v.usuario_creador AS "Supervisor/Coordinador",
                 ag.marchamos AS "No. de Marchamo",
-                ml.tienda AS "Tienda (más lejana)",
+                ag.destinos AS "Destinos",
                 ag.cantidad_tiendas AS "Cantidad de Tiendas",
                 v.placa AS "Placa",
                 v.piloto AS "Piloto a Cargo",
@@ -1681,6 +1693,7 @@ def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
             FROM viajes v
             JOIN agregado ag ON ag.viaje_id = v.id
             JOIN mas_lejano ml ON ml.viaje_id = v.id
+            LEFT JOIN sr_vinculo_viaje s ON s.id_viaje = v.id_viaje
             LEFT JOIN cat_camiones cam ON cam.placa = v.placa
             LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
             WHERE v.estado != 'Anulado'
@@ -1689,6 +1702,71 @@ def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
             ORDER BY v.fecha_creacion DESC, v.id DESC
         """
         return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+
+
+def obtener_reporte_bitacora_destinos(fecha_inicio, fecha_fin, cliente="Todos"):
+    """BITÁCORA DE VIAJES: un renglón por DESTINO (tienda). Cada renglón trae el destino más lejano
+    de su viaje y los km de la ruta lejana, el detalle de cajas, roles y tarimas de esa tienda, y el
+    detalle de la Ruta en SimpliRoute (guardado; se puede actualizar al generar)."""
+    sr_int.asegurar_vinculo(get_conn)
+    with closing(get_conn()) as conn:
+        query = """
+            SELECT
+                v.fecha_creacion AS "Fecha",
+                v.id_viaje AS "No. de Viaje",
+                LEFT(s.route_id_sr, 8) AS "No. de Viaje SimpliRoute",
+                v.cliente AS "Cliente",
+                v.cd_origen AS "Origen",
+                d.orden AS "Orden de Parada",
+                d.tienda AS "Destino (Tienda)",
+                d.km AS "Km del Destino",
+                FIRST_VALUE(d.tienda) OVER w AS "Destino más Lejano del Viaje",
+                MAX(d.km) OVER (PARTITION BY d.viaje_id) AS "Km Ruta Lejana",
+                CASE WHEN ROW_NUMBER() OVER w = 1 THEN 'Sí' ELSE '' END AS "¿Es el más Lejano?",
+                d.tipo_pago AS "Clasificación de Destino",
+                d.pedidos AS _pedidos,
+                d.marchamo_ida AS "Marchamo de Ida",
+                d.marchamo_regreso AS "Marchamo de Regreso",
+                d.cajas AS "Cajas",
+                d.roles AS "Roles",
+                d.tarimas AS "Tarimas",
+                d.peso AS "Peso",
+                COALESCE(d.roles_devueltos, 0) AS "Roles Devueltos",
+                COALESCE(d.tarimas_devueltas, 0) AS "Tarimas Devueltas",
+                COALESCE(d.pacas_carton_devueltas, 0) AS "Pacas de Cartón Devueltas",
+                d.estado_entrega AS "Estado de Entrega",
+                v.placa AS "Placa",
+                COALESCE(v.placa_furgon, '') AS "Placa Furgón",
+                v.piloto AS "Piloto a Cargo",
+                v.auxiliar AS "Auxiliar",
+                cam.tipo AS "Tonelaje",
+                v.transportista AS "Transportista",
+                tr.razon_social AS "Razón Social",
+                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje",
+                v.estado AS "Estado del Viaje",
+                s.detalle_sr AS _detalle_sr,
+                s.detalle_sr_fecha AS _detalle_sr_fecha
+            FROM destinos d
+            JOIN viajes v ON v.id = d.viaje_id
+            LEFT JOIN sr_vinculo_viaje s ON s.id_viaje = v.id_viaje
+            LEFT JOIN cat_camiones cam ON cam.placa = v.placa
+            LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
+            WHERE v.estado != 'Anulado'
+              AND v.fecha_creacion BETWEEN %s AND %s
+              AND (%s = 'Todos' OR v.cliente = %s)
+            WINDOW w AS (PARTITION BY d.viaje_id ORDER BY d.km DESC NULLS LAST, d.orden)
+            ORDER BY v.fecha_creacion DESC, v.id DESC, d.orden
+        """
+        df = pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
+    if df.empty:
+        return df.drop(columns=["_pedidos", "_detalle_sr", "_detalle_sr_fecha"])
+    # No. de Despacho(s) de cada tienda, unidos con "-" (como en la bitácora del cliente)
+    df.insert(df.columns.get_loc("Clasificación de Destino") + 1, "No. de Despacho(s) de la Tienda",
+              df["_pedidos"].apply(lambda t: "-".join(_despachos_de_pedidos_json(t))))
+    # Detalle de la Ruta en SimpliRoute (columnas al final)
+    detalle = pd.DataFrame([sr_int.columnas_detalle_sr(t, f) for t, f in zip(df["_detalle_sr"], df["_detalle_sr_fecha"])])
+    df = pd.concat([df.drop(columns=["_pedidos", "_detalle_sr", "_detalle_sr_fecha"]).reset_index(drop=True), detalle], axis=1)
+    return df
 
 
 def _sanear_formulas(df):
@@ -3540,53 +3618,73 @@ def pagina_gestion_viajes():
 # ==========================================
 def pagina_reportes():
     reporte_sel = st.selectbox(
-        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
+        "Reporte", ["Reporte Anexo de Viajes", "Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
                     "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
     )
 
-    if reporte_sel == "Bitácora de Viajes":
-        st.subheader(":material/receipt_long: Bitácora de Viajes")
+    if reporte_sel in ("Reporte Anexo de Viajes", "Bitácora de Viajes"):
+        es_anexo = reporte_sel == "Reporte Anexo de Viajes"
+        clave_rep = "anexo" if es_anexo else "bitacora"
+        st.subheader(":material/receipt_long: " + reporte_sel)
+        if es_anexo:
+            st.caption("Un renglón por viaje, con todos sus destinos en una sola celda — referencia de los viajes realizados.")
+        else:
+            st.caption("Un renglón por destino (tienda), con el destino más lejano del viaje, el detalle de cajas, roles y "
+                       "tarimas por tienda y el detalle de la Ruta en SimpliRoute.")
 
         fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1.3, 0.8])
         with fcol1:
-            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7))
+            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key=f"rep_{clave_rep}_ini")
         with fcol2:
-            fecha_fin = st.date_input("Hasta", value=ahora().date())
+            fecha_fin = st.date_input("Hasta", value=ahora().date(), key=f"rep_{clave_rep}_fin")
         with fcol3:
             clientes_reporte = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
-            cliente_reporte = st.selectbox("Cliente", clientes_reporte)
+            cliente_reporte = st.selectbox("Cliente", clientes_reporte, key=f"rep_{clave_rep}_cli")
         with fcol4:
             st.write("")
-            generar = st.button(":material/search: Generar", use_container_width=True)
+            generar = st.button(":material/search: Generar", use_container_width=True, key=f"rep_{clave_rep}_gen")
+        actualizar_sr = False
+        if not es_anexo:
+            actualizar_sr = st.checkbox("Actualizar el detalle desde SimpliRoute antes de generar (más lento: consulta cada ruta, "
+                                        "hasta 60)", key=f"rep_{clave_rep}_sr")
 
         if generar:
-            st.session_state["df_bitacora"] = obtener_reporte_bitacora(fecha_ini, fecha_fin, cliente_reporte)
+            if actualizar_sr:
+                with st.spinner("Consultando SimpliRoute..."):
+                    ok_sr, msg_sr = sr_int.refrescar_detalle_rango(get_conn, fecha_ini, fecha_fin, cliente_reporte)
+                (st.success if ok_sr else st.warning)(msg_sr)
+            funcion = obtener_reporte_anexo_viajes if es_anexo else obtener_reporte_bitacora_destinos
+            st.session_state[f"df_rep_{clave_rep}"] = funcion(fecha_ini, fecha_fin, cliente_reporte)
 
-        df_bitacora = st.session_state.get("df_bitacora")
+        df_bitacora = st.session_state.get(f"df_rep_{clave_rep}")
         if df_bitacora is not None:
             if df_bitacora.empty:
                 st.info("No hay viajes en ese rango de fechas para ese cliente.")
             else:
-                st.caption(f"{len(df_bitacora)} viaje(s) encontrados.")
+                if es_anexo:
+                    st.caption(f"{len(df_bitacora)} viaje(s) encontrados.")
+                else:
+                    st.caption(f"{len(df_bitacora)} destino(s) en {df_bitacora['No. de Viaje'].nunique()} viaje(s).")
                 # Ventana con su propio scroll, en vez de empujar toda la página
                 st.dataframe(df_bitacora, use_container_width=True, height=420)
 
+                nombre_base = "reporte_anexo_viajes" if es_anexo else "bitacora_viajes"
                 ecol1, ecol2 = st.columns(2)
                 with ecol1:
                     st.download_button(
                         ":material/download: Exportar a Excel",
                         data=exportar_excel(df_bitacora),
-                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.xlsx",
+                        file_name=f"{nombre_base}_{fecha_ini}_a_{fecha_fin}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
+                        use_container_width=True, key=f"rep_{clave_rep}_xlsx"
                     )
                 with ecol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
                         data=exportar_csv(df_bitacora),
-                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.csv",
+                        file_name=f"{nombre_base}_{fecha_ini}_a_{fecha_fin}.csv",
                         mime="text/csv",
-                        use_container_width=True
+                        use_container_width=True, key=f"rep_{clave_rep}_csv"
                     )
         else:
             st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
