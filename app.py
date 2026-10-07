@@ -450,6 +450,36 @@ st.markdown("""
             padding-left: 8px;
         }
         [data-testid="stLogo"] { padding-left: 6px; }
+        /* Flecha para abrir el menú lateral: vive en esta barra verde, y por
+           defecto Streamlit la pinta gris oscuro (casi invisible sobre el
+           verde). Blanca, con un resalte suave al pasar el mouse/dedo. Los 3
+           selectores cubren las distintas versiones de Streamlit. */
+        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"],
+        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"] span,
+        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"] svg,
+        [data-testid="stSidebarCollapsedControl"] button,
+        [data-testid="stSidebarCollapsedControl"] svg,
+        [data-testid="collapsedControl"] button,
+        [data-testid="collapsedControl"] svg {
+            color: #FFFFFF !important;
+        }
+        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"]:hover,
+        [data-testid="stSidebarCollapsedControl"] button:hover,
+        [data-testid="collapsedControl"] button:hover {
+            background-color: rgba(255, 255, 255, 0.16) !important;
+            border-radius: 8px;
+        }
+        /* Menú de los 3 puntos (⋮) de la derecha: mismo problema, gris oscuro
+           sobre el verde. Blanco también. El menú desplegable que se abre
+           al tocarlo vive fuera de esta barra, así que conserva su look normal. */
+        header[data-testid="stHeader"] [data-testid="stToolbar"] button,
+        header[data-testid="stHeader"] [data-testid="stToolbar"] button * {
+            color: #FFFFFF !important;
+        }
+        header[data-testid="stHeader"] [data-testid="stToolbar"] button:hover {
+            background-color: rgba(255, 255, 255, 0.16) !important;
+            border-radius: 8px;
+        }
 
         /* --- Inputs, selects, textareas: look de producto moderno, no de formulario
            de los 2000s --- */
