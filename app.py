@@ -486,6 +486,45 @@ st.markdown("""
             box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
         }
 
+        /* Panel "Vehículos que pidió el cliente" (Despacho): dos tarjetas —
+           fecha + estado del día a la izquierda; cantidad + guardar a la
+           derecha. Todo con los tokens de marca de arriba. Las reglas que
+           dependen de la versión de Streamlit (botón verde, número grande)
+           fallan "en suave": si no aplican, el panel se ve igual de ordenado,
+           solo sin ese detalle. */
+        .ransa-sol-micro {
+            font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+            text-transform: uppercase; color: var(--gris-medio); margin-bottom: 2px;
+        }
+        .ransa-sol-chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-height: 58px; margin-top: 2px; padding-bottom: 0.9rem; }
+        .ransa-sol-chip {
+            display: inline-flex; align-items: center; gap: 7px;
+            font-size: 12.5px; font-weight: 600; color: #4B5563;
+            background: #F3F4F6; border-radius: 999px; padding: 5px 12px;
+        }
+        .ransa-sol-chip.ok   { background: var(--ransa-verde-claro); color: var(--ransa-verde); }
+        .ransa-sol-chip.pos  { background: white; border: 1px solid var(--gris-borde); color: var(--gris-texto); }
+        .ransa-sol-chip.warn { background: #FEF3E8; color: var(--ransa-naranja); }
+        .ransa-sol-dot { width: 8px; height: 8px; border-radius: 99px; background: #9AA0A6; display: inline-block; }
+        .ransa-sol-chip.ok .ransa-sol-dot { background: var(--ransa-verde); box-shadow: 0 0 0 3px rgba(11, 74, 50, 0.15); }
+        .ransa-sol-prog { margin: 2px 4px 0; padding-bottom: 0.9rem; }
+        .ransa-sol-prog-top { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--gris-medio); margin-bottom: 6px; }
+        .ransa-sol-prog-top b { color: var(--ransa-verde); }
+        .ransa-sol-track { height: 8px; background: var(--ransa-verde-claro); border-radius: 99px; overflow: hidden; }
+        .ransa-sol-fill { height: 100%; background: var(--ransa-verde); border-radius: 99px; }
+        /* Botón Guardar/Actualizar: verde sólido de marca (el type="primary"
+           global es gris oscuro; aquí este botón es la acción principal del panel). */
+        div.st-key-sol_guardar div.stButton > button {
+            background-color: var(--ransa-verde) !important;
+            color: white !important;
+            border: none !important;
+        }
+        div.st-key-sol_guardar div.stButton > button:hover {
+            background-color: var(--ransa-verde-oscuro) !important;
+        }
+        /* Cantidad en grande */
+        div[class*="st-key-sol_cant_"] input { font-size: 22px !important; font-weight: 700 !important; }
+
         /* Alertas con acento de color a la izquierda, look más "SaaS" */
         div[data-testid="stAlertContentSuccess"] { border-left: 4px solid #16794C; padding-left: 10px; }
         div[data-testid="stAlertContentInfo"] { border-left: 4px solid #2563AE; padding-left: 10px; }
@@ -2533,24 +2572,51 @@ def posicionamiento_del_dia(cliente, fecha):
 
 
 def panel_solicitud_vehiculos(cliente):
-    """Recuadro de Despacho: cuántos vehículos pidió el cliente hoy y cuántos van posicionados."""
+    """Recuadro de Despacho: cuántos vehículos pidió el cliente hoy y cuántos van posicionados.
+    Dos tarjetas: (izquierda) fecha + estado del día, (derecha) cantidad + guardar."""
     try:
         with st.expander(":material/call_received: Vehículos que pidió el cliente", expanded=False):
-            fecha = st.date_input("Fecha de la solicitud", value=ahora().date(), key="sol_fecha")
-            solicitados, posicionados = posicionamiento_del_dia(cliente, fecha)
-            if solicitados is None:
-                st.caption(f"Todavía no hay solicitud registrada. Posicionados ese día: **{posicionados}**.")
-            else:
-                st.caption(f"Solicitados **{solicitados}** · Posicionados **{posicionados}** · Pendientes **{max(solicitados - posicionados, 0)}**"
-                           + (f" · Excedente **{posicionados - solicitados}**" if posicionados > solicitados else ""))
-            c1, c2 = st.columns([2, 1])
-            cantidad = c1.number_input("Vehículos solicitados", min_value=0, max_value=500, step=1,
-                                       value=int(solicitados or 0), key=f"sol_cant_{cliente}_{fecha}")
-            c2.write("")
-            if c2.button(":material/save: Guardar", key="sol_guardar", use_container_width=True):
-                ok, msg = guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario_activo)
-                st.session_state["flash_solicitud"] = ("success" if ok else "error", msg)
-                st.rerun()
+            col_fecha, col_cant = st.columns([5, 7], gap="medium")
+
+            with col_fecha:
+                with st.container(border=True):
+                    st.markdown('<div class="ransa-sol-micro">Fecha de la solicitud</div>', unsafe_allow_html=True)
+                    fecha = st.date_input("Fecha de la solicitud", value=ahora().date(), key="sol_fecha",
+                                          label_visibility="collapsed")
+                    st.caption("Día para el que el cliente hizo la solicitud.")
+                    solicitados, posicionados = posicionamiento_del_dia(cliente, fecha)
+                    if solicitados is None:
+                        chips = ('<span class="ransa-sol-chip"><i class="ransa-sol-dot"></i>Sin solicitud registrada</span>'
+                                 f'<span class="ransa-sol-chip pos">Posicionados ese día: <b>{posicionados}</b></span>')
+                    else:
+                        chips = ('<span class="ransa-sol-chip ok"><i class="ransa-sol-dot"></i>Solicitud registrada</span>'
+                                 f'<span class="ransa-sol-chip pos">Posicionados: <b>{posicionados}</b></span>'
+                                 f'<span class="ransa-sol-chip pos">Pendientes: <b>{max(solicitados - posicionados, 0)}</b></span>')
+                        if posicionados > solicitados:
+                            chips += f'<span class="ransa-sol-chip warn">Excedente: <b>{posicionados - solicitados}</b></span>'
+                    st.markdown(f'<div class="ransa-sol-chips">{chips}</div>', unsafe_allow_html=True)
+
+            with col_cant:
+                with st.container(border=True):
+                    st.markdown('<div class="ransa-sol-micro">Vehículos solicitados</div>', unsafe_allow_html=True)
+                    cantidad = st.number_input("Vehículos solicitados", min_value=0, max_value=500, step=1,
+                                               value=int(solicitados or 0), key=f"sol_cant_{cliente}_{fecha}",
+                                               label_visibility="collapsed")
+                    st.caption("Cantidad total que el cliente pidió para esa fecha.")
+                    texto_boton = "Guardar solicitud" if solicitados is None else "Actualizar solicitud"
+                    if st.button(f":material/save: {texto_boton}", key="sol_guardar", type="primary", use_container_width=True):
+                        ok, msg = guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario_activo)
+                        st.session_state["flash_solicitud"] = ("success" if ok else "error", msg)
+                        st.rerun()
+
+            if solicitados:
+                pct = min(round(posicionados / solicitados * 100), 100)
+                st.markdown(
+                    '<div class="ransa-sol-prog"><div class="ransa-sol-prog-top">'
+                    f'<span>Posicionamiento del día</span><b>{posicionados} de {solicitados} · {pct}%</b></div>'
+                    f'<div class="ransa-sol-track"><div class="ransa-sol-fill" style="width:{pct}%"></div></div></div>',
+                    unsafe_allow_html=True)
+
             flash = st.session_state.pop("flash_solicitud", None)
             if flash:
                 getattr(st, flash[0])(flash[1])
