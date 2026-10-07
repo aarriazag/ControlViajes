@@ -3,9 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import psycopg2
 import psycopg2.extras
-from psycopg2 import sql as psql
 import json
-import re
 import io
 import os
 import base64
@@ -18,9 +16,6 @@ import string
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import closing
-import requests
-import integracion_simpliroute as sr_int
-
 
 # --- VERSIÓN DE LA APP ---
 # Formato estándar Mayor.Menor.Parche:
@@ -29,11 +24,6 @@ import integracion_simpliroute as sr_int
 #   Mayor   (el primero)       = cambio de fondo en cómo funciona la herramienta (ej. 1.9.4 → 2.0.0)
 # Se actualiza a mano en cada entrega — no se calcula solo.
 VERSION_APP = "1.0.0"
-
-# Tonelaje que va con cabezal + furgón como una sola unidad (placa_furgon).
-# Una sola constante en vez de repetir "20 Ton" en 5 lugares del código —
-# si el tonelaje cambia de nombre otra vez, se corrige aquí una sola vez.
-TIPO_CABEZAL_FURGON = "20TM"
 
 # Equivalencia acordada con el cliente: cada paca de cartón retornada equivale
 # a 50 lbs — se usa para reportar el retornable de cartón en libras, que es
@@ -233,26 +223,6 @@ st.markdown("""
             box-shadow: none;
         }
 
-        /* Botones secundarios (acciones alternas, no la CTA principal de la
-           pantalla) — contorno en el verde de marca, fondo transparente,
-           se rellena solo al pasar el mouse. Cubre ambos selectores que
-           usan distintas versiones de Streamlit para el tipo "secondary". */
-        div.stButton > button[kind="secondary"],
-        div.stButton > button[data-testid="stBaseButton-secondary"] {
-            background-color: white !important;
-            color: var(--ransa-verde) !important;
-            border: 1.5px solid var(--ransa-verde) !important;
-            border-radius: 8px !important;
-            font-weight: 600 !important;
-            box-shadow: none !important;
-        }
-        div.stButton > button[kind="secondary"]:hover,
-        div.stButton > button[data-testid="stBaseButton-secondary"]:hover {
-            background-color: var(--ransa-verde-claro) !important;
-            color: var(--ransa-verde-oscuro) !important;
-            border-color: var(--ransa-verde-oscuro) !important;
-        }
-
         /* Enlaces de navegación (los genera st.navigation solo, dentro del
            sidebar) — texto normal, resalte verde clarito en la página activa,
            reutilizando el mismo verde clarito que ya existe en el sistema de
@@ -362,124 +332,13 @@ st.markdown("""
             letter-spacing: 0.03em; text-transform: uppercase; margin-left: 8px;
         }
 
-        /* Panel lateral verde de las pantallas previas al login (Iniciar
-           Sesión, Cambio de Contraseña, Selección de Cliente/CD) — mismo
-           degradado y tokens de marca que el resto de la app, nada de
-           colores nuevos. Se oculta en pantallas angostas (< 900px) para no
-           dejar el formulario apretado en celular/tablet. */
-        .ransa-login-sidebar {
-            background: linear-gradient(165deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
-            border-radius: 12px;
-            min-height: 620px;
-            box-sizing: border-box;
-            padding: 34px 22px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            position: relative;
-            overflow: hidden;
-        }
-        .ransa-login-sidebar::before {
-            content: ""; position: absolute; right: -60px; top: -50px;
-            width: 180px; height: 180px; border-radius: 999px;
-            background: rgba(255,255,255,0.05);
-        }
-        .ransa-login-sidebar::after {
-            content: ""; position: absolute; left: -70px; bottom: -50px;
-            width: 180px; height: 180px; border-radius: 999px;
-            background: rgba(255,255,255,0.04);
-        }
-        .ransa-login-sidebar .ransa-login-badge {
-            position: relative; background: #FFFFFF; border-radius: 10px;
-            padding: 12px 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-            margin-top: auto;
-        }
-        .ransa-login-sidebar .ransa-login-badge img { height: 36px; display: block; }
-        .ransa-login-sidebar .ransa-login-caption {
-            position: relative; text-align: center; color: #fff;
-            font-size: 15px; font-weight: 600; margin-top: 18px; margin-bottom: auto;
-        }
-        .ransa-login-sidebar .ransa-login-copyright {
-            position: relative; color: rgba(255,255,255,0.75); font-size: 11px; text-align: center;
-        }
-        @media (max-width: 900px) {
-            .ransa-login-sidebar { display: none; }
-        }
-
-        /* Responsivo: en pantallas angostas (otra resolución/otra computadora),
-           el texto de la barra no se corta a la mitad de una palabra ni se sale
-           del contenedor — se ajusta con normalidad. Esto es correctivo, no
-           estético: sin overflow-wrap, un texto largo en un contenedor angosto
-           se desborda en vez de bajar de línea. */
-        .ransa-topbar .titulo,
-        .ransa-topbar .subtitulo,
-        .ransa-topbar .contexto {
-            overflow-wrap: break-word;
-            word-break: normal;
-            min-width: 0;
-        }
-        @media (max-width: 680px) {
-            .ransa-topbar {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 8px;
-            }
-            .ransa-topbar .contexto { text-align: left; }
-            .ransa-topbar .titulo { font-size: 17px; }
-        }
-        /* Red de seguridad general: texto normal de la app (párrafos, captions)
-           siempre se ajusta al ancho disponible, en cualquier resolución. */
-        .stMarkdown p, [data-testid="stCaptionContainer"] {
-            overflow-wrap: break-word;
-            word-break: normal;
-        }
-
         /* Reduce el padding superior por defecto de Streamlit para que la topbar quede pegada arriba */
-        .block-container { padding-top: 3.8rem; }
+        .block-container { padding-top: 0.8rem; }
         /* Quita la barra de color ("decoración") que Streamlit pone arriba por
            defecto — es el espacio vacío/resaltado que sobra encima del contenido.
            El menú de los 3 puntos (⋮) se queda intacto, solo se quita esa franja. */
         div[data-testid="stDecoration"] { display: none; }
-        /* El logo (st.logo) vive en esta barra nativa de Streamlit — antes quedaba
-           transparente, así que el logo flotaba solo sobre el fondo oscuro de la
-           página, desconectado visualmente de tu barra verde de abajo. Ahora usa
-           el mismo verde de marca, para que se lea como una sola pieza. */
-        header[data-testid="stHeader"] {
-            height: 3.2rem;
-            background: linear-gradient(90deg, var(--ransa-verde) 0%, var(--ransa-verde-oscuro) 100%);
-            padding-left: 8px;
-        }
-        [data-testid="stLogo"] { padding-left: 6px; }
-        /* Flecha para abrir el menú lateral: vive en esta barra verde, y por
-           defecto Streamlit la pinta gris oscuro (casi invisible sobre el
-           verde). Blanca, con un resalte suave al pasar el mouse/dedo. Los 3
-           selectores cubren las distintas versiones de Streamlit. */
-        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"],
-        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"] span,
-        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"] svg,
-        [data-testid="stSidebarCollapsedControl"] button,
-        [data-testid="stSidebarCollapsedControl"] svg,
-        [data-testid="collapsedControl"] button,
-        [data-testid="collapsedControl"] svg {
-            color: #FFFFFF !important;
-        }
-        header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"]:hover,
-        [data-testid="stSidebarCollapsedControl"] button:hover,
-        [data-testid="collapsedControl"] button:hover {
-            background-color: rgba(255, 255, 255, 0.16) !important;
-            border-radius: 8px;
-        }
-        /* Menú de los 3 puntos (⋮) de la derecha: mismo problema, gris oscuro
-           sobre el verde. Blanco también. El menú desplegable que se abre
-           al tocarlo vive fuera de esta barra, así que conserva su look normal. */
-        header[data-testid="stHeader"] [data-testid="stToolbar"] button,
-        header[data-testid="stHeader"] [data-testid="stToolbar"] button * {
-            color: #FFFFFF !important;
-        }
-        header[data-testid="stHeader"] [data-testid="stToolbar"] button:hover {
-            background-color: rgba(255, 255, 255, 0.16) !important;
-            border-radius: 8px;
-        }
+        header[data-testid="stHeader"] { height: 2.2rem; background: transparent; }
 
         /* --- Inputs, selects, textareas: look de producto moderno, no de formulario
            de los 2000s --- */
@@ -515,45 +374,6 @@ st.markdown("""
             border-radius: 10px !important;
             box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
         }
-
-        /* Panel "Vehículos que pidió el cliente" (Despacho): dos tarjetas —
-           fecha + estado del día a la izquierda; cantidad + guardar a la
-           derecha. Todo con los tokens de marca de arriba. Las reglas que
-           dependen de la versión de Streamlit (botón verde, número grande)
-           fallan "en suave": si no aplican, el panel se ve igual de ordenado,
-           solo sin ese detalle. */
-        .ransa-sol-micro {
-            font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
-            text-transform: uppercase; color: var(--gris-medio); margin-bottom: 2px;
-        }
-        .ransa-sol-chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-height: 58px; margin-top: 2px; padding-bottom: 0.9rem; }
-        .ransa-sol-chip {
-            display: inline-flex; align-items: center; gap: 7px;
-            font-size: 12.5px; font-weight: 600; color: #4B5563;
-            background: #F3F4F6; border-radius: 999px; padding: 5px 12px;
-        }
-        .ransa-sol-chip.ok   { background: var(--ransa-verde-claro); color: var(--ransa-verde); }
-        .ransa-sol-chip.pos  { background: white; border: 1px solid var(--gris-borde); color: var(--gris-texto); }
-        .ransa-sol-chip.warn { background: #FEF3E8; color: var(--ransa-naranja); }
-        .ransa-sol-dot { width: 8px; height: 8px; border-radius: 99px; background: #9AA0A6; display: inline-block; }
-        .ransa-sol-chip.ok .ransa-sol-dot { background: var(--ransa-verde); box-shadow: 0 0 0 3px rgba(11, 74, 50, 0.15); }
-        .ransa-sol-prog { margin: 2px 4px 0; padding-bottom: 0.9rem; }
-        .ransa-sol-prog-top { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--gris-medio); margin-bottom: 6px; }
-        .ransa-sol-prog-top b { color: var(--ransa-verde); }
-        .ransa-sol-track { height: 8px; background: var(--ransa-verde-claro); border-radius: 99px; overflow: hidden; }
-        .ransa-sol-fill { height: 100%; background: var(--ransa-verde); border-radius: 99px; }
-        /* Botón Guardar/Actualizar: verde sólido de marca (el type="primary"
-           global es gris oscuro; aquí este botón es la acción principal del panel). */
-        div.st-key-sol_guardar div.stButton > button {
-            background-color: var(--ransa-verde) !important;
-            color: white !important;
-            border: none !important;
-        }
-        div.st-key-sol_guardar div.stButton > button:hover {
-            background-color: var(--ransa-verde-oscuro) !important;
-        }
-        /* Cantidad en grande */
-        div[class*="st-key-sol_cant_"] input { font-size: 22px !important; font-weight: 700 !important; }
 
         /* Alertas con acento de color a la izquierda, look más "SaaS" */
         div[data-testid="stAlertContentSuccess"] { border-left: 4px solid #16794C; padding-left: 10px; }
@@ -735,7 +555,6 @@ def init_db():
             )
         """)
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT TRUE")
-        cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS capacidad_cajas INTEGER")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_clientes_tiendas (
                 cliente TEXT, tienda TEXT, km REAL,
@@ -758,7 +577,6 @@ def init_db():
                 tipo TEXT PRIMARY KEY, km_por_galon REAL
             )
         """)
-        cur.execute("ALTER TABLE cat_rendimiento_camion ADD COLUMN IF NOT EXISTS capacidad_cajas_default INTEGER")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_cds_por_cliente (
                 cliente TEXT, cd TEXT, PRIMARY KEY (cliente, cd)
@@ -800,29 +618,6 @@ def init_db():
             UPDATE cat_clientes SET estado_cliente = CASE WHEN activo THEN 'Activo' ELSE 'Inactivo' END
             WHERE estado_cliente IS NULL
         """)
-        # Segmento del cliente: ¿hay integración con su WMS (pedidos, etc.) o solo se le transporta mercadería?
-        # Sin valor por defecto a propósito: un cliente sin clasificar sale como "Sin clasificar" en los reportes.
-        cur.execute("ALTER TABLE cat_clientes ADD COLUMN IF NOT EXISTS integracion_wms TEXT")
-        cur.execute("""
-            DO $$ BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_cliente_integracion_wms') THEN
-                    ALTER TABLE cat_clientes ADD CONSTRAINT chk_cliente_integracion_wms
-                        CHECK (integracion_wms IN ('Integración WMS', 'No Integración WMS'));
-                END IF;
-            END $$
-        """)
-        # Vehículos que pide cada cliente por día (base del reporte de Posicionamiento).
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS solicitudes_transporte (
-                fecha DATE NOT NULL,
-                cliente TEXT NOT NULL REFERENCES cat_clientes(nombre) ON UPDATE CASCADE ON DELETE RESTRICT,
-                vehiculos_solicitados INTEGER NOT NULL CHECK (vehiculos_solicitados >= 0),
-                observaciones TEXT,
-                registrado_por TEXT,
-                actualizado TIMESTAMP DEFAULT NOW(),
-                PRIMARY KEY (fecha, cliente)
-            )
-        """)
         # Bitácora de auditoría: quién hizo qué y cuándo, en toda la app.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS auditoria (
@@ -846,6 +641,62 @@ def init_db():
         """)
         conn.commit()
 
+        # Sembrar datos de ejemplo — cada INSERT usa ON CONFLICT DO NOTHING, así
+        # que es seguro que este bloque corra más de una vez (por ejemplo, si un
+        # Borrado Masivo deja alguna de estas tablas en cero: eso no debe hacer
+        # que se vuelvan a sembrar TODAS, chocando con lo que sí sigue ahí).
+        cur.execute("SELECT COUNT(*) FROM cat_clientes_tiendas")
+        if cur.fetchone()[0] == 0:
+            cur.executemany("INSERT INTO cat_transportistas (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
+                             [("Transportes Express",), ("Logística del Norte",), ("Flota Interna",)])
+            cur.executemany("INSERT INTO cat_pilotos (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
+                             [("Juan Pérez",), ("María Rodríguez",), ("Luis Martínez",), ("Andrés Custodio",)])
+            cur.executemany("INSERT INTO cat_auxiliares (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
+                             [("Carlos López",), ("Pedro Gómez",), ("José Hernández",), ("Ramiro Ruiz",)])
+            cur.executemany(
+                "INSERT INTO cat_camiones (placa, tipo, transportista, piloto, auxiliar) VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (placa) DO NOTHING",
+                [("C-123ABC", "5 Ton", "Transportes Express", "Juan Pérez", "Carlos López"),
+                 ("C-456DEF", "10 Ton", "Logística del Norte", "María Rodríguez", "Pedro Gómez"),
+                 ("C-789GHI", "20 Ton", "Flota Interna", "Luis Martínez", "José Hernández")]
+            )
+            cur.executemany(
+                "INSERT INTO cat_clientes (nombre) VALUES (%s) ON CONFLICT (nombre) DO NOTHING",
+                [("Dollarcity",), ("UniSuper",), ("UniSuper Importados",), ("UniSuper LTX",)]
+            )
+            cur.executemany(
+                "INSERT INTO cat_clientes_tiendas (cliente, tienda, km) VALUES (%s,%s,%s) "
+                "ON CONFLICT (cliente, tienda) DO NOTHING",
+                [("Dollarcity", "Dollarcity Zona 10", 15.5),
+                 ("Dollarcity", "Dollarcity Mixco", 32.0),
+                 ("UniSuper", "UniSuper Central", 22.1),
+                 ("UniSuper Importados", "UniSuper Importados Norte", 18.0),
+                 ("UniSuper LTX", "UniSuper LTX Sur", 45.3)]
+            )
+            cur.executemany(
+                "INSERT INTO cat_rendimiento_camion (tipo, km_por_galon) VALUES (%s,%s) ON CONFLICT (tipo) DO NOTHING",
+                [("5 Ton", 8.0), ("10 Ton", 6.0), ("20 Ton", 4.0)]
+            )
+            cur.executemany(
+                "INSERT INTO cat_cds_por_cliente (cliente, cd) VALUES (%s,%s) ON CONFLICT (cliente, cd) DO NOTHING",
+                [("Dollarcity", "CD Barcenas"), ("Dollarcity", "CD Central"),
+                 ("UniSuper", "CD Barcenas"),
+                 ("UniSuper Importados", "CD Barcenas"),
+                 ("UniSuper LTX", "CD Barcenas")]
+            )
+            cur.executemany(
+                "INSERT INTO cat_usuarios (usuario, perfil) VALUES (%s,%s) ON CONFLICT (usuario) DO NOTHING",
+                [("Admin_Logistica", "SuperAdministrador"), ("Op_Salidas", "Operador"), ("Liq_Transporte", "Liquidador")]
+            )
+            # Por defecto, los usuarios de ejemplo (no-Administrador) ven todos los
+            # clientes sembrados, para no romper nada mientras ajustas los accesos reales.
+            cur.executemany(
+                "INSERT INTO cat_usuario_clientes (usuario, cliente) VALUES (%s,%s) ON CONFLICT (usuario, cliente) DO NOTHING",
+                [(u, c) for u in ("Op_Salidas", "Liq_Transporte")
+                 for c in ("Dollarcity", "UniSuper", "UniSuper Importados", "UniSuper LTX")]
+            )
+            conn.commit()
+
         # Por si "cat_clientes" se creó después de ya tener datos (upgrade de una
         # versión anterior de la app): rellena con cualquier cliente que ya exista
         # disperso en otras tablas, para que las llaves foráneas de abajo no fallen.
@@ -861,44 +712,19 @@ def init_db():
         """)
         conn.commit()
 
-        # Datos mínimos de referencia (no son datos de ejemplo): el piloto y el auxiliar
-        # "Sin ..." que se usan cuando un viaje no lleva uno. Idempotente.
-        cur.execute("INSERT INTO cat_pilotos (nombre, activo) VALUES ('Sin Piloto', TRUE) ON CONFLICT (nombre) DO NOTHING")
-        cur.execute("INSERT INTO cat_auxiliares (nombre, activo) VALUES ('Sin Auxiliar', TRUE) ON CONFLICT (nombre) DO NOTHING")
-        conn.commit()
-
-        # Primer ingreso a una base VACÍA: no hay usuarios de ejemplo ni contraseña conocida.
-        # El primer SuperAdministrador se crea UNA sola vez, con los datos que se pongan en
-        # Secrets (bloque [admin_inicial] con usuario y password). Queda obligado a cambiar
-        # la contraseña en su primer ingreso. Si la base ya tiene usuarios, esto no hace nada.
-        cur.execute("SELECT COUNT(*) FROM cat_usuarios")
-        if cur.fetchone()[0] == 0:
-            try:
-                _cfg_admin = st.secrets.get("admin_inicial")
-                _u_ini = str(_cfg_admin["usuario"]).strip() if _cfg_admin else ""
-                _p_ini = str(_cfg_admin["password"]) if _cfg_admin else ""
-            except Exception:
-                _u_ini, _p_ini = "", ""
-            if _u_ini and _p_ini:
-                _salt_ini, _hash_ini = hash_password(_p_ini)
+        # Contraseña temporal para cualquier usuario que todavía no tenga una
+        # (los 3 usuarios de ejemplo, o upgrades desde una versión sin login real).
+        # Todos quedan forzados a cambiarla en su primer ingreso.
+        cur.execute("SELECT usuario FROM cat_usuarios WHERE password_hash IS NULL")
+        usuarios_sin_password = [r[0] for r in cur.fetchall()]
+        if usuarios_sin_password:
+            salt_temp, hash_temp = hash_password("Ransa2026")
+            for u in usuarios_sin_password:
                 cur.execute(
-                    "INSERT INTO cat_usuarios (usuario, perfil, password_hash, password_salt, activo, "
-                    "debe_cambiar_password, creado_por) VALUES (%s,'SuperAdministrador',%s,%s,TRUE,TRUE,'Arranque inicial') "
-                    "ON CONFLICT (usuario) DO NOTHING",
-                    (_u_ini, _hash_ini, _salt_ini)
+                    "UPDATE cat_usuarios SET password_hash=%s, password_salt=%s, debe_cambiar_password=TRUE WHERE usuario=%s",
+                    (hash_temp, salt_temp, u)
                 )
             conn.commit()
-
-        # Esquema propio de la integración con SimpliRoute (tablas y columnas). Vive en
-        # integracion_simpliroute.py; si fallara, la app arranca igual sin la integración.
-        try:
-            sr_int.asegurar_esquema_sr(conn)
-        except Exception:
-            conn.rollback()
-        try:
-            sr_int.asegurar_esquema_formato(conn)
-        except Exception:
-            conn.rollback()
 
         # ---- Llaves foráneas con actualización en cascada ----
         # Esto es lo que de verdad evita que renombrar un piloto/auxiliar/
@@ -950,24 +776,17 @@ def cargar_catalogos_desde_db():
         cur.execute("SELECT nombre FROM cat_auxiliares WHERE activo = TRUE ORDER BY nombre")
         auxiliares = [r["nombre"] for r in cur.fetchall()]
 
-        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar, capacidad_cajas FROM cat_camiones WHERE activo = TRUE ORDER BY placa")
+        cur.execute("SELECT placa, tipo, transportista, piloto, auxiliar FROM cat_camiones WHERE activo = TRUE ORDER BY placa")
         camiones = {r["placa"]: {"tipo": r["tipo"], "transportista": r["transportista"],
-                                  "piloto": r["piloto"], "auxiliar": r["auxiliar"],
-                                  "capacidad_cajas": r["capacidad_cajas"]} for r in cur.fetchall()}
+                                  "piloto": r["piloto"], "auxiliar": r["auxiliar"]} for r in cur.fetchall()}
 
         cur.execute("SELECT cliente, tienda, km, clasificacion FROM cat_clientes_tiendas ORDER BY cliente, tienda")
         clientes = {}
         for r in cur.fetchall():
             clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "clasificacion": r["clasificacion"] or "Local"}
 
-        cur.execute("SELECT tipo, km_por_galon, capacidad_cajas_default FROM cat_rendimiento_camion ORDER BY tipo")
-        _filas_rendimiento = cur.fetchall()
-        rendimiento = {r["tipo"]: r["km_por_galon"] for r in _filas_rendimiento}
-        # El catálogo de Rendimiento es la fuente real de qué tonelajes existen —
-        # agregar un tipo nuevo (ej. "15TM") se hace ahí, y automáticamente queda
-        # disponible para elegir al dar de alta un camión, sin tocar código.
-        tipos_camion = [r["tipo"] for r in _filas_rendimiento]
-        capacidad_cajas_default = {r["tipo"]: r["capacidad_cajas_default"] for r in _filas_rendimiento}
+        cur.execute("SELECT tipo, km_por_galon FROM cat_rendimiento_camion ORDER BY tipo")
+        rendimiento = {r["tipo"]: r["km_por_galon"] for r in cur.fetchall()}
 
         cur.execute("SELECT nombre FROM cat_motivos_sin_pedido ORDER BY nombre")
         motivos_sin_pedido = [r["nombre"] for r in cur.fetchall()]
@@ -1008,8 +827,6 @@ def cargar_catalogos_desde_db():
             "clientes_lista_activos": clientes_lista_activos,
             "motivos_sin_pedido": motivos_sin_pedido,
             "rendimiento": rendimiento,
-            "tipos_camion": tipos_camion,
-            "capacidad_cajas_default": capacidad_cajas_default,
             "cds_por_cliente": cds_por_cliente,
             "tipo_operacion_por_cd": tipo_operacion_por_cd,
             "clientes_en_prueba": clientes_en_prueba,
@@ -1147,16 +964,6 @@ def crear_usuario(usuario, perfil, creado_por, clientes=None):
             conn.commit()
             registrar_auditoria(creado_por, "Crear usuario", f"Usuario nuevo: {usuario} · Perfil: {perfil} · Clientes: {', '.join(clientes or []) or '(ninguno)'}")
             return True, password_temp
-        except psycopg2.errors.UniqueViolation:
-            # El nombre de usuario es la llave primaria de cat_usuarios: si ya existe
-            # no es una falla del sistema, es un nombre repetido. No se revela el perfil
-            # de la cuenta existente (puede ser uno que quien crea no tiene permiso de ver).
-            conn.rollback()
-            return False, (f"El usuario '{usuario}' ya existe. Revisa la lista de 'Usuarios actuales' "
-                           f"(puede estar desactivado), o pide a un Administrador que lo revise si no "
-                           f"lo ves — puede ser una cuenta de un perfil que no tienes permiso de ver. "
-                           f"Si solo necesita acceso o contraseña, usa 'Generar Nueva Contraseña Temporal' "
-                           f"o reactívalo en vez de crearlo de nuevo.")
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "crear_usuario")
@@ -1226,7 +1033,6 @@ def actualizar_default_camion(placa, piloto, auxiliar):
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
-                auxiliar = sr_int.preparar_auxiliar_libre(cur, auxiliar)  # mismo nombre que quedó en el viaje
                 cur.execute(
                     "UPDATE cat_camiones SET piloto=%s, auxiliar=%s WHERE placa=%s",
                     (piloto, auxiliar, placa)
@@ -1236,70 +1042,32 @@ def actualizar_default_camion(placa, piloto, auxiliar):
             conn.rollback()  # si falla, no es crítico — el viaje ya se guardó bien
 
 
-def campo_auxiliar(etiqueta, opciones, valor_inicial, key):
-    """El Auxiliar es un campo LIBRE: se escribe el nombre (o se elige uno ya guardado, que sale
-    como sugerencia). Cada nombre nuevo se guarda solo al guardar el viaje, siempre con Mayúscula
-    Inicial. Si esta versión de Streamlit no permite escribir un valor nuevo dentro del
-    desplegable, se usa una caja de texto normal."""
-    try:
-        idx = opciones.index(valor_inicial) if valor_inicial in opciones else None
-        elegido = st.selectbox(etiqueta, opciones, index=idx, accept_new_options=True,
-                               placeholder="Escribe o elige el nombre", key=key)
-        return (elegido or "").strip()
-    except TypeError:
-        return st.text_input(etiqueta, value=valor_inicial or "", placeholder="Nombre del auxiliar", key=key).strip()
-
-
 # Config genérica usada por la pantalla de Catálogos: qué tabla, columnas y
 # llave primaria corresponden a cada catálogo, para no repetir código por cada uno.
-def normalizar_tonelaje(valor):
-    """Convierte variantes conocidas de tonelaje ('5 Ton', '05TN', '20 Ton'...)
-    al formato estándar ##TM. Devuelve None si no reconoce el valor — nunca
-    adivina un tonelaje que no haya visto antes, para no inventar datos."""
-    if not valor:
-        return None
-    limpio = str(valor).strip().upper().replace(" ", "")
-    if re.match(r"^\d{2}TM$", limpio):
-        return limpio
-    m = re.match(r"^0?(\d{1,2})(TON|TM|TN)?$", limpio)
-    if m:
-        return f"{int(m.group(1)):02d}TM"
-    return None
-
-
 CATALOGOS_CONFIG = {
-    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente", "integracion_wms"], "clave": ["nombre"], "numericas": [],
-                "opciones_desplegable": {"estado_cliente": ["Prueba", "Activo", "Inactivo"],
-                                         "integracion_wms": ["Integración WMS", "No Integración WMS"]},
-                "opcionales": ["integracion_wms"]},
-    "Solicitudes de Transporte": {"tabla": "solicitudes_transporte",
-                                  "columnas": ["fecha", "cliente", "vehiculos_solicitados", "observaciones"],
-                                  "clave": ["fecha", "cliente"], "numericas": ["vehiculos_solicitados"],
-                                  "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
+    "Clientes": {"tabla": "cat_clientes", "columnas": ["nombre", "estado_cliente"], "clave": ["nombre"], "numericas": [],
+                "opciones_desplegable": {"estado_cliente": ["Prueba", "Activo", "Inactivo"]}},
     "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social", "activo"], "clave": ["nombre"],
                        "numericas": [], "booleanas": ["activo"]},
     "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
                "booleanas": ["activo"]},
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
                   "booleanas": ["activo"]},
-    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "capacidad_cajas", "activo"],
+    "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "activo"],
                  "clave": ["placa"], "numericas": [], "booleanas": ["activo"],
-                 "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares", "tipo": "tipos_camion"}},
+                 "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares"}},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"],
                            "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]},
                            "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
-    "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon", "capacidad_cajas_default"],
-                               "clave": ["tipo"], "numericas": ["km_por_galon", "capacidad_cajas_default"]},
+    "Rendimiento por Camión": {"tabla": "cat_rendimiento_camion", "columnas": ["tipo", "km_por_galon"],
+                               "clave": ["tipo"], "numericas": ["km_por_galon"]},
     "CDs por Cliente": {"tabla": "cat_cds_por_cliente", "columnas": ["cliente", "cd", "tipo_operacion"],
                         "clave": ["cliente", "cd"], "numericas": [],
                         "opciones_desplegable": {"tipo_operacion": ["Distribución", "Transporte"]},
                         "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
     "Motivos de Viaje sin Pedido": {"tabla": "cat_motivos_sin_pedido", "columnas": ["nombre"],
                                     "clave": ["nombre"], "numericas": []},
-    # Siglas que siempre van en MAYÚSCULAS dentro de los nombres (MYM, TESA, S.A., KFC...). Aquí se
-    # agregan las que falten; el formato de nombres de todos los catálogos las respeta.
-    "Siglas": {"tabla": "cat_siglas", "columnas": ["sigla"], "clave": ["sigla"], "numericas": []},
     # "Usuarios" ya no se gestiona aquí como catálogo genérico — crear una cuenta
     # necesita generarle una contraseña, así que vive en la pestaña "Usuarios"
     # dedicada (Gestión de Usuarios), no en un data_editor de texto plano.
@@ -1339,10 +1107,6 @@ def _mensaje_foreign_key_amigable(e):
     en vez del texto técnico crudo — usado tanto al agregar/corregir un
     registro individual como al guardar la tabla completa."""
     detalle = str(e)
-    if "vehiculos_solicitados" in detalle:
-        return "No se pudo guardar — la cantidad de vehículos solicitados no puede ser negativa."
-    if "chk_cliente_integracion_wms" in detalle:
-        return "No se pudo guardar — «Integración con WMS» solo puede ser «Integración WMS» o «No Integración WMS» (o quedar vacío)."
     if "piloto" in detalle:
         pista = "el Piloto"
     elif "auxiliar" in detalle:
@@ -1360,15 +1124,13 @@ def _mensaje_foreign_key_amigable(e):
 def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clientes_permitidos=None):
     """Inserta un registro nuevo, o lo actualiza si la llave ya existe (upsert),
     para poder corregir un solo dato sin tener que resubir todo el Excel."""
+    if clientes_permitidos is not None and "cliente" in columnas:
+        if str(valores.get("cliente", "")).strip() not in clientes_permitidos:
+            return False, f"No tienes acceso al cliente '{valores.get('cliente')}'."
     with closing(get_conn()) as conn:
         try:
             _validar_identificadores_sql(tabla, columnas)
             with conn.cursor() as cur:
-                # Formato de nombres (Mayúscula Inicial) — vive en integracion_simpliroute.py
-                valores = sr_int.formatear_valores_catalogo(cur, tabla, valores)
-                if clientes_permitidos is not None and "cliente" in columnas:
-                    if str(valores.get("cliente", "")).strip() not in clientes_permitidos:
-                        return False, f"No tienes acceso al cliente '{valores.get('cliente')}'."
                 cols_sql = ", ".join(columnas)
                 placeholders = ", ".join(["%s"] * len(columnas))
                 no_clave = [c for c in columnas if c not in clave]
@@ -1383,12 +1145,9 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clie
             registrar_auditoria(usuario, "Agregar/Actualizar registro de catálogo",
                                  f"Tabla {tabla} · {', '.join(f'{c}={valores[c]}' for c in clave)}")
             return True, "OK"
-        except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.CheckViolation) as e:
+        except psycopg2.errors.ForeignKeyViolation as e:
             conn.rollback()
             return False, _mensaje_foreign_key_amigable(e)
-        except (psycopg2.errors.InvalidDatetimeFormat, psycopg2.errors.DatetimeFieldOverflow):
-            conn.rollback()
-            return False, "Una fecha no es válida — usa el formato AAAA-MM-DD (por ejemplo 2026-10-05)."
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "agregar_o_actualizar_registro")
@@ -1475,8 +1234,6 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
         try:
             _validar_identificadores_sql(tabla, columnas)
             with conn.cursor() as cur:
-                # Formato de nombres (Mayúscula Inicial) — vive en integracion_simpliroute.py
-                df_nuevo = sr_int.formatear_df_catalogo(cur, tabla, df_nuevo)
                 if clientes_permitidos is not None and "cliente" in columnas:
                     fuera_de_alcance = {str(row["cliente"]).strip() for _, row in df_nuevo.iterrows()
                                         if str(row["cliente"]).strip() not in clientes_permitidos}
@@ -1551,12 +1308,9 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
             if no_borrables:
                 return True, f"⚠️ Guardado, pero esto sigue existiendo porque está en uso en Camiones o Viajes: {', '.join(no_borrables)}"
             return True, "OK"
-        except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.CheckViolation) as e:
+        except psycopg2.errors.ForeignKeyViolation as e:
             conn.rollback()
             return False, _mensaje_foreign_key_amigable(e)
-        except (psycopg2.errors.InvalidDatetimeFormat, psycopg2.errors.DatetimeFieldOverflow):
-            conn.rollback()
-            return False, "Una fecha no es válida — usa el formato AAAA-MM-DD (por ejemplo 2026-10-05)."
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "sincronizar_catalogo")
@@ -1650,9 +1404,6 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
-                # Auxiliar libre: formato Mayúscula Inicial y alta en el catálogo si es nuevo
-                # (dentro de esta misma transacción: si el viaje no se guarda, el auxiliar tampoco)
-                auxiliar = sr_int.preparar_auxiliar_libre(cur, auxiliar)
                 # Revalidar marchamos DENTRO de la transacción (evita condiciones de
                 # carrera entre dos digitadores guardando al mismo tiempo)
                 for dest in destinos_viaje:
@@ -1733,24 +1484,60 @@ def enviar_visita_simpliroute(viaje_id):
     return False, "SimpliRoute todavía no está conectado — este viaje sigue en modo manual dentro de Control de Ruta."
 
 
-def puente_sr(tipo, id_viaje, route_id_sr=None, cambio_camion_piloto=None):
-    """Único punto de contacto de la app con el Control SR (que vive completo en
-    integracion_simpliroute.py). Nunca lanza: si algo falla, el mensaje queda
-    guardado en la sesión para mostrarse después de la recarga de pantalla."""
-    try:
-        ok, msg = sr_int.evento(get_conn, tipo, id_viaje, route_id_sr=route_id_sr, cambio_camion_piloto=cambio_camion_piloto)
-        if msg:
-            st.session_state["flash_sr" if not ok else "flash_sr_ok"] = msg
-    except Exception:
-        pass
-
-
 def obtener_viajes_recientes(limite=10):
     with closing(get_conn()) as conn:
         return pd.read_sql_query(
             "SELECT id_viaje, cliente, placa, piloto, fecha_creacion, hora_creacion, estado "
             "FROM viajes ORDER BY id DESC LIMIT %s", conn, params=(limite,)
         )
+
+
+def obtener_reporte_bitacora(fecha_inicio, fecha_fin, cliente="Todos"):
+    """Un renglón por viaje: la tienda que se muestra es la más lejana (mayor km)
+    del viaje, junto con cuántas tiendas llevaba en total. BULTOS = solo cajas."""
+    with closing(get_conn()) as conn:
+        query = """
+            WITH agregado AS (
+                SELECT viaje_id,
+                       STRING_AGG(marchamo_ida, ' / ' ORDER BY orden) AS marchamos,
+                       COUNT(*) AS cantidad_tiendas,
+                       SUM(cajas) AS bultos
+                FROM destinos
+                GROUP BY viaje_id
+            ),
+            mas_lejano AS (
+                SELECT DISTINCT ON (viaje_id) viaje_id, tienda, tipo_pago
+                FROM destinos
+                ORDER BY viaje_id, km DESC NULLS LAST
+            )
+            SELECT
+                v.fecha_creacion AS "Fecha",
+                v.id_viaje AS "No. Despacho",
+                v.usuario_creador AS "Supervisor/Coordinador",
+                ag.marchamos AS "No. de Marchamo",
+                ml.tienda AS "Tienda (más lejana)",
+                ag.cantidad_tiendas AS "Cantidad de Tiendas",
+                v.placa AS "Placa",
+                v.piloto AS "Piloto a Cargo",
+                v.cd_origen AS "Origen",
+                ml.tipo_pago AS "Clasificación de Destino",
+                cam.tipo AS "Tonelaje",
+                v.transportista AS "Transportista",
+                tr.razon_social AS "Razón Social",
+                ag.bultos AS "Bultos",
+                COALESCE(v.motivo_sin_pedido, 'Con Pedido') AS "Tipo de Viaje",
+                COALESCE(v.placa_furgon, '') AS "Placa Furgón"
+            FROM viajes v
+            JOIN agregado ag ON ag.viaje_id = v.id
+            JOIN mas_lejano ml ON ml.viaje_id = v.id
+            LEFT JOIN cat_camiones cam ON cam.placa = v.placa
+            LEFT JOIN cat_transportistas tr ON tr.nombre = v.transportista
+            WHERE v.estado != 'Anulado'
+              AND v.fecha_creacion BETWEEN %s AND %s
+              AND (%s = 'Todos' OR v.cliente = %s)
+            ORDER BY v.fecha_creacion DESC, v.id DESC
+        """
+        return pd.read_sql_query(query, conn, params=(str(fecha_inicio), str(fecha_fin), cliente, cliente))
 
 
 def _sanear_formulas(df):
@@ -1946,7 +1733,6 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
     with closing(get_conn()) as conn:
         try:
             with conn.cursor() as cur:
-                auxiliar = sr_int.preparar_auxiliar_libre(cur, auxiliar)  # libre + Mayúscula Inicial + alta si es nuevo
                 # Revalidar que ningún marchamo de ida corregido choque con el de
                 # OTRO destino que no sea el mismo que estamos editando.
                 for d in destinos_actualizados:
@@ -2293,6 +2079,44 @@ if 'form_run' not in st.session_state:
 if 'num_destinos' not in st.session_state:
     st.session_state.num_destinos = 1
 
+# Prefijos de TODAS las claves de session_state que usa el formulario de
+# Despacho, con el número de "corrida" (run) incrustado en el nombre — ver
+# pagina_despacho() más abajo para la lista completa de keys que generan.
+_PREFIJOS_FORM_DESPACHO = [
+    "mreg_final", "info_cli", "info_corr", "info_cd", "placa", "piloto", "aux",
+    "furgon", "sin_pedido", "motivo_sin_pedido", "pedido_subrun", "pedidos_lista",
+    "t", "mida", "del_destino", "comp", "cod_pedido", "cajas_pedido",
+    "btn_agregar_pedido", "del_pedido", "c_disabled", "c_calc", "c", "tar", "r",
+    "tipopago", "peso", "remitos", "dev", "cred", "pg", "obs",
+]
+
+
+def _limpiar_claves_formulario_despacho(run_a_borrar):
+    """Borra del session_state las claves de widgets de una 'corrida' (run) ya
+    cerrada del formulario de Despacho.
+
+    Cada vez que se guarda un viaje, form_run se incrementa para que el
+    formulario nazca limpio con keys nuevas (placa_4, mida_4_0, etc.) — pero
+    Streamlit NUNCA borra solo las keys de la corrida anterior (placa_3,
+    mida_3_0, pedidos_lista_3_0...). Sin esto, cada viaje que se despacha deja
+    "basura" acumulándose en memoria durante toda la sesión — y una sesión de
+    un despachador que trabaja un turno completo sin cerrar sesión puede crear
+    decenas de viajes, cada uno dejando su propio rastro de campos fantasma.
+    Con varias personas trabajando así al mismo tiempo, esto es una causa
+    directa de que el servidor se quede sin memoria (out of memory) después de
+    un rato de uso normal.
+
+    Se identifican por coincidencia exacta de prefijo + número de run (nunca
+    por 'contiene', para no borrar por accidente una clave de otra pantalla
+    que use el mismo número por coincidencia, como un ID de viaje)."""
+    marcador = f"_{run_a_borrar}"
+    for clave in list(st.session_state.keys()):
+        for prefijo in _PREFIJOS_FORM_DESPACHO:
+            objetivo = f"{prefijo}{marcador}"
+            if clave == objetivo or clave.startswith(objetivo + "_"):
+                del st.session_state[clave]
+                break
+
 # ==========================================
 # SIDEBAR + FLUJO DE ENTRADA (Login → Cliente/CD → App)
 # ==========================================
@@ -2317,52 +2141,30 @@ except Exception as e:
 # de texto libre, no una lista desplegable, para no exponer a cualquier
 # visitante qué nombres de usuario existen en el sistema.
 if not st.session_state.get("login_confirmado"):
-    col_sidebar_login, col_form_login = st.columns([1, 2.6])
-    with col_sidebar_login:
-        st.markdown(f"""
-            <div class="ransa-login-sidebar">
-                <div class="ransa-login-badge">
-                    <img src="data:image/png;base64,{_LOGO_TEXTO_B64}" alt="RANSA">
-                </div>
-                <div class="ransa-login-caption">Sistema de Control de Viajes</div>
-                <div class="ransa-login-copyright">© {ahora().year} Ransa · Guatemala</div>
+    st.markdown("""
+        <div class="ransa-topbar" style="justify-content:center;">
+            <div style="text-align:center;">
+                <div class="titulo">RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
+                <div class="subtitulo">Ingresa con tu usuario para continuar</div>
             </div>
-        """, unsafe_allow_html=True)
-    with col_form_login:
-        st.markdown("""
-            <div class="ransa-topbar" style="justify-content:center;">
-                <div style="text-align:center;">
-                    <div class="titulo">RANSA <span style="font-weight:400;">· Sistema de Control de Viajes</span></div>
-                    <div class="subtitulo">Ingresa con tu usuario para continuar</div>
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
-        col_izq, col_centro, col_der = st.columns([1, 1.2, 1])
-        with col_centro:
-            with st.container(border=True):
-                st.markdown("#### :material/lock: Iniciar Sesión")
-                usuario_login = st.text_input("Usuario")
-                password_login = st.text_input("Contraseña", type="password")
-                try:
-                    with closing(get_conn()) as _c_u, _c_u.cursor() as _cu:
-                        _cu.execute("SELECT COUNT(*) FROM cat_usuarios")
-                        _sin_usuarios = _cu.fetchone()[0] == 0
-                except Exception:
-                    _sin_usuarios = False
-                if _sin_usuarios:
-                    st.error("⚠️ La base está vacía y no hay ningún usuario. Agrega el bloque [admin_inicial] "
-                             "(usuario y password) en los Secrets de la app y reinicia; se creará el "
-                             "primer SuperAdministrador.")
-                if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
-                    resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
-                    if resultado_login:
-                        st.session_state["usuario_activo_fijo"] = usuario_login.strip()
-                        st.session_state["perfil_activo_fijo"] = resultado_login["perfil"]
-                        st.session_state["debe_cambiar_password"] = resultado_login["debe_cambiar_password"]
-                        st.session_state["login_confirmado"] = True
-                        st.rerun()
-                    else:
-                        st.error("❌ Usuario o contraseña incorrectos.")
+        </div>
+    """, unsafe_allow_html=True)
+    col_izq, col_centro, col_der = st.columns([1, 1.2, 1])
+    with col_centro:
+        with st.container(border=True):
+            st.markdown("#### :material/lock: Iniciar Sesión")
+            usuario_login = st.text_input("Usuario")
+            password_login = st.text_input("Contraseña", type="password")
+            if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
+                resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
+                if resultado_login:
+                    st.session_state["usuario_activo_fijo"] = usuario_login.strip()
+                    st.session_state["perfil_activo_fijo"] = resultado_login["perfil"]
+                    st.session_state["debe_cambiar_password"] = resultado_login["debe_cambiar_password"]
+                    st.session_state["login_confirmado"] = True
+                    st.rerun()
+                else:
+                    st.error("❌ Usuario o contraseña incorrectos.")
     st.stop()
 
 usuario_activo = st.session_state["usuario_activo_fijo"]
@@ -2397,45 +2199,33 @@ st.session_state["ultima_actividad"] = ahora_actividad
 # --- PANTALLA 1B: Cambio de contraseña obligatorio (primer ingreso, o tras un
 # restablecimiento). No se puede pasar de aquí sin poner una contraseña nueva.
 if st.session_state.get("debe_cambiar_password"):
-    col_sidebar_pw, col_form_pw = st.columns([1, 2.6])
-    with col_sidebar_pw:
-        st.markdown(f"""
-            <div class="ransa-login-sidebar">
-                <div class="ransa-login-badge">
-                    <img src="data:image/png;base64,{_LOGO_TEXTO_B64}" alt="RANSA">
-                </div>
-                <div class="ransa-login-caption">Sistema de Control de Viajes</div>
-                <div class="ransa-login-copyright">© {ahora().year} Ransa · Guatemala</div>
+    st.markdown("""
+        <div class="ransa-topbar" style="justify-content:center;">
+            <div style="text-align:center;">
+                <div class="titulo">:material/key: Cambio de Contraseña Obligatorio</div>
+                <div class="subtitulo">Define una contraseña nueva para continuar</div>
             </div>
-        """, unsafe_allow_html=True)
-    with col_form_pw:
-        st.markdown("""
-            <div class="ransa-topbar" style="justify-content:center;">
-                <div style="text-align:center;">
-                    <div class="titulo">:material/key: Cambio de Contraseña Obligatorio</div>
-                    <div class="subtitulo">Define una contraseña nueva para continuar</div>
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
-        col_izq2, col_centro2, col_der2 = st.columns([1, 1.2, 1])
-        with col_centro2:
-            with st.container(border=True):
-                nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres, con letra y número)", type="password", key="nueva_pw_1")
-                nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="nueva_pw_2")
-                if st.button(":material/check: Guardar Contraseña", use_container_width=True):
-                    valida, msg_valida = password_es_valida(nueva1)
-                    if not valida:
-                        st.error(f"❌ {msg_valida}")
-                    elif nueva1 != nueva2:
-                        st.error("❌ Las dos contraseñas no coinciden.")
+        </div>
+    """, unsafe_allow_html=True)
+    col_izq2, col_centro2, col_der2 = st.columns([1, 1.2, 1])
+    with col_centro2:
+        with st.container(border=True):
+            nueva1 = st.text_input("Nueva contraseña (mínimo 8 caracteres, con letra y número)", type="password", key="nueva_pw_1")
+            nueva2 = st.text_input("Repite la nueva contraseña", type="password", key="nueva_pw_2")
+            if st.button(":material/check: Guardar Contraseña", use_container_width=True):
+                valida, msg_valida = password_es_valida(nueva1)
+                if not valida:
+                    st.error(f"❌ {msg_valida}")
+                elif nueva1 != nueva2:
+                    st.error("❌ Las dos contraseñas no coinciden.")
+                else:
+                    ok, msg = establecer_password(usuario_activo, nueva1, forzar_cambio_siguiente=False)
+                    if ok:
+                        st.session_state["debe_cambiar_password"] = False
+                        st.success("✅ Contraseña actualizada.")
+                        st.rerun()
                     else:
-                        ok, msg = establecer_password(usuario_activo, nueva1, forzar_cambio_siguiente=False)
-                        if ok:
-                            st.session_state["debe_cambiar_password"] = False
-                            st.success("✅ Contraseña actualizada.")
-                            st.rerun()
-                        else:
-                            mostrar_resultado_error(msg, perfil_activo)
+                        mostrar_resultado_error(msg, perfil_activo)
     st.stop()
 
 with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_container_width=True):
@@ -2461,8 +2251,6 @@ with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_conta
     if st.button(":material/logout: Cerrar Sesión", key="btn_logout_sidebar", use_container_width=True):
         st.session_state["login_confirmado"] = False
         st.session_state["config_bloqueada"] = False
-        st.session_state["modo_importar_sr"] = False
-        st.session_state.pop("rutas_sr_encontradas", None)
         for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password", "cliente_activo_fijo", "cd_origen_fijo"):
             st.session_state.pop(k, None)
         st.rerun()
@@ -2470,21 +2258,6 @@ with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_conta
 # --- PANTALLA 2: Cliente y CD Origen — se eligen UNA SOLA VEZ por sesión. Para
 # cambiarlos hay que cerrar sesión y volver a entrar (evita que a mitad de una
 # jornada alguien cambie sin querer el cliente/CD y se mezclen viajes).
-# Base NUEVA (sin ningún cliente): el Administrador no tiene nada que elegir y, sin esto,
-# quedaría atrapado aquí sin poder llegar a Catálogos para crear el primer cliente. En ese
-# caso se abre solo Catálogos (ver el final del archivo). En cuanto exista un cliente, se
-# sale de este modo y vuelve la selección normal de Cliente y CD.
-if (perfil_activo in ("Administrador", "SuperAdministrador")
-        and not st.session_state.catalogos["clientes_lista"]):
-    st.session_state["_modo_base_vacia"] = True
-    st.session_state["cliente_activo_fijo"] = "(sin clientes)"
-    st.session_state["cd_origen_fijo"] = ""
-    st.session_state["config_bloqueada"] = True
-elif st.session_state.pop("_modo_base_vacia", False):
-    st.session_state["config_bloqueada"] = False
-    st.session_state.pop("cliente_activo_fijo", None)
-    st.session_state.pop("cd_origen_fijo", None)
-
 if not st.session_state.get("config_bloqueada"):
     st.sidebar.markdown("---")
     st.markdown("""
@@ -2542,8 +2315,6 @@ with st.sidebar.popover(f":material/my_location: {cliente_activo} · CD {cd_orig
         st.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
     if st.button(":material/swap_horiz: Cambiar Cliente / CD", key="btn_cambiar_cliente_sidebar", use_container_width=True):
         st.session_state["config_bloqueada"] = False
-        st.session_state["modo_importar_sr"] = False
-        st.session_state.pop("rutas_sr_encontradas", None)
         del st.session_state["cliente_activo_fijo"]
         del st.session_state["cd_origen_fijo"]
         st.rerun()
@@ -2573,376 +2344,12 @@ st.markdown("---")
 # ==========================================
 # MÓDULO 1: DESPACHO / CREACIÓN DE VIAJES
 # ==========================================
-def guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario):
-    """Guarda (o corrige) cuántos vehículos pidió el cliente ese día. Un renglón por fecha y cliente."""
-    try:
-        with closing(get_conn()) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO solicitudes_transporte (fecha, cliente, vehiculos_solicitados, registrado_por, actualizado) "
-                    "VALUES (%s, %s, %s, %s, NOW()) ON CONFLICT (fecha, cliente) DO UPDATE SET "
-                    "vehiculos_solicitados = EXCLUDED.vehiculos_solicitados, registrado_por = EXCLUDED.registrado_por, "
-                    "actualizado = NOW()", (str(fecha), cliente, int(cantidad), usuario))
-            conn.commit()
-        registrar_auditoria(usuario, "Solicitud de vehículos", f"{cliente} · {fecha}: {int(cantidad)}")
-        return True, f"Solicitud guardada: {cliente} pidió {int(cantidad)} vehículo(s) para el {fecha}."
-    except Exception as e:
-        return False, f"No se pudo guardar la solicitud: {str(e).splitlines()[0]}"
-
-
-def posicionamiento_del_dia(cliente, fecha):
-    """(solicitados o None, posicionados) del cliente ese día. Posicionados = viajes no anulados creados ese día."""
-    with closing(get_conn()) as conn, conn.cursor() as cur:
-        cur.execute("SELECT vehiculos_solicitados FROM solicitudes_transporte WHERE fecha = %s AND cliente = %s",
-                    (str(fecha), cliente))
-        f = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM viajes WHERE cliente = %s AND fecha_creacion = %s AND estado <> 'Anulado'",
-                    (cliente, str(fecha)))
-        return (f[0] if f else None), cur.fetchone()[0]
-
-
-def panel_solicitud_vehiculos(cliente):
-    """Recuadro de Despacho: cuántos vehículos pidió el cliente hoy y cuántos van posicionados.
-    Dos tarjetas: (izquierda) fecha + estado del día, (derecha) cantidad + guardar."""
-    try:
-        with st.expander(":material/call_received: Vehículos que pidió el cliente", expanded=False):
-            col_fecha, col_cant = st.columns([5, 7], gap="medium")
-
-            with col_fecha:
-                with st.container(border=True):
-                    st.markdown('<div class="ransa-sol-micro">Fecha de la solicitud</div>', unsafe_allow_html=True)
-                    fecha = st.date_input("Fecha de la solicitud", value=ahora().date(), key="sol_fecha",
-                                          label_visibility="collapsed")
-                    st.caption("Día para el que el cliente hizo la solicitud.")
-                    solicitados, posicionados = posicionamiento_del_dia(cliente, fecha)
-                    if solicitados is None:
-                        chips = ('<span class="ransa-sol-chip"><i class="ransa-sol-dot"></i>Sin solicitud registrada</span>'
-                                 f'<span class="ransa-sol-chip pos">Posicionados ese día: <b>{posicionados}</b></span>')
-                    else:
-                        chips = ('<span class="ransa-sol-chip ok"><i class="ransa-sol-dot"></i>Solicitud registrada</span>'
-                                 f'<span class="ransa-sol-chip pos">Posicionados: <b>{posicionados}</b></span>'
-                                 f'<span class="ransa-sol-chip pos">Pendientes: <b>{max(solicitados - posicionados, 0)}</b></span>')
-                        if posicionados > solicitados:
-                            chips += f'<span class="ransa-sol-chip warn">Excedente: <b>{posicionados - solicitados}</b></span>'
-                    st.markdown(f'<div class="ransa-sol-chips">{chips}</div>', unsafe_allow_html=True)
-
-            with col_cant:
-                with st.container(border=True):
-                    st.markdown('<div class="ransa-sol-micro">Vehículos solicitados</div>', unsafe_allow_html=True)
-                    cantidad = st.number_input("Vehículos solicitados", min_value=0, max_value=500, step=1,
-                                               value=int(solicitados or 0), key=f"sol_cant_{cliente}_{fecha}",
-                                               label_visibility="collapsed")
-                    st.caption("Cantidad total que el cliente pidió para esa fecha.")
-                    texto_boton = "Guardar solicitud" if solicitados is None else "Actualizar solicitud"
-                    if st.button(f":material/save: {texto_boton}", key="sol_guardar", type="primary", use_container_width=True):
-                        ok, msg = guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario_activo)
-                        st.session_state["flash_solicitud"] = ("success" if ok else "error", msg)
-                        st.rerun()
-
-            if solicitados:
-                pct = min(round(posicionados / solicitados * 100), 100)
-                st.markdown(
-                    '<div class="ransa-sol-prog"><div class="ransa-sol-prog-top">'
-                    f'<span>Posicionamiento del día</span><b>{posicionados} de {solicitados} · {pct}%</b></div>'
-                    f'<div class="ransa-sol-track"><div class="ransa-sol-fill" style="width:{pct}%"></div></div></div>',
-                    unsafe_allow_html=True)
-
-            flash = st.session_state.pop("flash_solicitud", None)
-            if flash:
-                getattr(st, flash[0])(flash[1])
-    except Exception as e:
-        st.caption(f"(El recuadro de solicitudes no pudo cargarse: {str(e).splitlines()[0]})")
-
-
-_AVISO_FALTA_SQL = "⚠️ Reportes (falta ejecutar reportes_supabase.sql)"
-
-
-def catalogo_reportes():
-    """Reportes activos registrados en Supabase (tabla reportes_catalogo) que este perfil puede ver:
-    [(nombre, vista, descripcion, actualiza_sr, nombre_archivo)]. None si el catálogo aún no existe."""
-    consultas = (
-        "SELECT nombre, vista, descripcion, COALESCE(actualiza_sr, FALSE), nombre_archivo, perfiles "
-        "FROM reportes_catalogo WHERE COALESCE(activo, TRUE) ORDER BY orden, nombre",
-        "SELECT nombre, vista, descripcion, COALESCE(actualiza_sr, FALSE), nombre_archivo, NULL "
-        "FROM reportes_catalogo WHERE COALESCE(activo, TRUE) ORDER BY orden, nombre",   # catálogo creado antes de la columna "perfiles"
-    )
-    for q in consultas:
-        try:
-            with closing(get_conn()) as conn, conn.cursor() as cur:
-                cur.execute(q)
-                filas = cur.fetchall()
-            visibles = []
-            for f in filas:
-                if not re.match(r"^rpt_[a-z0-9_]+$", str(f[1])):
-                    continue
-                perfiles = [x.strip() for x in str(f[5] or "").split(",") if x.strip()]
-                if perfiles and perfil_activo not in perfiles:
-                    continue
-                visibles.append(f[:5])
-            return visibles
-        except Exception:
-            continue
-    return None
-
-
-def mostrar_reporte_supabase(fila):
-    """Visor genérico: consulta la vista del reporte con rango de fechas y clientes permitidos, y ofrece filtro
-    rápido y exportación. Los reportes se crean o cambian en Supabase; esto no cambia con cada reporte."""
-    nombre, vista, descripcion, actualiza_sr, archivo = fila
-    clave = vista
-    st.subheader(":material/receipt_long: " + nombre)
-    if descripcion:
-        st.caption(descripcion)
-    permitidos = clientes_permitidos_para(usuario_activo, perfil_activo)
-    c1, c2, c3, c4 = st.columns([1, 1, 1.3, 0.8])
-    with c1:
-        fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7), key=f"rep_{clave}_ini")
-    with c2:
-        fecha_fin = st.date_input("Hasta", value=ahora().date(), key=f"rep_{clave}_fin")
-    with c3:
-        cliente = st.selectbox("Cliente", ["Todos"] + list(permitidos), key=f"rep_{clave}_cli")
-    with c4:
-        st.write("")
-        generar = st.button(":material/search: Generar", use_container_width=True, key=f"rep_{clave}_gen")
-    actualizar = False
-    if actualiza_sr:
-        actualizar = st.checkbox("Actualizar el detalle desde SimpliRoute antes de generar (más lento: consulta cada "
-                                 "ruta, hasta 60)", key=f"rep_{clave}_sr")
-    if generar:
-        if actualizar:
-            with st.spinner("Consultando SimpliRoute..."):
-                ok_sr, msg_sr = sr_int.refrescar_detalle_rango(get_conn, fecha_ini, fecha_fin, cliente)
-            (st.success if ok_sr else st.warning)(msg_sr)
-        consulta = psql.SQL('SELECT * FROM {} WHERE "Fecha" BETWEEN %s AND %s AND "Cliente" = ANY(%s)').format(psql.Identifier(vista))
-        try:
-            with closing(get_conn()) as conn:
-                st.session_state[f"df_rep_{clave}"] = pd.read_sql_query(
-                    consulta.as_string(conn), conn,
-                    params=(str(fecha_ini), str(fecha_fin), list(permitidos) if cliente == "Todos" else [cliente]))
-        except Exception as e:
-            st.session_state.pop(f"df_rep_{clave}", None)
-            st.error(f"No se pudo consultar la vista {vista}: {str(e).splitlines()[0]}. "
-                     'Recuerda que debe tener las columnas "Fecha" y "Cliente".')
-    df = st.session_state.get(f"df_rep_{clave}")
-    if df is None:
-        st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
-        return
-    if df.empty:
-        st.info("No hay datos en ese rango de fechas para ese cliente.")
-        return
-    # Filtro rápido: sirve para cualquier reporte, sin configurar nada
-    cols_filtro = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and 1 < df[c].nunique() <= 300]
-    if cols_filtro:
-        with st.expander(":material/filter_alt: Filtrar los resultados", expanded=False):
-            fc1, fc2 = st.columns([1, 2])
-            col_f = fc1.selectbox("Columna", ["(sin filtro)"] + cols_filtro, key=f"rep_{clave}_fcol")
-            if col_f != "(sin filtro)":
-                valores = fc2.multiselect("Valores", sorted(df[col_f].dropna().astype(str).unique()), key=f"rep_{clave}_fval")
-                if valores:
-                    df = df[df[col_f].astype(str).isin(valores)]
-    st.caption(f"{len(df)} renglón(es)" + (f" en {df['No. de Viaje'].nunique()} viaje(s)." if "No. de Viaje" in df else "."))
-    st.dataframe(df, use_container_width=True, height=420)
-    base = archivo or vista
-    e1, e2 = st.columns(2)
-    with e1:
-        st.download_button(":material/download: Exportar a Excel", data=exportar_excel(df),
-                           file_name=f"{base}_{fecha_ini}_a_{fecha_fin}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True, key=f"rep_{clave}_xlsx")
-    with e2:
-        st.download_button(":material/download: Exportar a CSV", data=exportar_csv(df),
-                           file_name=f"{base}_{fecha_ini}_a_{fecha_fin}.csv", mime="text/csv",
-                           use_container_width=True, key=f"rep_{clave}_csv")
-
-
 def pagina_despacho():
     if perfil_activo in ["Administrador", "SuperAdministrador", "Operador", "Supervisor"]:
         st.header(":material/local_shipping: Creación de Viaje")
         st.caption(f"Configura placa, ruta y materiales del nuevo viaje · Digitando como **{usuario_activo}** ({perfil_activo})")
 
-        if "modo_importar_sr" not in st.session_state:
-            st.session_state.modo_importar_sr = False
-
-        if cliente_activo and cliente_activo != "(sin clientes)":
-            panel_solicitud_vehiculos(cliente_activo)
-
-        with st.container(border=True):
-            _c_texto, _c_boton = st.columns([3, 1], vertical_alignment="center")
-            with _c_texto:
-                if not st.session_state.modo_importar_sr:
-                    st.markdown(
-                        "**:material/sync: Importar desde SimpliRoute**  \n"
-                        "<span style='color: var(--gris-medio); font-size: 0.88rem;'>"
-                        "Trae rutas ya planificadas para el cliente activo, con tiendas y vehículo/piloto sugeridos."
-                        "</span>",
-                        unsafe_allow_html=True
-                    )
-                else:
-                    st.markdown(
-                        "**:material/sync: Importando desde SimpliRoute**  \n"
-                        "<span style='color: var(--gris-medio); font-size: 0.88rem;'>"
-                        "Elige una ruta de la lista de abajo, o vuelve a la creación manual."
-                        "</span>",
-                        unsafe_allow_html=True
-                    )
-            with _c_boton:
-                if not st.session_state.modo_importar_sr:
-                    if st.button(":material/sync: Importar Rutas", key="btn_abrir_importar_sr",
-                                 use_container_width=True, type="secondary"):
-                        st.session_state.modo_importar_sr = True
-                        st.rerun()
-                else:
-                    if st.button(":material/arrow_back: Creación Manual", key="btn_cerrar_importar_sr",
-                                 use_container_width=True, type="secondary"):
-                        st.session_state.modo_importar_sr = False
-                        st.session_state.pop("rutas_sr_encontradas", None)
-                        st.rerun()
-
-        if st.session_state.modo_importar_sr:
-            st.markdown("#### :material/sync: Rutas de SimpliRoute pendientes de importar")
-            _token_sr_import = sr_int.obtener_token_sr_desde_vault(get_conn)
-            if not _token_sr_import:
-                st.error("❌ No hay token de SimpliRoute configurado (revisa el Vault de Supabase) — no se puede importar. Usa creación manual.")
-
-            if _token_sr_import:
-                _fecha_import = st.date_input("Fecha de las rutas", value=datetime.now().date(), key="fecha_import_sr")
-                if st.button(":material/refresh: Consultar Rutas", key="btn_consultar_rutas_sr"):
-                    ok_imp, rutas_o_error = sr_int.importar_rutas_sr(str(_fecha_import), token=_token_sr_import)
-                    st.session_state["rutas_sr_encontradas"] = rutas_o_error if ok_imp else []
-                    if ok_imp:
-                        # Cada visit_type que SR manda queda anotado: solo esos se pueden mapear a un cliente
-                        sr_int.registrar_visit_types_vistos(get_conn, {t for _r in rutas_o_error for t in _r["visit_types"]})
-                    if not ok_imp:
-                        st.error(f"❌ {rutas_o_error}")
-
-                # Filtra por el cliente activo (el mismo que ya elegiste arriba en el
-                # sidebar) usando el mapeo visit_type -> cliente. Una ruta sin ningún
-                # visit_type mapeado NO se asume de nadie — se muestra aparte, para
-                # que un Administrador la mapee en vez de que se mezcle sola.
-                with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                    _cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr")
-                    _mapa_cliente_sr = dict(_cur.fetchall())
-
-                _todas_las_rutas = st.session_state.get("rutas_sr_encontradas", [])
-                _rutas_sr, _rutas_otro_cliente, _rutas_sin_mapear = [], [], []
-                for _r in _todas_las_rutas:
-                    _clientes_de_ruta = {_mapa_cliente_sr.get(t) for t in _r["visit_types"]}
-                    _clientes_de_ruta.discard(None)
-                    if not _clientes_de_ruta:
-                        _rutas_sin_mapear.append(_r)
-                    elif cliente_activo in _clientes_de_ruta:
-                        _rutas_sr.append(_r)
-                    else:
-                        _rutas_otro_cliente.append(_r)
-
-                if _todas_las_rutas:
-                    st.caption(f"{len(_todas_las_rutas)} ruta(s) totales ese día · "
-                               f"{len(_rutas_otro_cliente)} de otro(s) cliente(s) (ocultas) · "
-                               f"{len(_rutas_sin_mapear)} con visit_type sin mapear")
-                if _rutas_sin_mapear:
-                    _tipos_sin_mapear = sorted({t for r in _rutas_sin_mapear for t in r["visit_types"]})
-                    st.warning(f"⚠️ {len(_rutas_sin_mapear)} ruta(s) con visit_type sin mapear a ningún cliente: "
-                               f"{', '.join(_tipos_sin_mapear)}. Mapéalos en Catálogos → Integración SimpliRoute "
-                               "para que aparezcan en la importación del cliente correcto.")
-
-                if _rutas_sr:
-                    # Rutas que ya tienen un viaje: se muestran MARCADAS y no se pueden volver a usar
-                    # (para cambiar algo se edita ese viaje en Gestión de Viajes). Las libres van primero.
-                    _usadas_sr = sr_int.rutas_ya_utilizadas(get_conn, [_r["route_id"] for _r in _rutas_sr])
-                    _rutas_sr = sorted(_rutas_sr, key=lambda _r: bool(_usadas_sr.get(str(_r["route_id"]), {}).get("viajes")))
-                    _n_usadas = sum(1 for _r in _rutas_sr if _usadas_sr.get(str(_r["route_id"]), {}).get("viajes"))
-                    st.success(f"✅ {len(_rutas_sr)} ruta(s) de **{cliente_activo}** encontrada(s) con visitas ese día "
-                               f"— {len(_rutas_sr) - _n_usadas} por usar, {_n_usadas} ya utilizada(s).")
-                    _tiendas_cliente_import = st.session_state.catalogos["clientes"].get(cliente_activo, {})
-                    for _idx_ruta, _ruta_sr in enumerate(_rutas_sr):
-                        _info_uso = _usadas_sr.get(str(_ruta_sr["route_id"]), {"viajes": [], "anulados": []})
-                        _ruta_usada = bool(_info_uso["viajes"])
-                        with st.container(border=True):
-                            if _ruta_usada:
-                                _folio_uso, _estado_uso = _info_uso["viajes"][0]
-                                st.success(f"✅ **YA UTILIZADA** en el viaje **{_folio_uso}** ({_estado_uso}). "
-                                           "Para cambiar algo, edita ese viaje en Gestión de Viajes.")
-                                if perfil_activo in ("Administrador", "SuperAdministrador", "Operador") and st.button(
-                                        f":material/edit_document: Abrir {_folio_uso} en Gestión de Viajes",
-                                        key=f"abrir_viaje_ruta_{_idx_ruta}"):
-                                    _mis_cli_g = None if perfil_activo in ("Administrador", "SuperAdministrador") else clientes_permitidos_para(usuario_activo, perfil_activo)
-                                    st.session_state["valor_gestion"] = _folio_uso
-                                    st.session_state["resultados_gestion"] = buscar_viajes(_folio_uso, clientes_permitidos=_mis_cli_g)
-                                    st.session_state.pop("viaje_gestion", None)
-                                    st.session_state.pop("destinos_gestion", None)
-                                    st.switch_page(_PAGINA_GESTION_VIAJES)
-                            elif _info_uso["anulados"]:
-                                st.info(f"El viaje {', '.join(_info_uso['anulados'])} de esta ruta fue anulado: puedes usarla de nuevo.")
-                            st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {len(_ruta_sr['destinos'])} parada(s)/tienda(s) "
-                                        f"({_ruta_sr['total_visitas']} registro(s) de pedido/transferencia en SR) · "
-                                        f"Vehículo SR: {_ruta_sr.get('vehicle_placa_sr') or _ruta_sr['vehicle_sr_id']} · "
-                                        f"Piloto SR: {_ruta_sr.get('driver_nombre_sr') or ('sin asignar' if _ruta_sr['driver_sr_id'] is None else _ruta_sr['driver_sr_id'])}")
-                            st.caption("Tipos de visita: " + ", ".join(f"{k} ({v})" for k, v in _ruta_sr["visit_types"].items()))
-                            st.caption("⚠️ La columna 'Unidades' es la suma de `load_3` de SR — confirmado antes con datos reales "
-                                       "que para Zona Sur eso cuenta UNIDADES sueltas de producto, no bultos físicos "
-                                       "(un bulto trae varias unidades). No es el número de bultos que despachas — "
-                                       "ese sigue viniendo de Infor. Se muestra solo como referencia.")
-                            _df_destinos_sr = pd.DataFrame([
-                                {"Tienda": d["tienda"], "Unidades (SR, no bultos)": d["cajas"], "Pedidos/Transferencias": len(d["pedidos"])}
-                                for d in _ruta_sr["destinos"]
-                            ])
-                            st.dataframe(_df_destinos_sr, use_container_width=True, hide_index=True)
-                            if st.button(":material/check: Usar esta ruta" if not _ruta_usada else ":material/block: Ruta ya utilizada",
-                                         key=f"usar_ruta_sr_{_idx_ruta}", use_container_width=True, disabled=_ruta_usada):
-                                _run_destino = st.session_state.form_run
-                                _sin_match = []
-                                st.session_state.num_destinos = len(_ruta_sr["destinos"])
-                                for _i_dest, _d in enumerate(_ruta_sr["destinos"]):
-                                    # Match por nombre: exacto (sin importar mayúsculas) primero,
-                                    # si no, "contiene" en cualquier dirección — mismo tipo de
-                                    # coincidencia que ya usamos hoy a mano con los datos reales
-                                    # de SR. Si no encuentra nada, el campo queda vacío para que
-                                    # el digitador lo elija — nunca se inventa una tienda.
-                                    _tienda_sr_norm = _d["tienda"].strip().upper()
-                                    _match = next((t for t in _tiendas_cliente_import if t.strip().upper() == _tienda_sr_norm), None)
-                                    if not _match:
-                                        _match = next((t for t in _tiendas_cliente_import
-                                                        if t.strip().upper() in _tienda_sr_norm or _tienda_sr_norm in t.strip().upper()), None)
-                                    if _match:
-                                        st.session_state[f"t_{_run_destino}_{_i_dest}"] = _match
-                                    else:
-                                        _sin_match.append(_d["tienda"])
-                                    # No se importa el detalle de pedidos/transferencias — probado
-                                    # en campo con un Supervisor y resultó más trabajo que ayuda
-                                    # (decenas de líneas en 0, una por una). En vez de eso, un
-                                    # resumen de solo referencia (nunca se guarda en la base) — el
-                                    # digitador escribe el Despacho Manual y las cajas reales,
-                                    # igual que en un viaje 100% manual.
-                                    st.session_state[f"resumen_sr_{_run_destino}_{_i_dest}"] = {
-                                        "transferencias": len(_d["pedidos"]),
-                                        "unidades": _d["cajas"],
-                                    }
-
-                                # Camión y piloto de la Ruta de SR: la lógica vive en integracion_simpliroute.py
-                                # (resolver_ruta_para_formulario). El camión se prellena si es un camión real, ya
-                                # está en el catálogo y está activo; el piloto se prellena si SR tiene uno asignado
-                                # y está activo — si SR no tiene piloto, queda EN BLANCO para elegirlo.
-                                _sel_sr = sr_int.resolver_ruta_para_formulario(get_conn, _ruta_sr)
-                                if _sel_sr["placa"]:
-                                    st.session_state[f"placa_{_run_destino}"] = _sel_sr["placa"]
-                                st.session_state[f"sr_piloto_{_run_destino}"] = _sel_sr["piloto"] or ""
-
-                                st.session_state[f"route_id_sr_{_run_destino}"] = _ruta_sr["route_id"]
-                                st.session_state.modo_importar_sr = False
-                                _avisos_import = []
-                                if _sin_match:
-                                    _avisos_import.append(f"⚠️ {len(_sin_match)} tienda(s) de SR no se pudieron emparejar automáticamente, "
-                                                          f"elígelas a mano: {', '.join(_sin_match)}")
-                                _avisos_import += [f"⚠️ {a}" for a in _sel_sr["avisos"]]
-                                if _avisos_import:
-                                    st.session_state["flash_importar_sr"] = ("warning", "\n\n".join(_avisos_import))
-                                st.rerun()
-            st.markdown("---")
-
         run = st.session_state.form_run  # sufijo de las keys del formulario actual
-        _flash_import = st.session_state.pop("flash_importar_sr", None)
-        if _flash_import:
-            getattr(st, _flash_import[0])(_flash_import[1])
         marchamo_regreso_actual = st.session_state.get(f"mreg_final_{run}", "")
         tiendas_cliente = st.session_state.catalogos["clientes"].get(cliente_activo, {})
         es_cliente_unisuper = cliente_activo.startswith("UniSuper")
@@ -2975,23 +2382,20 @@ def pagina_despacho():
                         pil_pred = datos_c["piloto"]
                         aux_pred = datos_c["auxiliar"]
 
-                    # Si el viaje viene de una Ruta de SR, el piloto lo manda SR (en blanco si no tiene).
-                    _pil_de_sr = st.session_state.get(f"sr_piloto_{run}")
-                    if _pil_de_sr is not None:
-                        pil_pred = _pil_de_sr
-
                     with col_pil:
                         pilotos = st.session_state.catalogos["pilotos"]
                         if pilotos:
-                            # Sin piloto previsto queda EN BLANCO (antes se elegía el primero de la lista sin avisar).
-                            # La llave lleva la placa: al cambiar de camión, el piloto se reinicia con el de ese camión.
-                            piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else None,
-                                                        placeholder="Elige el piloto", key=f"piloto_{run}_{placa}") or ""
+                            piloto_final = st.selectbox("Piloto", pilotos, index=pilotos.index(pil_pred) if pil_pred in pilotos else 0, key=f"piloto_{run}")
                         else:
                             st.warning("Sin pilotos en el catálogo.")
                             piloto_final = ""
                     with col_aux:
-                        auxiliar_final = campo_auxiliar("Auxiliar de Carga", st.session_state.catalogos["auxiliares"], aux_pred, f"aux_{run}_{placa}")
+                        auxiliares = st.session_state.catalogos["auxiliares"]
+                        if auxiliares:
+                            auxiliar_final = st.selectbox("Auxiliar de Carga", auxiliares, index=auxiliares.index(aux_pred) if aux_pred in auxiliares else 0, key=f"aux_{run}")
+                        else:
+                            st.warning("Sin auxiliares en el catálogo.")
+                            auxiliar_final = ""
 
                     if placa:
                         st.markdown(
@@ -3004,7 +2408,7 @@ def pagina_despacho():
                         st.caption("Elige una placa para ver el transportista y la capacidad del camión.")
 
                     placa_furgon = ""
-                    if cap_pred == TIPO_CABEZAL_FURGON:
+                    if cap_pred == "20 Ton":
                         # Las unidades de 20 Ton llevan cabezal + furgón por separado —
                         # el furgón tiene su propia placa, y como el proveedor lo puede
                         # cambiar según disponibilidad, no vive en el catálogo de
@@ -3041,46 +2445,6 @@ def pagina_despacho():
                     st.markdown("##### :material/route: RUTA Y DESTINOS")
                     st.caption("Cuenta lo físico primero; el marchamo de ida se cierra al final de cada tienda.")
 
-                    # --- Reordenar/eliminar destinos: todo lo que vive "por destino" en
-                    # session_state está indexado por posición (ej. t_{run}_{i}). Mover un
-                    # destino de posición significa mover TODAS sus claves juntas — de ahí
-                    # esta lista central, para no arriesgar que una quede regada al agregar
-                    # un campo nuevo más adelante y se nos olvide incluirla aquí.
-                    _CLAVES_POR_DESTINO = [
-                        "t", "mida", "comp", "r", "tar", "c", "peso", "remitos", "dev", "cred",
-                        "pg", "obs", "pedidos_lista", "pedido_subrun", "resumen_sr",
-                    ]
-
-                    def _mover_valor_destino(_origen, _destino):
-                        for _pref in _CLAVES_POR_DESTINO:
-                            _ko, _kd = f"{_pref}_{run}_{_origen}", f"{_pref}_{run}_{_destino}"
-                            if _ko in st.session_state:
-                                st.session_state[_kd] = st.session_state[_ko]
-                            else:
-                                st.session_state.pop(_kd, None)
-
-                    def _intercambiar_destinos(_i, _j):
-                        for _pref in _CLAVES_POR_DESTINO:
-                            _ki, _kj = f"{_pref}_{run}_{_i}", f"{_pref}_{run}_{_j}"
-                            _tiene_i, _vi = (_ki in st.session_state), st.session_state.get(_ki)
-                            _tiene_j, _vj = (_kj in st.session_state), st.session_state.get(_kj)
-                            if _tiene_j:
-                                st.session_state[_ki] = _vj
-                            else:
-                                st.session_state.pop(_ki, None)
-                            if _tiene_i:
-                                st.session_state[_kj] = _vi
-                            else:
-                                st.session_state.pop(_kj, None)
-
-                    def _eliminar_destino(_k, _total):
-                        for _idx in range(_k, _total - 1):
-                            _mover_valor_destino(_idx + 1, _idx)
-                        _ultimo = _total - 1
-                        for _pref in _CLAVES_POR_DESTINO:
-                            st.session_state.pop(f"{_pref}_{run}_{_ultimo}", None)
-                        st.session_state.num_destinos -= 1
-
                     destinos_viaje = []
                     total_destinos = st.session_state.num_destinos
                     tiendas_usadas_en_form = set()
@@ -3097,7 +2461,7 @@ def pagina_despacho():
                         lista_pedidos = st.session_state[key_lista_pedidos]
 
                         with st.container(border=True):
-                            cab1, cab2, cab3, cab4, cab5, cab6 = st.columns([0.35, 2.2, 1.5, 0.3, 0.3, 0.4])
+                            cab1, cab2, cab3, cab4 = st.columns([0.35, 2.2, 1.5, 0.4])
                             cab1.markdown(f'<div class="badge-numero">{i + 1}</div>', unsafe_allow_html=True)
                             with cab2:
                                 tienda = st.selectbox("Tienda / Destino", [""] + list(tiendas_cliente.keys()),
@@ -3108,19 +2472,10 @@ def pagina_despacho():
                                                               label_visibility="collapsed",
                                                               placeholder="📷 Escanea o digita el marchamo")
                             with cab4:
-                                if st.button(":material/arrow_upward:", key=f"subir_destino_{run}_{i}",
-                                             disabled=(i == 0), help="Subir en el orden de entrega"):
-                                    _intercambiar_destinos(i, i - 1)
-                                    st.rerun()
-                            with cab5:
-                                if st.button(":material/arrow_downward:", key=f"bajar_destino_{run}_{i}",
-                                             disabled=(i == total_destinos - 1), help="Bajar en el orden de entrega"):
-                                    _intercambiar_destinos(i, i + 1)
-                                    st.rerun()
-                            with cab6:
-                                if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=(total_destinos <= 1),
-                                             help="Quitar este destino del viaje" if total_destinos > 1 else "Debe quedar al menos un destino"):
-                                    _eliminar_destino(i, total_destinos)
+                                puede_borrar = (i == total_destinos - 1) and total_destinos > 1
+                                if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=not puede_borrar,
+                                             help="Quitar este destino" if puede_borrar else "Solo puedes quitar el último destino agregado"):
+                                    st.session_state.num_destinos -= 1
                                     st.rerun()
 
                             km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
@@ -3220,15 +2575,6 @@ def pagina_despacho():
                                     devolucion_txt = ""
                                     creditos_txt = ""
 
-                                # Si esta tienda vino de "Usar esta ruta" (importación de SR), se
-                                # muestra un resumen de solo referencia — nunca se guarda en la
-                                # base (por diseño, para no generar confusión con datos reales).
-                                _resumen_sr = st.session_state.get(f"resumen_sr_{run}_{i}")
-                                if _resumen_sr:
-                                    st.caption(f"📦 De SimpliRoute: {_resumen_sr['transferencias']} transferencia(s), "
-                                               f"{_resumen_sr['unidades']} unidades (no son bultos — solo referencia). "
-                                               f"Escribe el Despacho Manual y las cajas reales abajo.")
-
                                 observaciones_txt = st.text_area(
                                     "Observaciones / Instrucciones para el Piloto", key=f"obs_{run}_{i}",
                                     placeholder="Ej: lleva transferencia T-123, tienda cerrada, faltante detectado, etc.",
@@ -3326,13 +2672,9 @@ def pagina_despacho():
 
                 if not placa or len(destinos_viaje) == 0:
                     st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
-                elif not piloto_final:
-                    st.error("❌ Error: Falta elegir el Piloto (la Ruta de SimpliRoute no trae uno, o no está activo en el catálogo).")
-                elif not auxiliar_final:
-                    st.error("❌ Error: Falta el Auxiliar (escribe el nombre, o elige \"Sin Auxiliar\").")
-                elif len(auxiliar_final) > 100:
-                    st.error("❌ Error: El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
-                elif cap_pred == TIPO_CABEZAL_FURGON and not placa_furgon:
+                elif not piloto_final or not auxiliar_final:
+                    st.error("❌ Error: Falta seleccionar Piloto y/o Auxiliar (revisa que el catálogo tenga al menos uno cargado).")
+                elif cap_pred == "20 Ton" and not placa_furgon:
                     st.error("❌ Error: Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                 elif marchamos_vacios:
                     st.error("❌ Error: Todos los destinos ingresados deben tener un Marchamo de Ida asignado.")
@@ -3344,10 +2686,6 @@ def pagina_despacho():
                     st.error("❌ Error: El Marchamo de Regreso no puede ser igual a un Marchamo de Ida de este mismo viaje.")
                 elif viaje_sin_pedido and not motivo_seleccionado:
                     st.error("❌ Error: Elige un Motivo para este viaje sin pedido antes de generarlo.")
-                elif st.session_state.get(f"route_id_sr_{run}") and sr_int.ruta_en_uso(get_conn, st.session_state.get(f"route_id_sr_{run}")):
-                    _folio_en_uso, _estado_en_uso = sr_int.ruta_en_uso(get_conn, st.session_state.get(f"route_id_sr_{run}"))
-                    st.error(f"❌ Esta ruta de SimpliRoute ya se utilizó en el viaje {_folio_en_uso} ({_estado_en_uso}). "
-                             "Para cambiar algo, edítalo en Gestión de Viajes; si es otro viaje, usa la Creación Manual.")
                 else:
                     ok, resultado = guardar_viaje(
                         cliente=cliente_activo,
@@ -3359,7 +2697,7 @@ def pagina_despacho():
                         destinos_viaje=destinos_viaje,
                         cd_origen=cd_origen_final,
                         motivo_sin_pedido=motivo_seleccionado if viaje_sin_pedido else None,
-                        placa_furgon=placa_furgon if cap_pred == TIPO_CABEZAL_FURGON else None,
+                        placa_furgon=placa_furgon if cap_pred == "20 Ton" else None,
                         tipo_camion=cap_pred
                     )
                     if ok:
@@ -3367,12 +2705,10 @@ def pagina_despacho():
                         # El camión "aprende" el piloto/auxiliar usado esta vez, para
                         # que la próxima vez ya salga como default (se puede cambiar).
                         actualizar_default_camion(placa, piloto_final, auxiliar_final)
-                        # Control SR: vincula el viaje con su Ruta de SR y (si está activado en
-                        # integracion_simpliroute.py) reasigna camión/piloto reales allá.
-                        puente_sr("viaje_guardado", resultado, route_id_sr=st.session_state.get(f"route_id_sr_{run}"))
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.session_state.num_destinos = 1
-                        st.session_state.form_run += 1  # limpia el formulario para el próximo viaje
+                        _limpiar_claves_formulario_despacho(run)  # libera los campos de ESTA corrida ya cerrada
+                        st.session_state.form_run += 1  # el próximo formulario nace con keys nuevas
                         st.session_state["ultimo_viaje_guardado"] = resultado
                         st.rerun()
                     else:
@@ -3577,9 +2913,9 @@ def pagina_liquidaciones():
 # (disponible mientras no esté ya Anulado). Separado de Liquidaciones a propósito.
 # ==========================================
 def pagina_gestion_viajes():
-    if perfil_activo in ["Administrador", "SuperAdministrador", "Operador"]:
+    if perfil_activo in ["Administrador", "SuperAdministrador", "Operador", "Supervisor"]:
         st.header(":material/edit_document: Gestión de Viajes")
-        if perfil_activo == "Operador":
+        if perfil_activo in ("Operador", "Supervisor"):
             st.caption("Puedes corregir o anular cualquier viaje de los clientes que tengas asignados "
                        "(no solo los que tú mismo creaste — para que un turno pueda corregir lo del otro). "
                        "Un viaje Liquidado ya no se puede editar — solo anular.")
@@ -3673,10 +3009,16 @@ def pagina_gestion_viajes():
                             st.warning(f"Catálogo de Pilotos vacío — se mantiene el piloto actual: {viaje_g['piloto']}")
                             piloto_edit = viaje_g["piloto"]
 
-                        auxiliar_edit = campo_auxiliar("Auxiliar", st.session_state.catalogos["auxiliares"], viaje_g["auxiliar"], f"edit_aux_{viaje_g['id']}")
+                        aux_disp = st.session_state.catalogos["auxiliares"]
+                        if aux_disp:
+                            aux_idx = aux_disp.index(viaje_g["auxiliar"]) if viaje_g["auxiliar"] in aux_disp else 0
+                            auxiliar_edit = st.selectbox("Auxiliar", aux_disp, index=aux_idx, key=f"edit_aux_{viaje_g['id']}")
+                        else:
+                            st.warning(f"Catálogo de Auxiliares vacío — se mantiene el auxiliar actual: {viaje_g['auxiliar']}")
+                            auxiliar_edit = viaje_g["auxiliar"]
 
                         placa_furgon_edit = ""
-                        if datos_cam.get("tipo") == TIPO_CABEZAL_FURGON:
+                        if datos_cam.get("tipo") == "20 Ton":
                             placa_furgon_edit = st.text_input(
                                 "Placa del Furgón (unidad de 20 Ton)",
                                 value=viaje_g.get("placa_furgon") or "", key=f"edit_furgon_{viaje_g['id']}"
@@ -3733,23 +3075,16 @@ def pagina_gestion_viajes():
                             value=marchamo_regreso_actual_g, key=f"emreg_viaje_{viaje_g['id']}"
                         )
 
-                        sr_int.render_panel_ruta_sr(st, get_conn, viaje_g)
-
                         if st.button("💾 Guardar Correcciones", key=f"btn_editar_{viaje_g['id']}"):
                             if not marchamo_regreso_edit.strip():
                                 st.error("❌ El Marchamo de Regreso es obligatorio.")
-                            elif len(auxiliar_edit) > 100:
-                                st.error("❌ El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
-                            elif datos_cam.get("tipo") == TIPO_CABEZAL_FURGON and not placa_furgon_edit:
+                            elif datos_cam.get("tipo") == "20 Ton" and not placa_furgon_edit:
                                 st.error("❌ Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
                             else:
                                 ok, msg = editar_viaje(viaje_g["id"], placa_edit, transportista_edit, piloto_edit,
                                                        auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip(),
                                                        usuario_activo, placa_furgon=placa_furgon_edit or None)
                                 if ok:
-                                    puente_sr("viaje_editado", viaje_g["id_viaje"],
-                                              cambio_camion_piloto=(placa_edit != viaje_g["placa"] or piloto_edit != viaje_g["piloto"]))
-                                    st.session_state.catalogos = cargar_catalogos_desde_db()  # por si el auxiliar es nuevo
                                     st.success(f"Viaje {viaje_g['id_viaje']} corregido.")
                                     del st.session_state["viaje_gestion"]
                                     del st.session_state["destinos_gestion"]
@@ -3771,7 +3106,6 @@ def pagina_gestion_viajes():
                         else:
                             ok, msg = anular_viaje(viaje_g["id"], usuario_activo, motivo_anulacion.strip())
                             if ok:
-                                puente_sr("viaje_anulado", viaje_g["id_viaje"])
                                 st.success(f"Viaje {viaje_g['id_viaje']} anulado.")
                                 del st.session_state["viaje_gestion"]
                                 del st.session_state["destinos_gestion"]
@@ -3780,30 +3114,63 @@ def pagina_gestion_viajes():
                             else:
                                 mostrar_resultado_error(msg, perfil_activo)
     else:
-        st.info("Solo el perfil Administrador puede editar o anular viajes.")
+        st.info("Tu perfil no tiene permisos para editar o anular viajes.")
 
 # ==========================================
 # MÓDULO 3: REPORTES (pendiente de construir)
 # ==========================================
 def pagina_reportes():
-    # Los reportes viven en Supabase (vistas rpt_... + tabla reportes_catalogo): se cambian o se agregan SIN tocar
-    # este archivo. Si ese archivo faltara o fallara, solo desaparecen esos reportes; la app sigue.
-    reportes_sb = catalogo_reportes()          # [(nombre, vista, descripcion, actualiza_sr, archivo)] o None
-    nombres_sb = [_AVISO_FALTA_SQL] if reportes_sb is None else [f[0] for f in reportes_sb]
     reporte_sel = st.selectbox(
-        "Reporte", nombres_sb + ["Resumen de Liquidaciones", "Control de Retornable",
-                                 "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
+        "Reporte", ["Bitácora de Viajes", "Resumen de Liquidaciones", "Control de Retornable",
+                    "Plan de Carga del Día (para el Dashboard)", "Bultos por Camión (próximamente)"]
     )
 
-    if reporte_sel in nombres_sb:
-        if reportes_sb is None:
-            st.warning("Los reportes viven en Supabase y todavía no están creados. Ejecuta el script `reportes_supabase.sql` "
-                       "en el SQL Editor de Supabase (una sola vez) y recarga esta pantalla.")
+    if reporte_sel == "Bitácora de Viajes":
+        st.subheader(":material/receipt_long: Bitácora de Viajes")
+
+        fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1.3, 0.8])
+        with fcol1:
+            fecha_ini = st.date_input("Desde", value=ahora().date() - timedelta(days=7))
+        with fcol2:
+            fecha_fin = st.date_input("Hasta", value=ahora().date())
+        with fcol3:
+            clientes_reporte = ["Todos"] + clientes_permitidos_para(usuario_activo, perfil_activo)
+            cliente_reporte = st.selectbox("Cliente", clientes_reporte)
+        with fcol4:
+            st.write("")
+            generar = st.button(":material/search: Generar", use_container_width=True)
+
+        if generar:
+            st.session_state["df_bitacora"] = obtener_reporte_bitacora(fecha_ini, fecha_fin, cliente_reporte)
+
+        df_bitacora = st.session_state.get("df_bitacora")
+        if df_bitacora is not None:
+            if df_bitacora.empty:
+                st.info("No hay viajes en ese rango de fechas para ese cliente.")
+            else:
+                st.caption(f"{len(df_bitacora)} viaje(s) encontrados.")
+                # Ventana con su propio scroll, en vez de empujar toda la página
+                st.dataframe(df_bitacora, use_container_width=True, height=420)
+
+                ecol1, ecol2 = st.columns(2)
+                with ecol1:
+                    st.download_button(
+                        ":material/download: Exportar a Excel",
+                        data=exportar_excel(df_bitacora),
+                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                with ecol2:
+                    st.download_button(
+                        ":material/download: Exportar a CSV",
+                        data=exportar_csv(df_bitacora),
+                        file_name=f"bitacora_{fecha_ini}_a_{fecha_fin}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
         else:
-            try:
-                mostrar_reporte_supabase(next(f for f in reportes_sb if f[0] == reporte_sel))
-            except Exception as e:
-                st.error(f"⚠️ El reporte «{reporte_sel}» no pudo cargarse: {str(e).splitlines()[0]}. El resto de la app no se afecta.")
+            st.info("Elige el rango de fechas y el cliente, y presiona Generar.")
 
     elif reporte_sel == "Resumen de Liquidaciones":
         st.subheader(":material/fact_check: Resumen de Liquidaciones")
@@ -3965,22 +3332,6 @@ def pagina_reportes():
 # MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
-@st.cache_data(ttl=900, show_spinner="Revisando visit_type de hoy en SimpliRoute...")
-def _tipos_sin_mapear_de_hoy(token_cache_key):
-    """Trae las Rutas de hoy de SimpliRoute y devuelve los visit_type que
-    todavía no están en cat_mapeo_cliente_sr — cacheado 15 min porque la
-    consulta completa del día puede tardar hasta 45s, y no tiene sentido
-    repetirla cada vez que alguien abre Catálogos."""
-    ok, rutas = sr_int.importar_rutas_sr(str(datetime.now().date()), token=token_cache_key)
-    if not ok:
-        return None
-    sr_int.registrar_visit_types_vistos(get_conn, {t for r in rutas for t in r["visit_types"]})
-    with closing(get_conn()) as conn, conn.cursor() as cur:
-        cur.execute("SELECT visit_type FROM cat_mapeo_cliente_sr")
-        ya_mapeados = {r[0] for r in cur.fetchall()}
-    return sorted({t for r in rutas for t in r["visit_types"] if t not in ya_mapeados})
-
-
 def pagina_catalogos():
     if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
@@ -4005,7 +3356,7 @@ def pagina_catalogos():
             # pertenece a un solo cliente, se asigna viaje por viaje), así que
             # ese catálogo específico NO se puede filtrar por cliente todavía.
             # Un Supervisor ve/edita TODOS los camiones, no solo "los suyos".
-            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Camiones", "Solicitudes de Transporte", "Acceso Usuario → Cliente"]
+            catalogos_disponibles = ["Clientes y Tiendas", "CDs por Cliente", "Camiones", "Acceso Usuario → Cliente"]
             mis_clientes = clientes_permitidos_para(usuario_activo, perfil_activo)
             st.caption(f"Ves y editas Clientes/Tiendas/CDs solo de: **{', '.join(mis_clientes) or '(ningún cliente asignado)'}**. "
                        "El catálogo de Camiones es compartido entre todos los clientes (no se puede filtrar por "
@@ -4039,7 +3390,7 @@ def pagina_catalogos():
                     st.rerun()
             column_config = {c: st.column_config.Column(disabled=True) for c in config.get("solo_lectura", [])}
             for col, opciones in config.get("opciones_desplegable", {}).items():
-                column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=col not in config.get("opcionales", []))
+                column_config[col] = st.column_config.SelectboxColumn(options=opciones, required=True)
             for col, catalogo_key in config.get("opciones_desde_catalogo", {}).items():
                 opciones_vivas = sorted(st.session_state.catalogos.get(catalogo_key, []))
                 # Si quien edita tiene alcance limitado (Supervisor) y esta columna
@@ -4058,8 +3409,6 @@ def pagina_catalogos():
                 column_config=column_config, key=f"editor_{catalogo_sel}"
             )
             if st.button(":material/save: Guardar Cambios de la Tabla", key=f"guardar_editor_{catalogo_sel}"):
-                if config["tabla"] == "cat_camiones" and "placa" in df_editado.columns:
-                    df_editado["placa"] = df_editado["placa"].apply(sr_int.normalizar_placa)
                 faltan = df_editado[config["clave"]].isnull().any(axis=1) | (df_editado[config["clave"]].astype(str).apply(lambda s: s.str.strip()).eq("").any(axis=1))
                 if faltan.any():
                     st.error(f"❌ Hay fila(s) sin llenar la llave ({', '.join(config['clave'])}). Complétalas o bórralas antes de guardar.")
@@ -4069,18 +3418,6 @@ def pagina_catalogos():
                         texto = "✅ Tabla actualizada correctamente."
                         if msg != "OK":
                             texto += f"\n\n⚠️ {msg}"
-                        if config["tabla"] == "cat_camiones":
-                            try:
-                                token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
-                                fallidas = []
-                                for placa_fila in df_editado["placa"].dropna().unique():
-                                    ok_sr, msg_sr = sr_int.sincronizar_camion_con_sr(get_conn, placa_fila, token=token_sr)
-                                    if not ok_sr:
-                                        fallidas.append(placa_fila)
-                                if fallidas:
-                                    texto += f"\n\n⚠️ {len(fallidas)} camión(es) quedaron pendientes de sincronizar con SimpliRoute."
-                            except Exception:
-                                pass
                         st.session_state["flash_catalogos"] = ("success", texto)
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
@@ -4137,42 +3474,16 @@ def pagina_catalogos():
                         st.warning("No hay usuarios disponibles para asignar todavía — créalos primero en la pestaña Usuarios.")
                         valores_form["usuario"] = ""
                 elif col == "tipo" and catalogo_sel == "Rendimiento por Camión":
-                    # Este catálogo ES la fuente real de qué tonelajes existen — para
-                    # agregar uno nuevo (ej. "15TM") se escribe aquí. El formato ##TM
-                    # es obligatorio (se valida al guardar) para no volver a tener
-                    # variantes como "5 Ton", "15 TN", "05Ton" regadas en Camiones.
-                    valores_form["tipo"] = st.text_input(
-                        "Tipo (formato: 05TM, 10TM, 15TM...)", key=f"campo_{catalogo_sel}_tipo_txt",
-                        help="Dos dígitos + TM, sin espacios. Este valor es el que luego aparece "
-                             "como opción al dar de alta un camión."
-                    ).strip().upper()
-                elif col == "tipo" and catalogo_sel == "Camiones":
-                    # Ya no es texto libre — se elige de los tonelajes que existen en
-                    # Rendimiento por Camión (la fuente real). Evita por completo que
-                    # se cuele una variante nueva sin querer.
-                    tipos_existentes = st.session_state.catalogos["tipos_camion"]
+                    # Los tonelajes válidos son los que ya existen en el catálogo de
+                    # Camiones — así se evitan variantes como "5 Ton", "5 T", "05 Ton".
+                    tipos_existentes = sorted(set(
+                        c["tipo"] for c in st.session_state.catalogos["camiones"].values() if c["tipo"]
+                    ))
                     if tipos_existentes:
-                        valores_form["tipo"] = st.selectbox(
-                            "Tipo (tonelaje)", tipos_existentes, key=f"campo_{catalogo_sel}_tipo_sel",
-                            help="¿Necesitas un tonelaje que no está en la lista? Agrégalo primero en "
-                                 "el catálogo 'Rendimiento por Camión' — de ahí sale esta lista."
-                        )
+                        valores_form["tipo"] = st.selectbox("Tipo", tipos_existentes, key=f"campo_{catalogo_sel}_tipo_sel")
                     else:
-                        st.warning("Todavía no hay ningún tonelaje registrado — agrega uno primero en "
-                                   "'Rendimiento por Camión'.")
+                        st.warning("Todavía no hay ningún tonelaje registrado en el catálogo de Camiones.")
                         valores_form["tipo"] = ""
-                elif col == "capacidad_cajas" and catalogo_sel == "Camiones":
-                    # Opcional de verdad (NULL, no 0) — si se deja en blanco, al usarse
-                    # se resuelve con el default de su tipo (cat_rendimiento_camion).
-                    _tipo_elegido = valores_form.get("tipo", "")
-                    _default_tipo = st.session_state.catalogos["capacidad_cajas_default"].get(_tipo_elegido)
-                    _placeholder_cap = f"usa el default de {_tipo_elegido} ({_default_tipo})" if _default_tipo else "sin default definido para este tipo"
-                    _cap_ingresada = st.number_input(
-                        "Capacidad en cajas (opcional — solo si este camión es distinto al estándar de su tipo)",
-                        min_value=0, step=1, value=None, placeholder=_placeholder_cap,
-                        key=f"campo_{catalogo_sel}_capacidad_cajas"
-                    )
-                    valores_form["capacidad_cajas"] = _cap_ingresada
                 elif col == "piloto" and catalogo_sel == "Camiones":
                     pilotos_existentes = sorted(st.session_state.catalogos["pilotos"])
                     valores_form["piloto"] = st.selectbox("Piloto", pilotos_existentes, key=f"campo_{catalogo_sel}_piloto_sel") if pilotos_existentes else ""
@@ -4184,12 +3495,6 @@ def pagina_catalogos():
                     valores_form["transportista"] = st.selectbox("Transportista", transportistas_existentes, key=f"campo_{catalogo_sel}_transportista_sel") if transportistas_existentes else ""
                 elif col == "clasificacion":
                     valores_form["clasificacion"] = st.selectbox("Clasificación (Local/Departamental)", ["Local", "Departamental"], key=f"campo_{catalogo_sel}_clasificacion_sel")
-                elif col == "integracion_wms":
-                    _op_wms = st.selectbox(
-                        "Integración con WMS", ["Sin clasificar", "Integración WMS", "No Integración WMS"], key=f"campo_{catalogo_sel}_wms_sel",
-                        help="Integración WMS: se le lleva la integración (pedidos, despacho, etc.). No Integración WMS: solo se "
-                             "transporta su mercadería. Sirve para segmentar los reportes.")
-                    valores_form["integracion_wms"] = None if _op_wms == "Sin clasificar" else _op_wms
                 elif col == "estado_cliente":
                     valores_form["estado_cliente"] = st.selectbox(
                         "Estado del Cliente", ["Prueba", "Activo", "Inactivo"], index=1, key=f"campo_{catalogo_sel}_estado_sel",
@@ -4211,13 +3516,9 @@ def pagina_catalogos():
                     valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
             guardar_registro = st.button(":material/save: Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
             if guardar_registro:
-                if config["tabla"] == "cat_camiones" and "placa" in valores_form:
-                    valores_form["placa"] = sr_int.normalizar_placa(valores_form["placa"])
                 faltan_llave = [c for c in config["clave"] if not str(valores_form[c]).strip()]
                 if faltan_llave:
                     st.error(f"❌ Debes llenar: {', '.join(faltan_llave)} (son la llave del registro).")
-                elif catalogo_sel == "Rendimiento por Camión" and not re.match(r"^\d{2}TM$", valores_form.get("tipo", "")):
-                    st.error("❌ El tipo debe tener el formato exacto ##TM (ej. 05TM, 10TM, 15TM) — dos dígitos, sin espacios.")
                 else:
                     # Si el registro trae un cliente que todavía no existe en el catálogo
                     # de Clientes, hay que crearlo primero — si no, la llave foránea lo rechaza.
@@ -4228,18 +3529,6 @@ def pagina_catalogos():
                     ok, msg = agregar_o_actualizar_registro(config["tabla"], config["columnas"], config["clave"], valores_form, usuario_activo, mis_clientes)
                     if ok:
                         st.session_state["flash_catalogos"] = ("success", "✅ Registro guardado correctamente.")
-                        if config["tabla"] == "cat_camiones":
-                            try:
-                                token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
-                                ok_sr, msg_sr = sr_int.sincronizar_camion_con_sr(get_conn, valores_form["placa"], token=token_sr)
-                                if not ok_sr:
-                                    st.session_state["flash_catalogos"] = (
-                                        "warning",
-                                        f"✅ Camión guardado, pero no se pudo sincronizar con SimpliRoute todavía "
-                                        f"(quedó en la lista de pendientes): {msg_sr}"
-                                    )
-                            except Exception:
-                                pass
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
                     else:
@@ -4296,22 +3585,8 @@ def pagina_catalogos():
                 try:
                     df_nuevo = pd.read_excel(archivo, engine="openpyxl")
                     faltantes = [c for c in config["columnas"] if c not in df_nuevo.columns]
-                    _filas_sin_tonelaje_valido = []
-                    if not faltantes and config["tabla"] == "cat_camiones" and "tipo" in df_nuevo.columns:
-                        # Auto-corrige variantes conocidas ("5 Ton", "20TN"...) al formato
-                        # ##TM — y separa aparte las que no se pudieron reconocer, para que
-                        # las corrijas en el Excel en vez de que se suban con un tonelaje
-                        # inventado o inconsistente.
-                        _tipos_normalizados = df_nuevo["tipo"].apply(normalizar_tonelaje)
-                        _filas_sin_tonelaje_valido = df_nuevo.loc[_tipos_normalizados.isna(), ["placa", "tipo"]].values.tolist() if "placa" in df_nuevo.columns else []
-                        df_nuevo["tipo"] = _tipos_normalizados.where(_tipos_normalizados.notna(), df_nuevo["tipo"])
                     if faltantes:
                         st.error(f"❌ Al archivo le faltan estas columnas: {', '.join(faltantes)}")
-                    elif _filas_sin_tonelaje_valido:
-                        st.error("❌ Estas filas tienen un tonelaje que no se pudo reconocer — corrígelas en el "
-                                 "Excel al formato ##TM (05TM, 10TM, 20TM...) y vuelve a subirlo:")
-                        st.dataframe(pd.DataFrame(_filas_sin_tonelaje_valido, columns=["Placa", "Tipo en el archivo"]),
-                                     use_container_width=True, hide_index=True)
                     else:
                         st.markdown("#### Vista previa de lo que se va a cargar")
                         st.dataframe(df_nuevo[config["columnas"]], use_container_width=True)
@@ -4369,120 +3644,6 @@ def pagina_catalogos():
                             else:
                                 st.session_state["flash_catalogos"] = ("error", f"❌ El borrado masivo falló, no se borró nada (probablemente algo ahí está en uso en Camiones o Viajes): {resultado}")
                                 st.rerun()
-
-    # ==========================================
-    # Integración SimpliRoute — visible para Administrador/SuperAdministrador/
-    # Supervisor. Nunca bloquea nada de lo de arriba; es solo visibilidad y
-    # botones de reintento sobre lo que ya se sincronizó (o no) en segundo
-    # plano al guardar camiones/pilotos.
-    # ==========================================
-    if perfil_activo in ["Administrador", "SuperAdministrador", "Supervisor"]:
-        st.markdown("---")
-        st.markdown("### :material/sync: Integración SimpliRoute")
-
-        token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
-        hay_token_sr = bool(token_sr)
-        if not hay_token_sr:
-            st.warning("⚠️ No hay token de SimpliRoute configurado en el Vault de Supabase — la integración está "
-                       "desactivada. Todo sigue funcionando en modo manual.")
-
-        # Visible para Administrador/SuperAdministrador/Supervisor sin que
-        # tengan que entrar a Despacho a importar algo primero — se revisa
-        # de una vez contra TODOS los clientes, no solo el que tengas activo.
-        # Cacheado 15 min: esta consulta trae el día completo de SimpliRoute
-        # (puede tardar hasta 45s) — no tiene sentido repetirla cada vez que
-        # se abre esta pantalla.
-        if hay_token_sr:
-            _tipos_sin_mapear_hoy = _tipos_sin_mapear_de_hoy(token_sr)
-            if _tipos_sin_mapear_hoy:
-                st.warning(f"⚠️ {len(_tipos_sin_mapear_hoy)} visit_type de hoy sin mapear a ningún cliente: "
-                           f"{', '.join(_tipos_sin_mapear_hoy)}. Mapéalos abajo para que sus rutas aparezcan "
-                           "en la importación del cliente correcto.")
-
-        with st.expander(":material/local_shipping: Camiones pendientes de sincronizar con SR", expanded=False):
-            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                _cur.execute(
-                    "SELECT placa FROM cat_camiones WHERE activo = TRUE "
-                    "AND (sincronizado_sr IS NOT TRUE OR id_sr IS NULL) ORDER BY placa"
-                )
-                _placas_pendientes = [r[0] for r in _cur.fetchall()]
-            if not _placas_pendientes:
-                st.success("✅ No hay camiones pendientes — todos sincronizados.")
-            else:
-                st.write(f"{len(_placas_pendientes)} camión(es) pendiente(s): " + ", ".join(_placas_pendientes))
-                if hay_token_sr and st.button(":material/refresh: Reintentar todos", key="btn_reintentar_camiones_sr"):
-                    resultados, resumen = sr_int.reintentar_camiones_pendientes(get_conn, token=token_sr)
-                    st.session_state["flash_catalogos"] = ("success", resumen)
-                    st.rerun()
-
-        with st.expander(":material/local_shipping: Camiones nuevos desde SR (pendientes de completar)", expanded=False):
-            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                _cur.execute("SELECT placa, id_sr FROM cat_camiones WHERE pendiente_completar = TRUE AND activo = FALSE ORDER BY placa")
-                _camiones_pend_sr = _cur.fetchall()
-            if not _camiones_pend_sr:
-                st.success("✅ No hay camiones nuevos pendientes de completar.")
-            else:
-                st.dataframe(pd.DataFrame(_camiones_pend_sr, columns=["Placa (de SR)", "ID en SR"]), use_container_width=True, hide_index=True)
-                st.caption("SR no trae el tipo ni el transportista. Complétalos en el catálogo de Camiones (arriba) y márcalos "
-                           "activos cuando estén listos; al activarlos desaparecen de esta lista y ya se pueden usar en Despacho.")
-
-        with st.expander(":material/person: Pilotos pendientes de completar (nuevos desde SR)", expanded=False):
-            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                _cur.execute("SELECT nombre, id_sr FROM cat_pilotos WHERE pendiente_completar = TRUE AND activo = FALSE ORDER BY nombre")
-                _pilotos_pendientes = _cur.fetchall()
-            if not _pilotos_pendientes:
-                st.success("✅ No hay pilotos pendientes de completar.")
-            else:
-                st.dataframe(pd.DataFrame(_pilotos_pendientes, columns=["Nombre (de SR)", "ID en SR"]), use_container_width=True, hide_index=True)
-                st.caption("Complétalos desde el catálogo de Pilotos arriba (licencia, transportista, etc.) y márcalos activos cuando estén listos.")
-
-        with st.expander(":material/warning: Nombres en revisión (posible piloto duplicado)", expanded=False):
-            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                _cur.execute(
-                    "SELECT nombre, id_sr, fecha_deteccion FROM cat_pilotos_revision_nombre "
-                    "WHERE resuelto = FALSE ORDER BY fecha_deteccion DESC"
-                )
-                _en_revision = _cur.fetchall()
-            if not _en_revision:
-                st.success("✅ No hay nombres en revisión.")
-            else:
-                for _nombre_rev, _id_sr_rev, _fecha_rev in _en_revision:
-                    st.write(f"**{_nombre_rev}** (id_sr {_id_sr_rev}) — detectado {_fecha_rev}")
-                    _c1, _c2 = st.columns(2)
-                    with _c1:
-                        if st.button("Es la misma persona → vincular", key=f"vincular_rev_{_id_sr_rev}"):
-                            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                                _cur.execute("UPDATE cat_pilotos SET id_sr = %s WHERE nombre = %s", (_id_sr_rev, _nombre_rev))
-                                _cur.execute("UPDATE cat_pilotos_revision_nombre SET resuelto = TRUE WHERE id_sr = %s", (_id_sr_rev,))
-                                _conn.commit()
-                            st.rerun()
-                    with _c2:
-                        if st.button("Es otra persona → crear aparte", key=f"separar_rev_{_id_sr_rev}"):
-                            with closing(get_conn()) as _conn, _conn.cursor() as _cur:
-                                _cur.execute(
-                                    "INSERT INTO cat_pilotos (nombre, id_sr, activo, pendiente_completar) "
-                                    "VALUES (%s, %s, FALSE, TRUE) ON CONFLICT (nombre) DO NOTHING",
-                                    (f"{_nombre_rev} (SR)", _id_sr_rev)
-                                )
-                                _cur.execute("UPDATE cat_pilotos_revision_nombre SET resuelto = TRUE WHERE id_sr = %s", (_id_sr_rev,))
-                                _conn.commit()
-                            st.rerun()
-
-        if hay_token_sr and st.button(":material/sync: Sincronizar Camiones desde SimpliRoute ahora", key="btn_sync_camiones_manual"):
-            ok_sync_c, resumen_sync_c = sr_int.sincronizar_camiones_desde_sr(get_conn, token=token_sr)
-            st.session_state["flash_catalogos"] = ("success" if ok_sync_c else "error", resumen_sync_c)
-            st.rerun()
-
-        if hay_token_sr and st.button(":material/sync: Sincronizar Pilotos desde SimpliRoute ahora", key="btn_sync_pilotos_manual"):
-            ok_sync, resumen_sync = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token_sr)
-            st.session_state["flash_catalogos"] = ("success" if ok_sync else "error", resumen_sync)
-            st.rerun()
-
-        with st.expander(":material/link: Mapeo Cliente ↔ visit_type de SR", expanded=False):
-            sr_int.render_mapeo_visit_type(st, get_conn, st.session_state.catalogos["clientes_lista_activos"], token=token_sr)
-
-        with st.expander(":material/fact_check: Control SR — ¿lo que cambié llegó a SimpliRoute?", expanded=False):
-            sr_int.render_control_sr(st, get_conn, token=token_sr)
 
 # ==========================================
 # MÓDULO 6: GESTIÓN DE USUARIOS — SuperAdministrador ve y administra a todos;
@@ -4664,81 +3825,19 @@ def pagina_usuarios():
                 st.info("Elige el rango de fechas y presiona 'Ver'.")
 
 # ==========================================
-# MÓDULO 7: DASHBOARDS — una sola pantalla con varios dashboards
-# seleccionables, en vez de una página aparte por cada uno. Agregar un
-# dashboard nuevo es: escribir una función que reciba `conn` (ya abierta) y
-# dibuje lo que sea con st.* (gráficas, tablas, métricas) — de solo lectura,
-# nunca hace commit/insert — y agregarla al diccionario DASHBOARDS_DISPONIBLES
-# de abajo. No hay que tocar nada más de este módulo ni de la navegación.
-# ==========================================
-def _dashboard_placeholder(conn):
-    st.info(":material/construction: Todavía no hay dashboards configurados — "
-            "cuando definamos el primero (ej. Indicadores de SimpliRoute: puntualidad, "
-            "efectividad de entrega, km real), aparece seleccionable aquí mismo, "
-            "sin tener que tocar la estructura de esta pantalla.")
-
-
-DASHBOARDS_DISPONIBLES = {
-    "(Ninguno configurado todavía)": _dashboard_placeholder,
-    # "Indicadores SimpliRoute": _dashboard_indicadores_sr,
-    # "Flota y Distribución": _dashboard_flota,
-}
-
-
-def pagina_dashboards():
-    st.header(":material/dashboard: Dashboards")
-    st.caption(f"Conectado como **{usuario_activo}** ({perfil_activo})")
-    dashboard_elegido = st.selectbox("Elige un dashboard", list(DASHBOARDS_DISPONIBLES.keys()), key="dashboard_sel")
-    with closing(get_conn()) as conn:
-        DASHBOARDS_DISPONIBLES[dashboard_elegido](conn)
-
-
-# ==========================================
 # NAVEGACIÓN — páginas reales en la barra lateral (Streamlit solo ejecuta
 # el código de la página elegida, no las 6 de un jalón como pasaba con
 # pestañas — esto es justo lo que evita la clase de bug que ya nos mordió
 # una vez con un st.stop() en una pestaña tumbando las que venían después).
 # ==========================================
-try:
-    _token_sr_autosync = sr_int.obtener_token_sr_desde_vault(get_conn)
-    if _token_sr_autosync and sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
-        sr_int.sincronizar_pilotos_desde_sr(get_conn, token=_token_sr_autosync)
-except Exception:
-    pass  # sin token, o SR no responde — nunca debe tumbar el arranque de la app
-try:
-    if _token_sr_autosync and sr_int.debe_sincronizar_camiones(get_conn, horas=12):
-        sr_int.sincronizar_camiones_desde_sr(get_conn, token=_token_sr_autosync)
-except Exception:
-    pass
-
-if st.session_state.get("_modo_base_vacia"):
-    st.info("🚀 **Base nueva:** todavía no hay clientes. Empieza cargando los catálogos en este orden: "
-            "Clientes → CDs por cliente → Tiendas → Transportistas → Camiones → Pilotos y Auxiliares → "
-            "Usuarios y su acceso a clientes. Al agregar el primer cliente, el sistema te lleva a la "
-            "selección normal de Cliente y CD para empezar a despachar.")
-    pagina_catalogos()
-    st.stop()
-
-_PAGINA_GESTION_VIAJES = st.Page(pagina_gestion_viajes, title="Gestión de Viajes", icon=":material/edit_document:")
 pagina_actual = st.navigation([
     st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:"),
     st.Page(pagina_liquidaciones, title="Recepción (Liquidaciones)", icon=":material/receipt_long:"),
-    _PAGINA_GESTION_VIAJES,
+    st.Page(pagina_gestion_viajes, title="Gestión de Viajes", icon=":material/edit_document:"),
     st.Page(pagina_reportes, title="Reportes", icon=":material/bar_chart:"),
     st.Page(pagina_catalogos, title="Catálogos", icon=":material/settings:"),
     st.Page(pagina_usuarios, title="Usuarios", icon=":material/manage_accounts:"),
-    st.Page(pagina_dashboards, title="Dashboards", icon=":material/dashboard:"),
 ])
-try:
-    _flash_sr = st.session_state.pop("flash_sr", None)
-    if _flash_sr:
-        st.warning(f"⚠️ SimpliRoute: {_flash_sr}")
-    _flash_sr_ok = st.session_state.pop("flash_sr_ok", None)
-    if _flash_sr_ok:
-        st.success(f"✅ SimpliRoute: {_flash_sr_ok}")
-except Exception:
-    pass
-
 pagina_actual.run()
 
 # ==========================================
