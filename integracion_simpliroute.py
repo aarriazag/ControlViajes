@@ -37,13 +37,22 @@ en app.py):
 import requests
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Config / cliente HTTP
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://api.simpliroute.com/v1/"
-TIMEOUT_SEGUNDOS = 8
+TIMEOUT_SEGUNDOS = 8            # máximo esperando LA RESPUESTA (lectura) de SR, en llamadas ligeras
+CONNECT_TIMEOUT_SEGUNDOS = 5    # máximo para ESTABLECER la conexión con SR; si no, falla rápido
+
+
+def _hoy_guatemala():
+    """La fecha de HOY en Guatemala. Render corre en hora UTC, así que datetime.now().date()
+    ya marca 'mañana' desde las 6 pm de Guatemala. (Solo para elegir fechas en pantalla: las
+    horas que se guardan en la base siguen usando datetime.now() para no descuadrar nada.)"""
+    return datetime.now(ZoneInfo("America/Guatemala")).date()
 
 # Patrón de placas "dummy" de planeación en SR: C- seguido de 6 dígitos
 # (ej. C-123456). Las placas reales de Ransa son C- + 3 dígitos + 3 letras
@@ -87,8 +96,11 @@ def _sr_request(method, ruta, token=None, timeout=None, reintentos_429=2, **kwar
     for intento in range(reintentos_429 + 1):
         try:
             resp = requests.request(
-                method, url, headers=_headers(token), timeout=(timeout or TIMEOUT_SEGUNDOS), **kwargs
+                method, url, headers=_headers(token),
+                timeout=(CONNECT_TIMEOUT_SEGUNDOS, (timeout or TIMEOUT_SEGUNDOS)), **kwargs
             )
+        except requests.exceptions.ConnectTimeout:
+            return False, f"No se pudo conectar con SimpliRoute a tiempo ({CONNECT_TIMEOUT_SEGUNDOS}s)."
         except requests.exceptions.Timeout:
             return False, f"SimpliRoute no respondió a tiempo (timeout de {timeout or TIMEOUT_SEGUNDOS}s)."
         except requests.exceptions.RequestException as e:
@@ -386,6 +398,10 @@ def sincronizar_camion_con_sr(get_conn_fn, placa, token=None):
             fila_piloto = cur.fetchone()
             if fila_piloto:
                 id_sr_piloto = fila_piloto[0]
+
+        # Termina aquí la lectura: se cierra la transacción ANTES de llamar a SR, para no dejar la
+        # conexión "abierta y esperando" mientras SR responde (puede tardar varios segundos).
+        conn.commit()
 
         if id_sr_actual:
             # Ya tenemos su id_sr de una sincronización anterior — NUNCA se
@@ -1272,7 +1288,7 @@ def _render_panel_ruta_sr(st, get_conn_fn, viaje, token):
             try:
                 fecha_ini = datetime.strptime(str(fecha_viaje)[:10], "%Y-%m-%d").date()
             except Exception:
-                fecha_ini = datetime.now().date()
+                fecha_ini = _hoy_guatemala()
             fecha = st.date_input("Fecha de la Ruta", value=fecha_ini, key=f"panel_sr_fecha_{id_viaje}")
             clave_rutas = f"panel_sr_rutas_{id_viaje}"
             if st.button(":material/search: Buscar Rutas de ese día", key=f"panel_sr_buscar_{id_viaje}"):
@@ -1344,7 +1360,7 @@ def escanear_visit_types_sr(get_conn_fn, token=None, dias=7):
     encuentra. Devuelve (ok, resumen). Nunca lanza."""
     from datetime import timedelta
     try:
-        hoy = datetime.now().date()
+        hoy = _hoy_guatemala()
         fechas = [hoy + timedelta(days=d) for d in range(-int(dias), 2)]
         encontrados, dias_ok, dias_fallo = set(), 0, 0
         for f in fechas:
@@ -1520,6 +1536,9 @@ def asegurar_vinculo(get_conn_fn):
         pass
 
 
+PRESUPUESTO_REFRESCO_SEGUNDOS = 60   # tiempo máximo total consultando Rutas a SR en un refresco
+
+
 def refrescar_detalle_rango(get_conn_fn, fecha_ini, fecha_fin, cliente="Todos", token=None, maximo=60):
     """Consulta a SR el detalle ACTUAL de las Rutas vinculadas a los viajes del rango y lo guarda
     (estado, kilómetros, visitas, carga, horas). Se hace a pedido desde Reportes: una consulta por Ruta,
@@ -1543,20 +1562,40 @@ def refrescar_detalle_rango(get_conn_fn, fecha_ini, fecha_fin, cliente="Todos", 
         filas = filas[:maximo]
         if not filas:
             return True, "No hay viajes vinculados a una Ruta de SimpliRoute en ese rango."
-        actualizados, fallos = 0, []
-        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
-            for id_viaje, route_id in filas:
-                ok, d = obtener_ruta_sr(route_id, token=token)
-                if not ok:
-                    fallos.append(id_viaje)
-                    continue
-                cur.execute("UPDATE sr_vinculo_viaje SET detalle_sr = %s, detalle_sr_fecha = NOW() WHERE id_viaje = %s",
-                            (json.dumps(d, default=str), id_viaje))
-                actualizados += 1
-            conn.commit()
+        # 1) Primero se consulta a SR, SIN tocar la base: así no hay filas bloqueadas mientras se espera.
+        #    Si SR falla 3 veces seguidas, o ya pasó el presupuesto de tiempo, se corta: no tiene
+        #    sentido seguir esperando 8 s por cada una de las 60 Rutas con SR caído o muy lento.
+        resultados, fallos, seguidos, corte = [], [], 0, None
+        inicio = time.time()
+        for id_viaje, route_id in filas:
+            if time.time() - inicio > PRESUPUESTO_REFRESCO_SEGUNDOS:
+                corte = "se alcanzó el tiempo máximo"
+                break
+            ok, d = obtener_ruta_sr(route_id, token=token)
+            if not ok:
+                fallos.append(id_viaje)
+                seguidos += 1
+                if seguidos >= 3:
+                    corte = "SimpliRoute dejó de responder"
+                    break
+                continue
+            seguidos = 0
+            resultados.append((id_viaje, json.dumps(d, default=str)))
+        # 2) Después se guarda todo de una vez, en una transacción corta.
+        actualizados = len(resultados)
+        if resultados:
+            with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+                for id_viaje, detalle in resultados:
+                    cur.execute("UPDATE sr_vinculo_viaje SET detalle_sr = %s, detalle_sr_fecha = NOW() WHERE id_viaje = %s",
+                                (detalle, id_viaje))
+                conn.commit()
         resumen = f"Detalle de SimpliRoute actualizado en {actualizados} de {len(filas)} viaje(s)."
         if fallos:
             resumen += f" No respondieron: {', '.join(fallos[:5])}{'…' if len(fallos) > 5 else ''}."
+        if corte:
+            sin_consultar = len(filas) - actualizados - len(fallos)
+            resumen += (f" Se detuvo la consulta ({corte})" + (f"; {sin_consultar} viaje(s) quedaron sin consultar" if sin_consultar > 0 else "")
+                        + ". Vuelve a intentarlo en unos minutos.")
         if recortado:
             resumen += f" Se actualizaron solo los {maximo} más recientes; acorta el rango para el resto."
         return True, resumen
@@ -1844,7 +1883,7 @@ def _render_control_sr(st, get_conn_fn, token):
     st.caption(f"Modo actual: **{modo}**. Compara camión y piloto del viaje contra la Ruta real en SimpliRoute. "
                "No compara cajas ni estado de entrega.")
 
-    fecha = st.date_input("Fecha de los viajes", value=datetime.now().date(), key="ctl_sr_fecha")
+    fecha = st.date_input("Fecha de los viajes", value=_hoy_guatemala(), key="ctl_sr_fecha")
     fecha_txt = str(fecha)
 
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:

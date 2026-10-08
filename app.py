@@ -18,7 +18,7 @@ import string
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from contextlib import closing
-import requests
+import time
 import integracion_simpliroute as sr_int
 
 
@@ -620,8 +620,29 @@ def get_conn():
     cfg = st.secrets["postgres"]
     return psycopg2.connect(
         host=cfg["host"], port=cfg["port"], dbname=cfg["dbname"],
-        user=cfg["user"], password=cfg["password"]
+        user=cfg["user"], password=cfg["password"],
+        # Sin esto, si la red o la base no responden, la pantalla espera sin límite.
+        # connect_timeout: máximo para conectar. keepalives: detecta una conexión
+        # muerta (cable, red caída) en ~60 s en vez de quedarse colgada por horas.
+        connect_timeout=10,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
     )
+
+
+# Errores de "no hay conexión con la base" (red caída, base reiniciando, tiempo agotado,
+# conexión cortada). Los demás errores NO se esconden: siguen mostrándose como siempre.
+ERRORES_DE_CONEXION = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+
+def _pantalla_sin_conexion(e, contexto=""):
+    """En vez del error rojo de Python, un aviso claro y un botón para reintentar.
+    El detalle técnico va a la consola del servidor (Logs de Render)."""
+    print(f"[SIN CONEXIÓN BD] {contexto} ({type(e).__name__}): {e}")
+    st.error("🔌 **No se pudo conectar con la base de datos.** Suele ser un problema pasajero de red. "
+             "Espera unos segundos y presiona **Reintentar**. Si sigue igual, avisa a un Administrador.")
+    if st.button(":material/refresh: Reintentar", key="btn_reintentar_bd"):
+        st.rerun()
+    st.stop()
 
 
 @st.cache_resource
@@ -1600,7 +1621,10 @@ def borrar_masivo(tabla, columna_cliente, cliente_valor, usuario):
             return False, _error_tecnico(e, "borrar_masivo")
 
 
-init_db()
+try:
+    init_db()
+except ERRORES_DE_CONEXION as e:
+    _pantalla_sin_conexion(e, "init_db")
 
 
 def marchamo_ya_usado(marchamo, cur):
@@ -1741,8 +1765,8 @@ def puente_sr(tipo, id_viaje, route_id_sr=None, cambio_camion_piloto=None):
         ok, msg = sr_int.evento(get_conn, tipo, id_viaje, route_id_sr=route_id_sr, cambio_camion_piloto=cambio_camion_piloto)
         if msg:
             st.session_state["flash_sr" if not ok else "flash_sr_ok"] = msg
-    except Exception:
-        pass
+    except Exception as e:
+        _error_tecnico(e, "puente_sr")
 
 
 def obtener_viajes_recientes(limite=10):
@@ -2283,7 +2307,10 @@ def liquidar_viaje(viaje_id, destinos_actualizados, usuario):
 # subir un Excel para reemplazarlos sin tocar una sola línea de código.
 # ==========================================
 if 'catalogos' not in st.session_state:
-    st.session_state.catalogos = cargar_catalogos_desde_db()
+    try:
+        st.session_state.catalogos = cargar_catalogos_desde_db()
+    except ERRORES_DE_CONEXION as e:
+        _pantalla_sin_conexion(e, "cargar_catalogos_desde_db")
 
 # Contador de "corridas" del formulario: se incrementa después de guardar un
 # viaje para que los widgets nazcan con keys nuevas (así el formulario queda
@@ -2354,7 +2381,12 @@ if not st.session_state.get("login_confirmado"):
                              "(usuario y password) en los Secrets de la app y reinicia; se creará el "
                              "primer SuperAdministrador.")
                 if st.button(":material/login: Ingresar al Sistema", use_container_width=True):
-                    resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
+                    try:
+                        resultado_login = verificar_login(usuario_login.strip(), password_login) if usuario_login.strip() else None
+                    except ERRORES_DE_CONEXION as e:
+                        print(f"[SIN CONEXIÓN BD] verificar_login ({type(e).__name__}): {e}")
+                        st.error("🔌 No se pudo conectar con la base de datos. Inténtalo de nuevo en unos segundos.")
+                        st.stop()
                     if resultado_login:
                         st.session_state["usuario_activo_fijo"] = usuario_login.strip()
                         st.session_state["perfil_activo_fijo"] = resultado_login["perfil"]
@@ -2371,7 +2403,11 @@ perfil_activo = st.session_state["perfil_activo_fijo"]
 # Se revisa en CADA acción, no solo al entrar — así, si un Administrador
 # desactiva esta cuenta mientras ya está trabajando, se cierra la sesión de
 # inmediato en vez de esperar a que la persona cierre sesión por su cuenta.
-if not cuenta_sigue_activa(usuario_activo):
+try:
+    _cuenta_activa = cuenta_sigue_activa(usuario_activo)
+except ERRORES_DE_CONEXION as e:
+    _pantalla_sin_conexion(e, "cuenta_sigue_activa")
+if not _cuenta_activa:
     st.error("🚫 Tu cuenta fue desactivada. Contacta a un Administrador si crees que es un error.")
     for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password",
               "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo"):
@@ -2805,7 +2841,7 @@ def pagina_despacho():
                 st.error("❌ No hay token de SimpliRoute configurado (revisa el Vault de Supabase) — no se puede importar. Usa creación manual.")
 
             if _token_sr_import:
-                _fecha_import = st.date_input("Fecha de las rutas", value=datetime.now().date(), key="fecha_import_sr")
+                _fecha_import = st.date_input("Fecha de las rutas", value=ahora().date(), key="fecha_import_sr")
                 if st.button(":material/refresh: Consultar Rutas", key="btn_consultar_rutas_sr"):
                     ok_imp, rutas_o_error = sr_int.importar_rutas_sr(str(_fecha_import), token=_token_sr_import)
                     st.session_state["rutas_sr_encontradas"] = rutas_o_error if ok_imp else []
@@ -3972,7 +4008,7 @@ def _tipos_sin_mapear_de_hoy(token_cache_key):
     todavía no están en cat_mapeo_cliente_sr — cacheado 15 min porque la
     consulta completa del día puede tardar hasta 45s, y no tiene sentido
     repetirla cada vez que alguien abre Catálogos."""
-    ok, rutas = sr_int.importar_rutas_sr(str(datetime.now().date()), token=token_cache_key)
+    ok, rutas = sr_int.importar_rutas_sr(str(ahora().date()), token=token_cache_key)
     if not ok:
         return None
     sr_int.registrar_visit_types_vistos(get_conn, {t for r in rutas for t in r["visit_types"]})
@@ -4080,8 +4116,8 @@ def pagina_catalogos():
                                         fallidas.append(placa_fila)
                                 if fallidas:
                                     texto += f"\n\n⚠️ {len(fallidas)} camión(es) quedaron pendientes de sincronizar con SimpliRoute."
-                            except Exception:
-                                pass
+                            except Exception as e_sr:
+                                _error_tecnico(e_sr, "sincronizar_camion_sr")
                         st.session_state["flash_catalogos"] = ("success", texto)
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
@@ -4239,8 +4275,8 @@ def pagina_catalogos():
                                         f"✅ Camión guardado, pero no se pudo sincronizar con SimpliRoute todavía "
                                         f"(quedó en la lista de pendientes): {msg_sr}"
                                     )
-                            except Exception:
-                                pass
+                            except Exception as e_sr:
+                                _error_tecnico(e_sr, "sincronizar_camion_sr")
                         st.session_state.catalogos = cargar_catalogos_desde_db()
                         st.rerun()
                     else:
@@ -4700,17 +4736,48 @@ def pagina_dashboards():
 # pestañas — esto es justo lo que evita la clase de bug que ya nos mordió
 # una vez con un st.stop() en una pestaña tumbando las que venían después).
 # ==========================================
-try:
-    _token_sr_autosync = sr_int.obtener_token_sr_desde_vault(get_conn)
-    if _token_sr_autosync and sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
-        sr_int.sincronizar_pilotos_desde_sr(get_conn, token=_token_sr_autosync)
-except Exception:
-    pass  # sin token, o SR no responde — nunca debe tumbar el arranque de la app
-try:
-    if _token_sr_autosync and sr_int.debe_sincronizar_camiones(get_conn, horas=12):
-        sr_int.sincronizar_camiones_desde_sr(get_conn, token=_token_sr_autosync)
-except Exception:
-    pass
+@st.cache_resource
+def _estado_autosync_sr():
+    """Memoria compartida por todo el servidor (no por usuario): cuándo se puede volver a revisar."""
+    return {"proximo_intento": 0.0}
+
+
+ESPERA_AUTOSYNC_SR_SEGUNDOS = 120
+
+
+def _autosync_sr_si_toca():
+    """Refresca los catálogos de Pilotos y Camiones desde SimpliRoute cada 12 horas.
+    Esto NO es la importación de Rutas (esa la dispara el botón del digitador y no depende de esto).
+
+    Antes se revisaba en CADA clic de CADA usuario (3 conexiones a la base por clic) y, si SR
+    estaba caído, cada clic volvía a esperar la respuesta de SR. Ahora la revisión corre como
+    máximo una vez cada 2 minutos por servidor, haya salido bien o mal: si SR falla, a lo sumo
+    una persona cada 2 minutos espera, y se reintenta solo en cuanto SR vuelva. Además queda
+    siempre el botón manual en Catálogos → Integración SimpliRoute."""
+    estado = _estado_autosync_sr()
+    if time.time() < estado["proximo_intento"]:
+        return
+    # Se reserva el turno ANTES de empezar, para que dos usuarios a la vez no lo hagan doble.
+    estado["proximo_intento"] = time.time() + ESPERA_AUTOSYNC_SR_SEGUNDOS
+    token = None
+    try:
+        token = sr_int.obtener_token_sr_desde_vault(get_conn)
+        if token and sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
+            ok, msg = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token)
+            if not ok:
+                print(f"[SR autosync pilotos] {msg}")
+    except Exception as e:
+        _error_tecnico(e, "autosync_pilotos_sr")  # nunca debe tumbar el arranque de la app
+    try:
+        if token and sr_int.debe_sincronizar_camiones(get_conn, horas=12):
+            ok, msg = sr_int.sincronizar_camiones_desde_sr(get_conn, token=token)
+            if not ok:
+                print(f"[SR autosync camiones] {msg}")
+    except Exception as e:
+        _error_tecnico(e, "autosync_camiones_sr")
+
+
+_autosync_sr_si_toca()
 
 if st.session_state.get("_modo_base_vacia"):
     st.info("🚀 **Base nueva:** todavía no hay clientes. Empieza cargando los catálogos en este orden: "
@@ -4740,7 +4807,10 @@ try:
 except Exception:
     pass
 
-pagina_actual.run()
+try:
+    pagina_actual.run()
+except ERRORES_DE_CONEXION as e:
+    _pantalla_sin_conexion(e, "pagina")
 
 # ==========================================
 # PIE DE PÁGINA DE LA HERRAMIENTA (visible en toda la app)
