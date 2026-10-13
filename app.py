@@ -3,6 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from psycopg2 import sql as psql
 import json
 import re
@@ -616,7 +617,7 @@ st.markdown("""
 #   password = "..."
 # ==========================================
 
-def get_conn():
+def _conexion_directa():
     cfg = st.secrets["postgres"]
     return psycopg2.connect(
         host=cfg["host"], port=cfg["port"], dbname=cfg["dbname"],
@@ -627,6 +628,98 @@ def get_conn():
         connect_timeout=10,
         keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
     )
+
+
+_KW_CONEXION = dict(connect_timeout=10, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+
+@st.cache_resource
+def _pool_conexiones():
+    """Grupo de conexiones compartido por todo el servidor: abrir una conexión nueva a Supabase en cada
+    consulta (7 o más por cada clic en Despacho) hacía lenta y torpe la pantalla. Mismos tiempos límite
+    que la conexión directa."""
+    cfg = st.secrets["postgres"]
+    return psycopg2.pool.ThreadedConnectionPool(
+        1, 10, host=cfg["host"], port=cfg["port"], dbname=cfg["dbname"], user=cfg["user"], password=cfg["password"],
+        **_KW_CONEXION)
+
+
+_ULTIMO_USO_CONEXION = {}
+
+
+class _ConexionDelPool:
+    """Se usa igual que una conexión normal (con closing(get_conn()) as conn: ...), pero close() la DEVUELVE al
+    grupo en vez de cerrarla. Al devolverla se descarta cualquier transacción pendiente."""
+    def __init__(self, pool, raw):
+        object.__setattr__(self, "_pool", pool)
+        object.__setattr__(self, "_raw", raw)
+        object.__setattr__(self, "_devuelta", False)
+
+    def __getattr__(self, nombre):
+        if nombre in ("_raw", "_pool", "_devuelta"):   # evita recursión si el objeto quedó a medio crear
+            raise AttributeError(nombre)
+        return getattr(self._raw, nombre)
+
+    def __setattr__(self, nombre, valor):
+        setattr(self._raw, nombre, valor)
+
+    def __enter__(self):
+        self._raw.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._raw.__exit__(*args)
+
+    def close(self):
+        if self._devuelta:
+            return
+        object.__setattr__(self, "_devuelta", True)
+        raw = self._raw
+        try:
+            if not raw.closed:
+                try:
+                    raw.rollback()               # primero se termina cualquier transacción (Postgres no deja cambiar ajustes dentro de una)
+                except Exception:
+                    pass
+                if raw.autocommit:
+                    raw.autocommit = False
+            _ULTIMO_USO_CONEXION[id(raw)] = time.time()
+        finally:
+            try:
+                self._pool.putconn(raw, close=bool(raw.closed))
+            except Exception:
+                pass
+
+    def __del__(self):
+        # Red de seguridad: si algún día se olvida cerrar una conexión, vuelve al grupo en vez de quedar atrapada.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def get_conn():
+    """Conexión a Supabase tomada del grupo. Si el grupo no está disponible o está lleno, abre una directa (como antes)."""
+    try:
+        pool = _pool_conexiones()
+        for _ in range(3):
+            raw = pool.getconn()
+            try:
+                if raw.closed:
+                    raise psycopg2.InterfaceError("conexión cerrada")
+                if time.time() - _ULTIMO_USO_CONEXION.get(id(raw), 0) > 45:   # tras un rato sin usarse, se comprueba que siga viva
+                    with raw.cursor() as c:
+                        c.execute("SELECT 1")
+                    raw.rollback()
+                return _ConexionDelPool(pool, raw)
+            except Exception:
+                try:
+                    pool.putconn(raw, close=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return _conexion_directa()
 
 
 # Errores de "no hay conexión con la base" (red caída, base reiniciando, tiempo agotado,
@@ -771,6 +864,9 @@ def init_db():
         # ubicación), no algo que se decida viaje a viaje — se configura aquí y
         # el Despacho solo la muestra, ya no se puede escoger ahí.
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS clasificacion TEXT DEFAULT 'Local'")
+        # Ruta y dirección: solo referencia (pueden quedar en blanco); no afectan ningún cálculo.
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS ruta TEXT")
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS direccion TEXT")
         # El diésel ya NO se calcula con un galonaje fijo por tienda: depende del
         # rendimiento (km por galón) de cada tipo de camión, así que un viaje en una
         # unidad de 5 Ton consume distinto que uno de 10 Ton a la misma distancia.
@@ -1306,7 +1402,7 @@ CATALOGOS_CONFIG = {
     "Camiones": {"tabla": "cat_camiones", "columnas": ["placa", "tipo", "transportista", "piloto", "auxiliar", "capacidad_cajas", "activo"],
                  "clave": ["placa"], "numericas": [], "booleanas": ["activo"],
                  "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares", "tipo": "tipos_camion"}},
-    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion"],
+    "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion", "ruta", "direccion"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"],
                            "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]},
                            "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
@@ -2043,11 +2139,13 @@ def generar_hoja_control_html(viaje, destinos):
     esta_liquidado = viaje["estado"] == "Liquidado"
 
     bloques_destino = ""
+    todos_despachos = []   # para el encabezado de la hoja
     for idx, d in enumerate(destinos, start=1):
         try:
             pedidos_lista = json.loads(d["pedidos"]) if d["pedidos"] else []
         except (json.JSONDecodeError, TypeError):
             pedidos_lista = []
+        todos_despachos += [str(p.get("pedido")) for p in pedidos_lista if p.get("pedido")]
         pedidos_txt = esc(", ".join(p["pedido"] for p in pedidos_lista)) if pedidos_lista else "—"
         badge_regreso = (
             f'<span class="badge-regreso">Marchamo Retorno: {esc(d["marchamo_regreso"])}</span>'
@@ -2211,6 +2309,7 @@ def generar_hoja_control_html(viaje, destinos):
         </div>
         <div class="datos-grid">
             <div class="dato"><label>No. de Viaje</label><span>{esc(viaje['id_viaje'])}</span></div>
+            <div class="dato"><label>No. de Despacho(s)</label><span>{esc(" - ".join(dict.fromkeys(todos_despachos))) or "—"}</span></div>
             <div class="dato"><label>Cliente</label><span>{esc(viaje['cliente'])}</span></div>
             <div class="dato"><label>CD Origen</label><span>{esc(viaje['cd_origen']) or '—'}</span></div>
             <div class="dato"><label>Transportista</label><span>{esc(viaje['transportista'])}</span></div>
@@ -2620,6 +2719,7 @@ def guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario):
                     "vehiculos_solicitados = EXCLUDED.vehiculos_solicitados, registrado_por = EXCLUDED.registrado_por, "
                     "actualizado = NOW()", (str(fecha), cliente, int(cantidad), usuario))
             conn.commit()
+        st.session_state.pop(f"_cache_posicionamiento_{cliente}_{fecha}", None)   # que el resumen se vea al instante
         registrar_auditoria(usuario, "Solicitud de vehículos", f"{cliente} · {fecha}: {int(cantidad)}")
         return True, f"Solicitud guardada: {cliente} pidió {int(cantidad)} vehículo(s) para el {fecha}."
     except Exception as e:
@@ -2627,7 +2727,18 @@ def guardar_solicitud_vehiculos(cliente, fecha, cantidad, usuario):
 
 
 def posicionamiento_del_dia(cliente, fecha):
-    """(solicitados o None, posicionados) del cliente ese día. Posicionados = viajes no anulados creados ese día."""
+    """(solicitados o None, posicionados) del cliente ese día. Posicionados = viajes no anulados creados ese día.
+    Se recuerda 15 segundos para no consultar la base en cada clic de Despacho."""
+    _clave_cache = f"_cache_posicionamiento_{cliente}_{fecha}"
+    _c = st.session_state.get(_clave_cache)
+    if _c and time.time() - _c[0] < 15:
+        return _c[1]
+    resultado = _posicionamiento_desde_base(cliente, fecha)
+    st.session_state[_clave_cache] = (time.time(), resultado)
+    return resultado
+
+
+def _posicionamiento_desde_base(cliente, fecha):
     with closing(get_conn()) as conn, conn.cursor() as cur:
         cur.execute("SELECT vehiculos_solicitados FROM solicitudes_transporte WHERE fecha = %s AND cliente = %s",
                     (str(fecha), cliente))
@@ -2752,8 +2863,10 @@ def mostrar_reporte_supabase(fila):
         consulta = psql.SQL('SELECT * FROM {} WHERE "Fecha" BETWEEN %s AND %s AND "Cliente" = ANY(%s)').format(psql.Identifier(vista))
         try:
             with closing(get_conn()) as conn:
+                with conn.cursor() as _cur_sql:
+                    _texto_sql = consulta.as_string(_cur_sql)
                 st.session_state[f"df_rep_{clave}"] = pd.read_sql_query(
-                    consulta.as_string(conn), conn,
+                    _texto_sql, conn,
                     params=(str(fecha_ini), str(fecha_fin), list(permitidos) if cliente == "Todos" else [cliente]))
         except Exception as e:
             st.session_state.pop(f"df_rep_{clave}", None)
@@ -2919,7 +3032,7 @@ def pagina_despacho():
                                        "(un bulto trae varias unidades). No es el número de bultos que despachas — "
                                        "ese sigue viniendo de Infor. Se muestra solo como referencia.")
                             _df_destinos_sr = pd.DataFrame([
-                                {"Tienda": d["tienda"], "Unidades (SR, no bultos)": d["cajas"], "Pedidos/Transferencias": len(d["pedidos"])}
+                                {"Tienda": d["tienda"], "Cajas (SR)": d["cajas"], "Oleada = No. de Despacho": ", ".join(d.get("oleadas", {})) or "—", "Visitas": len(d["pedidos"])}
                                 for d in _ruta_sr["destinos"]
                             ])
                             st.dataframe(_df_destinos_sr, use_container_width=True, hide_index=True)
@@ -2952,7 +3065,13 @@ def pagina_despacho():
                                     st.session_state[f"resumen_sr_{_run_destino}_{_i_dest}"] = {
                                         "transferencias": len(_d["pedidos"]),
                                         "unidades": _d["cajas"],
+                                        "oleadas": list(_d.get("oleadas", {})),
+                                        "sin_oleada": _d.get("visitas_sin_oleada", 0),
                                     }
+                                    # La OLEADA que trae SR en las notes es el No. de Despacho: se carga sola, con sus
+                                    # cajas (de load_4). Si la tienda no trae oleada (otro visit_type), queda como antes.
+                                    st.session_state[f"pedidos_lista_{_run_destino}_{_i_dest}"] = [dict(x) for x in _d.get("despachos", [])]
+                                    st.session_state[f"pedido_subrun_{_run_destino}_{_i_dest}"] = 0
 
                                 # Camión y piloto de la Ruta de SR: la lógica vive en integracion_simpliroute.py
                                 # (resolver_ruta_para_formulario). El camión se prellena si es un camión real, ya
@@ -3144,27 +3263,24 @@ def pagina_despacho():
                                                               label_visibility="collapsed",
                                                               placeholder="📷 Escanea o digita el marchamo")
                             with cab4:
-                                if st.button(":material/arrow_upward:", key=f"subir_destino_{run}_{i}",
-                                             disabled=(i == 0), help="Subir en el orden de entrega"):
-                                    _intercambiar_destinos(i, i - 1)
-                                    st.rerun()
+                                st.button(":material/arrow_upward:", key=f"subir_destino_{run}_{i}",
+                                          disabled=(i == 0), help="Subir en el orden de entrega",
+                                          on_click=_intercambiar_destinos, args=(i, i - 1))
                             with cab5:
-                                if st.button(":material/arrow_downward:", key=f"bajar_destino_{run}_{i}",
-                                             disabled=(i == total_destinos - 1), help="Bajar en el orden de entrega"):
-                                    _intercambiar_destinos(i, i + 1)
-                                    st.rerun()
+                                st.button(":material/arrow_downward:", key=f"bajar_destino_{run}_{i}",
+                                          disabled=(i == total_destinos - 1), help="Bajar en el orden de entrega",
+                                          on_click=_intercambiar_destinos, args=(i, i + 1))
                             with cab6:
-                                if st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=(total_destinos <= 1),
-                                             help="Quitar este destino del viaje" if total_destinos > 1 else "Debe quedar al menos un destino"):
-                                    _eliminar_destino(i, total_destinos)
-                                    st.rerun()
+                                st.button(":material/delete:", key=f"del_destino_{run}_{i}", disabled=(total_destinos <= 1),
+                                          help="Quitar este destino del viaje" if total_destinos > 1 else "Debe quedar al menos un destino",
+                                          on_click=_eliminar_destino, args=(i, total_destinos))
 
-                            km_t = tiendas_cliente[tienda]["km"] if tienda else 0.0
+                            km_t = (tiendas_cliente[tienda]["km"] or 0.0) if tienda else 0.0
                             rendimiento_camion = st.session_state.catalogos["rendimiento"].get(cap_pred)
                             es_complemento = st.toggle("¿Es complemento? (resto de un pedido que no cupo antes)", key=f"comp_{run}_{i}")
                             gal_t = round(km_t / rendimiento_camion, 2) if (tienda and rendimiento_camion) else 0.0
                             if tienda:
-                                st.caption(f"Distancia: {km_t} KM"
+                                st.caption((f"Distancia: {km_t} KM" if km_t else "Distancia: sin km definido en el catálogo (se calcula como 0 KM)")
                                            + (" · Complemento: solo Roles y Tarimas." if es_complemento else ""))
 
                             with st.expander("Detalle de cajas, material y documentos", expanded=True):
@@ -3261,9 +3377,15 @@ def pagina_despacho():
                                 # base (por diseño, para no generar confusión con datos reales).
                                 _resumen_sr = st.session_state.get(f"resumen_sr_{run}_{i}")
                                 if _resumen_sr:
-                                    st.caption(f"📦 De SimpliRoute: {_resumen_sr['transferencias']} transferencia(s), "
-                                               f"{_resumen_sr['unidades']} unidades (no son bultos — solo referencia). "
-                                               f"Escribe el Despacho Manual y las cajas reales abajo.")
+                                    if _resumen_sr.get("oleadas"):
+                                        st.caption(f":material/sync: De SimpliRoute: oleada(s) {', '.join(_resumen_sr['oleadas'])} cargada(s) arriba "
+                                                   f"como No. de Despacho, con sus cajas ({_resumen_sr['transferencias']} visita(s)). Revísalas."
+                                                   + (f" ⚠️ {_resumen_sr['sin_oleada']} visita(s) sin oleada: agrega su Despacho a mano."
+                                                      if _resumen_sr.get("sin_oleada") else ""))
+                                    else:
+                                        st.caption(f":material/sync: De SimpliRoute: {_resumen_sr['transferencias']} transferencia(s), "
+                                                   f"{_resumen_sr['unidades']} unidades (solo referencia). "
+                                                   f"Escribe el Despacho Manual y las cajas reales abajo.")
 
                                 observaciones_txt = st.text_area(
                                     "Observaciones / Instrucciones para el Piloto", key=f"obs_{run}_{i}",
@@ -4064,6 +4186,14 @@ def pagina_catalogos():
                 df_actual_completo = df_actual_completo[df_actual_completo["cliente"].isin(mis_clientes)]
             df_actual = df_actual_completo[config["columnas"]]  # sin las de solo lectura, para el resto de la lógica
 
+            if catalogo_sel == "Clientes y Tiendas":
+                with closing(get_conn()) as _c_km, _c_km.cursor() as _cur_km:
+                    _cur_km.execute("SELECT cliente, tienda FROM cat_clientes_tiendas WHERE (km IS NULL OR km <= 0) "
+                                    "AND cliente = ANY(%s) ORDER BY cliente, tienda", (clientes_permitidos_para(usuario_activo, perfil_activo),))
+                    _sin_km = _cur_km.fetchall()
+                if _sin_km:
+                    st.info(f"ℹ️ {len(_sin_km)} tienda(s) sin km. En Despacho se calculan con 0 KM (distancia y diésel) hasta que lo completes: "
+                            + ", ".join(f"{t} ({c})" for c, t in _sin_km[:10]) + (" …" if len(_sin_km) > 10 else ""))
             st.markdown("#### :material/table_edit: Edición rápida en tabla")
             rcol1, rcol2 = st.columns([3, 1])
             with rcol1:

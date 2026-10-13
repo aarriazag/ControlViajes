@@ -777,6 +777,32 @@ def crear_ruta_sr(id_viaje, id_sr_vehiculo, id_sr_piloto, planned_date,
     return True, route_id
 
 
+_PATRON_OLEADA = re.compile(r"OLEADA\s*[=:]\s*0*(\d+)", re.IGNORECASE)
+
+
+def oleada_de_notes(notes):
+    """'OLEADA=0000023769' -> '23769' (sin los ceros de relleno). None si las notes no traen oleada."""
+    m = _PATRON_OLEADA.search(str(notes or ""))
+    return m.group(1) if m else None
+
+
+def _a_numero(x):
+    try:
+        n = float(x)
+        return n if n == n else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def cajas_de_visita(v):
+    """Cajas de una Visita de SR. Desde el cambio de TI van en `load_4`; las visitas que no lo traen
+    (otros visit_type, o anteriores al cambio) siguen usando `load_3`, como antes."""
+    n = _a_numero(v.get("load_4"))
+    if n <= 0:
+        n = _a_numero(v.get("load_3"))
+    return int(n) if n == int(n) else n
+
+
 def importar_rutas_sr(fecha, token=None):
     """Trae todas las Rutas de SR de una fecha, y por cada una agrupa sus
     Visitas por tienda (título), sumando `load_3` como cajas — el mismo
@@ -837,11 +863,18 @@ def importar_rutas_sr(fecha, token=None):
 
             tienda = v.get("title") or "(sin nombre)"
             if tienda not in por_tienda:
-                por_tienda[tienda] = {"tienda": tienda, "cajas": 0, "pedidos": [], "orden_sugerido": None}
-            cajas_visita = v.get("load_3") or 0
+                por_tienda[tienda] = {"tienda": tienda, "cajas": 0, "pedidos": [], "orden_sugerido": None,
+                                      "oleadas": {}, "visitas_sin_oleada": 0}
+            cajas_visita = cajas_de_visita(v)
+            oleada = oleada_de_notes(v.get("notes"))
             por_tienda[tienda]["cajas"] += cajas_visita
+            if oleada:    # la oleada ES el No. de Despacho: se suman las cajas de todas sus visitas
+                por_tienda[tienda]["oleadas"][oleada] = por_tienda[tienda]["oleadas"].get(oleada, 0) + cajas_visita
+            else:
+                por_tienda[tienda]["visitas_sin_oleada"] += 1
             por_tienda[tienda]["pedidos"].append({
                 "pedido": v.get("reference"),
+                "oleada": oleada,
                 "cajas": cajas_visita,
                 "visit_id": v.get("id"),
                 "origen": "SR",
@@ -856,6 +889,9 @@ def importar_rutas_sr(fecha, token=None):
                 if actual is None or orden_visita < actual:
                     por_tienda[tienda]["orden_sugerido"] = orden_visita
 
+        for d_ in por_tienda.values():
+            d_["despachos"] = [{"pedido": o, "cajas": c, "origen": "SR"} for o, c in d_["oleadas"].items()]
+
         destinos_ordenados = sorted(
             por_tienda.values(),
             key=lambda d: d["orden_sugerido"] if d["orden_sugerido"] is not None else float("inf")
@@ -869,6 +905,7 @@ def importar_rutas_sr(fecha, token=None):
             "driver_nombre_sr": nombres_sr.get(ruta.get("driver")),
             "total_visitas": len(visitas_de_ruta),
             "visit_types": visit_types,
+            "oleadas": sorted({o for d_ in por_tienda.values() for o in d_["oleadas"]}),
             "destinos": destinos_ordenados,
         })
 
@@ -995,7 +1032,8 @@ FORMATO_CATALOGOS = {
                                ("piloto", "persona", ("cat_pilotos", "nombre")),
                                ("auxiliar", "persona", ("cat_auxiliares", "nombre"))],
     "cat_clientes_tiendas":   [("cliente", "entidad", ("cat_clientes", "nombre")),
-                               ("tienda", "entidad", ("cat_clientes_tiendas", "tienda", "cliente"))],
+                               ("tienda", "entidad", ("cat_clientes_tiendas", "tienda", "cliente")),
+                               ("ruta", "referencia", None), ("direccion", "referencia", None)],
     "cat_cds_por_cliente":    [("cliente", "entidad", ("cat_clientes", "nombre")),
                                ("cd", "entidad", ("cat_cds_por_cliente", "cd", "cliente"))],
     "cat_motivos_sin_pedido": [("nombre", "entidad", ("cat_motivos_sin_pedido", "nombre"))],
@@ -1023,6 +1061,15 @@ def _mapa_existentes(cur, fuente):
 
 
 def _formatear_un_valor(valor, modo, mapa, alcance=None, siglas=None):
+    if modo == "referencia":
+        # Dato de referencia opcional (ruta, dirección): se guarda tal cual, sin cambiar mayúsculas. Vacío -> NULL,
+        # y un número de Excel como 1011.0 vuelve a ser "1011".
+        if valor is None or valor != valor:
+            return None
+        txt = str(valor).strip()
+        if re.fullmatch(r"-?\d+\.0+", txt):
+            txt = txt.split(".")[0]
+        return txt or None
     if valor is None or valor != valor:          # None o NaN
         return valor
     s = str(valor).strip()
