@@ -857,6 +857,7 @@ HOJA_PLANTILLA_DEFECTO = r'''<html>
                     {% if not d.es_complemento %}<div class="material-box"><b>{{ d.cajas }}</b><span>BULTOS</span></div>{% endif %}
                 </div>
                 <div class="sub-info sub-info-grande">No. de Despachos: <b>{{ d.despachos_texto }}</b></div>
+                {% if d.bolsas_seguridad %}<div class="sub-info sub-info-grande">Bolsas de seguridad: <b>{{ d.bolsas_seguridad }}</b></div>{% endif %}
                 {% if es_unisuper %}<div class="sub-info">Remisión: <b>{{ d.remitos or '—' }}</b> &nbsp;|&nbsp;Devolución: <b>{{ d.devolucion or '—' }}</b> &nbsp;|&nbsp;Créditos: <b>{{ d.creditos or '—' }}</b> &nbsp;|&nbsp;Cartas Solicitud Producto P&amp;G: <b>{{ d.pg_cajas or 0 }}</b></div>{% endif %}
                 {% if d.incidencias %}<div class="incidencia"><span class="etiqueta">OBSERVACIONES</span><div class="incidencia-texto">{{ d.incidencias }}</div></div>{% endif %}
                 <div class="sello-area">
@@ -990,6 +991,8 @@ def init_db():
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS devolucion TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS creditos TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS pg_cajas INTEGER")
+        # Bolsas de seguridad (UniSuper LTX): números de serie separados por coma, máx. 6 por tienda
+        cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS bolsas_seguridad TEXT")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS es_complemento BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE destinos ADD COLUMN IF NOT EXISTS tipo_pago TEXT")
 
@@ -1912,6 +1915,27 @@ def marchamo_ya_usado(marchamo, cur):
     return cur.fetchone() is not None
 
 
+BOLSAS_MAX_POR_TIENDA = 6
+
+
+def bolsas_desde_texto(texto):
+    """'ab12, AB13 ; ab14' -> ['AB12', 'AB13', 'AB14']. Sin espacios, en mayúscula y sin vacíos.
+    NO quita repetidos a propósito: un repetido se debe detectar y avisar, no esconder."""
+    return [re.sub(r"\s+", "", x).upper() for x in re.split(r"[,;\n]+", texto or "") if x.strip()]
+
+
+def bolsas_ya_usadas(series, cur, excluir_ids=None):
+    """Números de serie de bolsas de seguridad que ya están en OTRO destino (el sello físico no se repite)."""
+    usadas = []
+    for serie in series:
+        cur.execute(
+            "SELECT 1 FROM destinos WHERE %s = ANY(string_to_array(replace(COALESCE(bolsas_seguridad, ''), ' ', ''), ',')) "
+            "AND id != ALL(%s) LIMIT 1", (serie, list(excluir_ids or [0])))
+        if cur.fetchone():
+            usadas.append(serie)
+    return usadas
+
+
 def peek_siguiente_correlativo(cliente):
     """Solo para mostrar una vista previa en pantalla; NO reserva el número."""
     with closing(get_conn()) as conn, conn.cursor() as cur:
@@ -1966,6 +1990,12 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                     conn.rollback()
                     return False, f"El marchamo de regreso '{marchamo_regreso_viaje}' ya fue usado en otro viaje."
 
+                _series_bolsas = [x for dest in destinos_viaje for x in bolsas_desde_texto(dest.get("bolsas_seguridad"))]
+                _bolsas_repetidas = bolsas_ya_usadas(_series_bolsas, cur)
+                if _bolsas_repetidas:
+                    conn.rollback()
+                    return False, "Estos números de serie de bolsas de seguridad ya se usaron en otro viaje: " + ", ".join(_bolsas_repetidas) + "."
+
                 id_viaje_str = siguiente_correlativo(cliente, cur)
                 fecha_hoy = ahora().strftime("%Y-%m-%d")
                 hora_hoy = ahora().strftime("%H:%M:%S")
@@ -1983,15 +2013,16 @@ def guardar_viaje(cliente, placa, transportista, piloto, auxiliar, usuario, dest
                     cur.execute(
                         "INSERT INTO destinos (viaje_id, orden, tienda, km, galones_base, pedidos, "
                         "marchamo_ida, marchamo_regreso, roles, tarimas, cajas, remitos, incidencias, "
-                        "devolucion, creditos, pg_cajas, es_complemento, tipo_pago, peso) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "devolucion, creditos, pg_cajas, es_complemento, tipo_pago, peso, bolsas_seguridad) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (viaje_id, i + 1, dest["tienda"], dest["km"], dest["galones_base"], dest["pedidos"],
                          dest["marchamo_ida"], dest["marchamo_regreso"] or None,
                          dest["roles"], dest["tarimas"], dest["cajas"],
                          dest.get("remitos", ""), dest.get("incidencias", ""),
                          dest.get("devolucion", ""), dest.get("creditos", ""),
                          dest.get("pg_cajas", 0), dest.get("es_complemento", False),
-                         dest.get("tipo_pago", "Local"), dest.get("peso"))
+                         dest.get("tipo_pago", "Local"), dest.get("peso"),
+                         dest.get("bolsas_seguridad") or None)
                     )
             conn.commit()
             orden_tiendas = " → ".join(f"{i+1}) {d['tienda']}" for i, d in enumerate(destinos_viaje))
@@ -2295,6 +2326,21 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                     if cur.fetchone():
                         conn.rollback()
                         return False, f"El marchamo '{d['marchamo_ida']}' ya está en uso en otro destino."
+                # Bolsas de seguridad: máximo por tienda, sin repetidos en el viaje ni en otros viajes
+                _todas_bolsas = []
+                for d in destinos_actualizados:
+                    _b = bolsas_desde_texto(d.get("bolsas_seguridad"))
+                    if len(_b) > BOLSAS_MAX_POR_TIENDA:
+                        conn.rollback()
+                        return False, f"Máximo {BOLSAS_MAX_POR_TIENDA} bolsas de seguridad por tienda ({d['tienda']})."
+                    _todas_bolsas += _b
+                if len(_todas_bolsas) != len(set(_todas_bolsas)):
+                    conn.rollback()
+                    return False, "Hay números de serie de bolsas de seguridad repetidos dentro de este viaje."
+                _ya = bolsas_ya_usadas(_todas_bolsas, cur, [d["id"] for d in destinos_actualizados])
+                if _ya:
+                    conn.rollback()
+                    return False, "Estos números de serie de bolsas de seguridad ya se usaron en otro viaje: " + ", ".join(_ya) + "."
 
                 # Lo mismo para el Marchamo de Regreso: no debe chocar con el de
                 # otro viaje (excluyendo los destinos de este mismo viaje).
@@ -2322,10 +2368,11 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                     cur.execute(
                         "UPDATE destinos SET tienda=%s, roles=%s, tarimas=%s, cajas=%s, marchamo_ida=%s, "
                         "marchamo_regreso=%s, remitos=%s, devolucion=%s, creditos=%s, pg_cajas=%s, "
-                        "incidencias=%s, es_complemento=%s, tipo_pago=%s WHERE id=%s",
+                        "incidencias=%s, es_complemento=%s, tipo_pago=%s, bolsas_seguridad=%s WHERE id=%s",
                         (d["tienda"], d["roles"], d["tarimas"], d["cajas"], d["marchamo_ida"],
                          marchamo_regreso_d, d["remitos"], d["devolucion"], d["creditos"],
-                         d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"], d["id"])
+                         d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"],
+                         d.get("bolsas_seguridad") or None, d["id"])
                     )
                     if "pedidos" in d:    # No. de Despacho(s) corregidos desde Gestión de Viajes
                         cur.execute("UPDATE destinos SET pedidos=%s WHERE id=%s", (d["pedidos"], d["id"]))
@@ -3285,6 +3332,7 @@ def pagina_despacho():
         marchamo_regreso_actual = st.session_state.get(f"mreg_final_{run}", "")
         tiendas_cliente = st.session_state.catalogos["clientes"].get(cliente_activo, {})
         es_cliente_unisuper = cliente_activo.startswith("UniSuper")
+        es_cliente_ltx = "LTX" in cliente_activo.upper()   # UniSuper LTX: lleva bolsas de seguridad con No. de serie
 
         if not tiendas_cliente:
             st.warning(f"⚠️ El cliente **{cliente_activo}** todavía no tiene ninguna tienda cargada en el "
@@ -3559,6 +3607,15 @@ def pagina_despacho():
                                     devolucion_txt = ""
                                     creditos_txt = ""
 
+                                if es_cliente_ltx:
+                                    bolsas_txt = st.text_input(
+                                        "Bolsas de seguridad (No. de serie)", key=f"bolsas_{run}_{i}", max_chars=120,
+                                        placeholder="Máximo 6, separados por coma",
+                                        help="Números de serie de las bolsas que lleva esta tienda (máximo 6). Se imprimen en la Hoja de Control. "
+                                             "Un número de serie no se puede repetir.")
+                                else:
+                                    bolsas_txt = ""
+
                                 # Si esta tienda vino de "Usar esta ruta" (importación de SR), se
                                 # muestra un resumen de solo referencia — nunca se guarda en la
                                 # base (por diseño, para no generar confusión con datos reales).
@@ -3599,6 +3656,7 @@ def pagina_despacho():
                                     "devolucion": devolucion_txt.strip(),
                                     "creditos": creditos_txt.strip(),
                                     "pg_cajas": pg_cajas,
+                                    "bolsas_seguridad": ", ".join(bolsas_desde_texto(bolsas_txt)),
                                     "es_complemento": es_complemento,
                                     "tipo_pago": tipo_pago,
                                     "peso": peso_kg
@@ -3656,6 +3714,8 @@ def pagina_despacho():
                             st.markdown(f"**{idx}. {d['tienda'] or '—'}**")
                             st.caption(f"Marchamo Ida: {d['marchamo_ida'] or '—'}")
                             st.caption(f"Tarimas: {d['tarimas']} · Roles: {d['roles']} · Bultos: {d['cajas']}")
+                            if d.get("bolsas_seguridad"):
+                                st.caption(f"Bolsas de seguridad: {d['bolsas_seguridad']}")
                             if idx == len(destinos_viaje) and marchamo_regreso_actual:
                                 st.markdown(f":material/lock: **Marchamo Regreso:** {marchamo_regreso_actual}")
                             st.markdown("---")
@@ -3668,6 +3728,11 @@ def pagina_despacho():
                 marchamo_regreso_choca_en_form = marchamo_regreso_viaje.strip() and any(
                     d["marchamo_ida"] == marchamo_regreso_viaje.strip() for d in destinos_viaje
                 )
+
+                _bolsas_por_tienda = [(d["tienda"], bolsas_desde_texto(d.get("bolsas_seguridad"))) for d in destinos_viaje]
+                bolsas_exceso = [t for t, b in _bolsas_por_tienda if len(b) > BOLSAS_MAX_POR_TIENDA]
+                _bolsas_todas = [x for _, b in _bolsas_por_tienda for x in b]
+                bolsas_repetidas_en_form = len(_bolsas_todas) != len(set(_bolsas_todas))
 
                 if not placa or len(destinos_viaje) == 0:
                     st.error("❌ Error: Debe seleccionar el camión y al menos un destino.")
@@ -3687,6 +3752,10 @@ def pagina_despacho():
                     st.error("❌ Error: El Marchamo de Regreso es obligatorio para cerrar el circuito.")
                 elif marchamo_regreso_choca_en_form:
                     st.error("❌ Error: El Marchamo de Regreso no puede ser igual a un Marchamo de Ida de este mismo viaje.")
+                elif bolsas_exceso:
+                    st.error(f"❌ Error: Máximo {BOLSAS_MAX_POR_TIENDA} bolsas de seguridad por tienda. Revisa: " + ", ".join(bolsas_exceso))
+                elif bolsas_repetidas_en_form:
+                    st.error("❌ Error: Hay números de serie de bolsas de seguridad repetidos dentro de este viaje.")
                 elif viaje_sin_pedido and not motivo_seleccionado:
                     st.error("❌ Error: Elige un Motivo para este viaje sin pedido antes de generarlo.")
                 elif despachos_sin_agregar:
@@ -4069,6 +4138,10 @@ def pagina_gestion_viajes():
                                 creditos_e = st.text_input("Créditos", value=d["creditos"] or "", max_chars=10, key=f"ecreditos_{d['id']}")
                             with dc4:
                                 pg_e = st.number_input("Cartas Sol. P&G", min_value=0, step=1, value=d["pg_cajas"] or 0, key=f"epg_{d['id']}")
+                            bolsas_e = d.get("bolsas_seguridad") or ""
+                            if "LTX" in str(viaje_g["cliente"]).upper():
+                                bolsas_e = st.text_input("Bolsas de seguridad (No. de serie, máximo 6, separados por coma)", value=bolsas_e,
+                                                         max_chars=120, key=f"ebolsas_{d['id']}")
                             obs_e = st.text_area("Observaciones", value=d["incidencias"] or "", key=f"eobs_{d['id']}")
                             es_comp_e = st.checkbox("¿Es complemento?", value=d["es_complemento"], key=f"ecomp_{d['id']}")
                             # Ya no se elige — se deriva de la tienda seleccionada arriba,
@@ -4087,6 +4160,7 @@ def pagina_gestion_viajes():
                                 "marchamo_ida": mida_e.strip(),
                                 "remitos": remitos_e.strip(), "devolucion": devolucion_e.strip(),
                                 "creditos": creditos_e.strip(), "pg_cajas": pg_e,
+                                "bolsas_seguridad": ", ".join(bolsas_desde_texto(bolsas_e)),
                                 "incidencias": obs_e.strip(), "es_complemento": es_comp_e,
                                 "tipo_pago": tipo_pago_e
                             })
