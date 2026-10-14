@@ -738,6 +738,167 @@ def _pantalla_sin_conexion(e, contexto=""):
     st.stop()
 
 
+# ==========================================
+# HOJA DE CONTROL IMPRESA — vive como PLANTILLA en Supabase (tabla plantillas_impresion): se cambia desde
+# Catálogos → «Hoja impresa (plantilla)» sin tocar este archivo ni hacer deploy. Este texto es la hoja
+# ORIGINAL: siembra la versión 1 y es el respaldo si una plantilla falla.
+# ==========================================
+HOJA_NOMBRE = "hoja_control"
+HOJA_CATALOGO = "Hoja impresa (plantilla)"
+HOJA_PLANTILLA_DEFECTO = r'''<html>
+<head>
+<style>
+    @page { size: letter; margin: 10mm; }
+    body { font-family: Arial, sans-serif; color: #1a1a1a; padding: 14px; font-size: 13px; }
+    .hoja { max-width: 800px; margin: auto; }
+    .header { display: flex; justify-content: space-between; align-items: flex-start;
+               border-bottom: 3px solid #0B4A32; padding-bottom: 6px; margin-bottom: 8px; }
+    .logo { font-size: 22px; font-weight: bold; color: #0B4A32; }
+    .titulo { text-align: right; }
+    .titulo h2 { margin: 0; color: #0B4A32; font-size: 16px; }
+    .titulo p { margin: 0; color: #666; font-size: 10px; }
+    .datos-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px 16px; margin-bottom: 8px; }
+    .dato label { display: block; font-size: 9px; color: #666; text-transform: uppercase; }
+    .dato span { font-size: 12px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }
+    .dato-blanco span { border-bottom: 1px dashed #999; min-height: 14px; }
+    .titulo-destinos { background: #0B4A32; color: white; padding: 3px 10px; font-weight: bold;
+                         border-radius: 4px; margin-bottom: 6px; font-size: 12px; }
+    .destino-card { border: 1px solid #ccc; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }
+    .destino-header { background: #eef6ef; padding: 4px 10px; font-weight: bold; font-size: 12px;
+                        display: flex; align-items: center; justify-content: space-between;
+                        flex-wrap: wrap; gap: 6px; }
+    .destino-header-izq { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+    .destino-num { background: #0B4A32; color: white; border-radius: 50%; padding: 1px 7px; font-size: 11px; }
+    .marchamo-inline { font-size: 13px; font-weight: bold; color: #0B4A32;
+                         background: #fff; border: 1px solid #0B4A32; border-radius: 4px; padding: 3px 12px; }
+    .badge-regreso { background: #B5622E; color: white; padding: 3px 12px;
+                       border-radius: 4px; font-size: 13px; font-weight: bold; white-space: nowrap; }
+    .badge-complemento { background: #7A3E1D; color: white; padding: 1px 8px;
+                           border-radius: 4px; font-size: 10px; }
+    .destino-body { display: flex; }
+    .material-enviado, .material-devuelto { flex: 1; padding: 5px 8px; }
+    .material-devuelto { border-left: 2px dashed #ccc; }
+    .etiqueta { font-size: 9px; color: #0B4A32; font-weight: bold; margin-bottom: 3px; }
+    .material-grid { display: flex; gap: 5px; }
+    .material-box { flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 3px 2px; }
+    .material-box b { display: block; font-size: 13px; color: #0B4A32; }
+    .material-box.vacio { min-height: 22px; }
+    .material-box span { font-size: 8px; color: #666; }
+    .sub-info { font-size: 10px; margin-top: 3px; }
+    .sub-info-grande { font-size: 13px; margin-top: 5px; font-weight: 600; }
+    .grid-encabezados { display: flex; gap: 5px; margin-top: 4px; }
+    .grid-encabezados span { flex: 1; text-align: center; font-size: 8px; color: #666; text-transform: uppercase; }
+    .sello-area { margin-top: 10px; }
+    .sello-espacio { min-height: 46px; }
+    .incidencia { margin-top: 8px; padding: 8px 10px; background: #FFF4EC; border: 1.5px solid #D9824F; border-radius: 6px; }
+    .incidencia .etiqueta { color: #D9824F; }
+    .incidencia-texto { font-size: 13px; color: #7A3E1D; margin-top: 3px; font-weight: 600; }
+    .footer { display: flex; justify-content: space-between; font-size: 9px; color: #999; margin-top: 10px; }
+    .btn-imprimir { background: #0B4A32; color: white; border: none; padding: 10px 20px;
+                      border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }
+    @media print {
+        body { padding: 0; font-size: 11px; }
+        .btn-imprimir { display: none; }
+        .logo, .titulo h2, .dato span, .etiqueta, .destino-num, .material-box b { color: #000 !important; }
+        .titulo-destinos, .destino-header, .destino-num { background: #fff !important; border: 1px solid #000; color: #000 !important; }
+        .marchamo-inline { border: 1px solid #000; color: #000 !important; background: #fff !important; }
+        .badge-regreso { background: #fff !important; color: #000 !important; border: 1px solid #000; }
+        .badge-complemento { background: #fff !important; color: #000 !important; border: 1px solid #000; }
+        .material-box { border: 1px solid #000; }
+        .destino-card { break-inside: avoid; }
+    }
+</style>
+</head>
+<body>
+<div class="hoja">
+    <button class="btn-imprimir" onclick="window.print()">🖨️ Imprimir</button>
+    <div class="header">
+        <div class="logo">RANSA</div>
+        <div class="titulo">
+            <h2>HOJA DE SALIDA</h2>
+            <p>Control de Ruta · Documento de Despacho</p>
+            {% if viaje.motivo_sin_pedido %}<p style="margin-top:2px;"><span style="background:#D9824F;color:#fff;padding:2px 10px;border-radius:6px;font-weight:600;font-size:13px;">SIN PEDIDO — {{ viaje.motivo_sin_pedido }}</span></p>{% endif %}
+            <p style="margin-top:4px;">Generado: <b>{{ viaje.fecha_creacion }} {{ viaje.hora_creacion }}</b>
+               por <b>{{ viaje.usuario_creador }}</b></p>
+            {% if liquidado %}<p style="margin-top:2px; color:#0B4A32;">✅ Liquidado por <b>{{ viaje.usuario_liquido }}</b> el <b>{{ viaje.fecha_liquidacion }} {{ viaje.hora_liquidacion }}</b></p>{% endif %}
+        </div>
+    </div>
+    <div class="datos-grid">
+        <div class="dato"><label>No. de Viaje</label><span>{{ viaje.id_viaje }}</span></div>
+        <div class="dato"><label>No. de Despacho(s)</label><span>{{ despachos_encabezado }}</span></div>
+        <div class="dato"><label>Cliente</label><span>{{ viaje.cliente }}</span></div>
+        <div class="dato"><label>CD Origen</label><span>{{ viaje.cd_origen or '—' }}</span></div>
+        <div class="dato"><label>Transportista</label><span>{{ viaje.transportista }}</span></div>
+        <div class="dato"><label>Camión</label><span>{{ viaje.placa }}{% if viaje.tipo_camion %} · {{ viaje.tipo_camion }}{% endif %}</span></div>
+        <div class="dato"><label>Furgón</label><span>{{ viaje.placa_furgon if viaje.placa_furgon else 'No Furgón' }}</span></div>
+        <div class="dato"><label>Fecha</label><span>{{ viaje.fecha_creacion }}</span></div>
+        <div class="dato dato-blanco"><label>Horario (Garita — hora real de salida)</label><span>&nbsp;</span></div>
+        <div class="dato"><label>Piloto</label><span>{{ viaje.piloto }}</span></div>
+        <div class="dato"><label>Auxiliar</label><span>{{ viaje.auxiliar }}</span></div>
+        <div class="dato"><label>Marchamo de Ida</label><span>{{ marchamo_ida_general }}</span></div>
+    </div>
+    <div class="titulo-destinos">DESTINOS DEL VIAJE ({{ destinos|length }})</div>
+    {% for d in destinos %}
+    <div class="destino-card">
+        <div class="destino-header">
+            <div class="destino-header-izq">
+                <span class="destino-num">{{ d.numero }}</span> {{ d.tienda }}
+                <span class="marchamo-inline">Marchamo: {{ d.marchamo_ida }}</span>
+                {% if d.es_complemento %}<span class="badge-complemento">COMPLEMENTO</span>{% endif %}
+            </div>
+            {% if d.marchamo_regreso %}<span class="badge-regreso">Marchamo Retorno: {{ d.marchamo_regreso }}</span>{% endif %}
+        </div>
+        <div class="destino-body">
+            <div class="material-enviado">
+                <div class="etiqueta">MATERIAL ENVIADO</div>
+                <div class="material-grid">
+                    <div class="material-box"><b>{{ d.roles }}</b><span>ROLES</span></div>
+                    <div class="material-box"><b>{{ d.tarimas }}</b><span>TARIMAS</span></div>
+                    {% if not d.es_complemento %}<div class="material-box"><b>{{ d.cajas }}</b><span>BULTOS</span></div>{% endif %}
+                </div>
+                <div class="sub-info sub-info-grande">No. de Despachos: <b>{{ d.despachos_texto }}</b></div>
+                {% if es_unisuper %}<div class="sub-info">Remisión: <b>{{ d.remitos or '—' }}</b> &nbsp;|&nbsp;Devolución: <b>{{ d.devolucion or '—' }}</b> &nbsp;|&nbsp;Créditos: <b>{{ d.creditos or '—' }}</b> &nbsp;|&nbsp;Cartas Solicitud Producto P&amp;G: <b>{{ d.pg_cajas or 0 }}</b></div>{% endif %}
+                {% if d.incidencias %}<div class="incidencia"><span class="etiqueta">OBSERVACIONES</span><div class="incidencia-texto">{{ d.incidencias }}</div></div>{% endif %}
+                <div class="sello-area">
+                    <span class="etiqueta">SELLO DE TIENDA</span>
+                    <div class="sello-espacio"></div>
+                </div>
+            </div>
+            <div class="material-devuelto">
+                <div class="etiqueta">{{ 'DEVUELTO POR LA TIENDA (LIQUIDADO)' if liquidado else 'DEVUELTO POR LA TIENDA (LLENAR A MANO)' }}</div>
+                <div class="grid-encabezados"><span>ROLES</span><span>TARIMAS</span><span>PACAS DE CARTÓN</span></div>
+                <div class="material-grid">
+                    {% if liquidado %}
+                    <div class="material-box"><b>{{ d.roles_devueltos or 0 }}</b></div>
+                    <div class="material-box"><b>{{ d.tarimas_devueltas or 0 }}</b></div>
+                    <div class="material-box"><b>{{ d.pacas_carton_devueltas or 0 }}</b></div>
+                    {% else %}
+                    <div class="material-box vacio"></div>
+                    <div class="material-box vacio"></div>
+                    <div class="material-box vacio"></div>
+                    {% endif %}
+                </div>
+                <div class="etiqueta" style="margin-top:10px;">CONTROL DE TIEMPOS (LLENAR A MANO)</div>
+                <div class="grid-encabezados"><span>LLEGADA</span><span>INICIO DESCARGA</span><span>SALIDA</span></div>
+                <div class="material-grid">
+                    <div class="material-box vacio"></div>
+                    <div class="material-box vacio"></div>
+                    <div class="material-box vacio"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+    <div class="footer">
+        <span>Hoja generada por el sistema Control de Ruta · Ransa · v{{ version_app }}</span>
+        <span>Sellar y entregar al finalizar el viaje para su liquidación.</span>
+    </div>
+</div>
+</body>
+</html>
+'''
+
+
 @st.cache_resource
 def init_db():
     """Crea las tablas si no existen todavía. Con @st.cache_resource, Streamlit
@@ -864,6 +1025,27 @@ def init_db():
         # ubicación), no algo que se decida viaje a viaje — se configura aquí y
         # el Despacho solo la muestra, ya no se puede escoger ahí.
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS clasificacion TEXT DEFAULT 'Local'")
+        # Plantillas de impresión (la Hoja de Control): una fila por versión, solo una activa.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plantillas_impresion (
+                nombre TEXT NOT NULL, version INTEGER NOT NULL, html TEXT NOT NULL,
+                activa BOOLEAN NOT NULL DEFAULT FALSE, nota TEXT, creado_por TEXT, creado TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (nombre, version))
+        """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_plantilla_activa ON plantillas_impresion (nombre) WHERE activa")
+        cur.execute("INSERT INTO plantillas_impresion (nombre, version, html, activa, nota, creado_por) "
+                    "SELECT %s, 1, %s, TRUE, 'Hoja original del sistema', 'sistema' "
+                    "WHERE NOT EXISTS (SELECT 1 FROM plantillas_impresion WHERE nombre = %s)",
+                    (HOJA_NOMBRE, HOJA_PLANTILLA_DEFECTO, HOJA_NOMBRE))
+        cur.execute("""
+            DO $$ DECLARE rol text; BEGIN
+              FOREACH rol IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = rol) THEN
+                  EXECUTE format('REVOKE ALL ON plantillas_impresion FROM %I', rol);
+                END IF;
+              END LOOP;
+            END $$
+        """)
         # Ruta y dirección: solo referencia (pueden quedar en blanco); no afectan ningún cálculo.
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS ruta TEXT")
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS direccion TEXT")
@@ -2057,6 +2239,42 @@ def anular_viaje(viaje_id, usuario, motivo, liberar_marchamos=True):
             return False, _error_tecnico(e, "anular_viaje")
 
 
+_PATRON_DESPACHO = re.compile(r"^[A-Za-z0-9._/-]{1,30}$")
+
+
+def despachos_desde_texto(txt):
+    """'779657, 779727' -> (['779657', '779727'], [códigos con caracteres no válidos]). Se separan por coma, punto y
+    coma o salto de línea; se quitan espacios y repetidos (máximo 20 por tienda)."""
+    codigos, malos = [], []
+    for c in re.split(r"[,;\n]+", str(txt or "")):
+        c = c.strip()
+        if not c:
+            continue
+        if not _PATRON_DESPACHO.match(c):
+            malos.append(c)
+        elif c not in codigos:
+            codigos.append(c)
+    return codigos[:20], malos
+
+
+def pedidos_json_editado(pedidos_existente, codigos, cajas_total):
+    """Detalle de despachos de un destino ya corregido. Los que ya estaban conservan sus cajas y su origen; un
+    despacho nuevo toma los bultos de la tienda si es el único, y 0 si hay varios (el total de la tienda es el
+    campo 'Bultos'). Si no cambió nada, devuelve el mismo texto que había."""
+    try:
+        existentes = json.loads(pedidos_existente) if pedidos_existente else []
+    except (json.JSONDecodeError, TypeError):
+        existentes = []
+    existentes = [p for p in existentes if isinstance(p, dict)]
+    if [str(p.get("pedido")) for p in existentes] == list(codigos):
+        return pedidos_existente
+    por_codigo = {str(p.get("pedido")): p for p in existentes}
+    nuevos = [por_codigo[c] if c in por_codigo else
+              {"pedido": c, "cajas": int(cajas_total) if len(codigos) == 1 else 0, "origen": "Manual (edición)"}
+              for c in codigos]
+    return json.dumps(nuevos)
+
+
 def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actualizados, marchamo_regreso_viaje, usuario_editor, placa_furgon=None):
     """Corrige los datos de un viaje ya guardado (solo permitido mientras esté
     'Pendiente de Liquidar'). destinos_actualizados es una lista de dicts con el
@@ -2109,228 +2327,194 @@ def editar_viaje(viaje_id, placa, transportista, piloto, auxiliar, destinos_actu
                          marchamo_regreso_d, d["remitos"], d["devolucion"], d["creditos"],
                          d["pg_cajas"], d["incidencias"], d["es_complemento"], d["tipo_pago"], d["id"])
                     )
+                    if "pedidos" in d:    # No. de Despacho(s) corregidos desde Gestión de Viajes
+                        cur.execute("UPDATE destinos SET pedidos=%s WHERE id=%s", (d["pedidos"], d["id"]))
             conn.commit()
             orden_tiendas_edit = " → ".join(f"{d['orden']}) {d['tienda']}" for d in sorted(destinos_actualizados, key=lambda x: x["orden"]))
-            registrar_auditoria(usuario_editor, "Editar viaje", f"Viaje ID {viaje_id} · Placa {placa} · Orden de paradas: {orden_tiendas_edit}")
+            _desp_aud = "; ".join(
+                f"{d['tienda']}: {', '.join(despachos_desde_texto(', '.join(str(p.get('pedido')) for p in json.loads(d['pedidos'] or '[]')))[0]) or '—'}"
+                for d in destinos_actualizados if "pedidos" in d)
+            registrar_auditoria(usuario_editor, "Editar viaje", f"Viaje ID {viaje_id} · Placa {placa} · Orden de paradas: {orden_tiendas_edit}"
+                                + (f" · No. de Despacho: {_desp_aud}" if _desp_aud else ""))
             return True, "OK"
         except Exception as e:
             conn.rollback()
             return False, _error_tecnico(e, "editar_viaje")
 
 
-def generar_hoja_control_html(viaje, destinos):
-    """Arma la Hoja de Control de Viaje como HTML: en pantalla se ve con los colores
-    de Ransa, pero al imprimir (@media print) los fondos de color se vuelven blancos
-    y solo quedan bordes negros, para que salga limpia en una impresora blanco y negro.
-    Si el viaje ya está Liquidado, los recuadros de devolución se llenan con los datos
-    reales de la liquidación en vez de salir en blanco.
+@st.cache_resource
+def _entorno_plantillas():
+    """Motor de plantillas restringido (sandbox): una plantilla no puede ejecutar código ni leer archivos, y todo
+    dato que se inserta con {{ ... }} se escapa solo (nadie puede meter HTML o scripts desde un campo de texto)."""
+    from jinja2.sandbox import SandboxedEnvironment
+    return SandboxedEnvironment(autoescape=True)
 
-    Todo texto que pudo haber sido digitado por una persona (marchamos, tienda,
-    observaciones, no. de despacho, documentos) se pasa por esc() antes de meterlo
-    en el HTML — si no, alguien podría escribir código en un campo de texto y que
-    se ejecute en la pantalla de quien reimprima esa hoja después (Administrador
-    incluido). esc() nunca cambia el dato que se guarda en la base, solo lo que
-    se muestra."""
-    def esc(valor):
-        return html_lib.escape(str(valor)) if valor is not None else ""
 
-    marchamo_ida_general = esc(destinos[0]["marchamo_ida"]) if destinos else ""
-    es_cliente_unisuper = viaje["cliente"].startswith("UniSuper")
-    esta_liquidado = viaje["estado"] == "Liquidado"
-
-    bloques_destino = ""
-    todos_despachos = []   # para el encabezado de la hoja
-    for idx, d in enumerate(destinos, start=1):
+def _contexto_hoja(viaje, destinos):
+    """Los datos que ve la plantilla: viaje (todas sus columnas), destinos (todas sus columnas + numero, despachos,
+    despachos_texto) y algunos resumenes. Los vacíos (None) llegan como texto vacío."""
+    def sin_none(dic):
+        return {k: ("" if v is None else v) for k, v in dict(dic).items()}
+    viaje = sin_none(viaje)
+    lista, todos = [], []
+    for n, d in enumerate(destinos, start=1):
+        d = sin_none(d)
         try:
-            pedidos_lista = json.loads(d["pedidos"]) if d["pedidos"] else []
+            peds = json.loads(d.get("pedidos")) if d.get("pedidos") else []
         except (json.JSONDecodeError, TypeError):
-            pedidos_lista = []
-        todos_despachos += [str(p.get("pedido")) for p in pedidos_lista if p.get("pedido")]
-        pedidos_txt = esc(", ".join(p["pedido"] for p in pedidos_lista)) if pedidos_lista else "—"
-        badge_regreso = (
-            f'<span class="badge-regreso">Marchamo Retorno: {esc(d["marchamo_regreso"])}</span>'
-            if d["marchamo_regreso"] else ""
-        )
-        badge_complemento = '<span class="badge-complemento">COMPLEMENTO</span>' if d["es_complemento"] else ""
-        incidencia_txt = esc(d["incidencias"]) if d["incidencias"] else ""
-        incidencia_html = f'<div class="incidencia"><span class="etiqueta">OBSERVACIONES</span><div class="incidencia-texto">{incidencia_txt}</div></div>' if incidencia_txt else ""
-        material_cajas = (
-            f'<div class="material-box"><b>{d["cajas"]}</b><span>BULTOS</span></div>'
-            if not d["es_complemento"] else ""
-        )
-        documentos_html = (
-            f'<div class="sub-info">Remisión: <b>{esc(d["remitos"]) or "—"}</b> &nbsp;|&nbsp;'
-            f'Devolución: <b>{esc(d["devolucion"]) or "—"}</b> &nbsp;|&nbsp;'
-            f'Créditos: <b>{esc(d["creditos"]) or "—"}</b> &nbsp;|&nbsp;'
-            f'Cartas Solicitud Producto P&amp;G: <b>{d["pg_cajas"] or 0}</b></div>'
-            if es_cliente_unisuper else ""
-        )
+            peds = []
+        codigos = [str(p.get("pedido")) for p in peds if isinstance(p, dict) and p.get("pedido")]
+        todos += codigos
+        d.update(numero=n, despachos=codigos, despachos_texto=", ".join(codigos) if codigos else "—")
+        lista.append(d)
+    return {"viaje": viaje, "destinos": lista, "liquidado": viaje.get("estado") == "Liquidado",
+            "es_unisuper": str(viaje.get("cliente", "")).startswith("UniSuper"),
+            "despachos_encabezado": " - ".join(dict.fromkeys(todos)) or "—",
+            "marchamo_ida_general": lista[0].get("marchamo_ida", "") if lista else "",
+            "version_app": VERSION_APP}
 
-        if esta_liquidado:
-            devuelto_boxes = f"""
-                        <div class="material-box"><b>{d["roles_devueltos"] or 0}</b></div>
-                        <div class="material-box"><b>{d["tarimas_devueltas"] or 0}</b></div>
-                        <div class="material-box"><b>{d["pacas_carton_devueltas"] or 0}</b></div>"""
+
+def renderizar_plantilla_hoja(html_plantilla, viaje, destinos):
+    if len(html_plantilla) > 200_000:
+        raise ValueError("La plantilla es demasiado grande (máximo 200 mil caracteres).")
+    return _entorno_plantillas().from_string(html_plantilla).render(**_contexto_hoja(viaje, destinos))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def plantilla_hoja_activa():
+    """(versión, html) de la plantilla activa en Supabase; se recuerda 60 s. Si no se puede leer, la original."""
+    try:
+        with closing(get_conn()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT version, html FROM plantillas_impresion WHERE nombre = %s AND activa", (HOJA_NOMBRE,))
+            f = cur.fetchone()
+        if f:
+            return f[0], f[1]
+    except Exception:
+        pass
+    return 0, HOJA_PLANTILLA_DEFECTO
+
+
+def generar_hoja_control_html(viaje, destinos):
+    """Hoja de Control de Viaje en HTML, con la plantilla activa de Supabase. Si esa plantilla falla, se imprime con la
+    hoja original del sistema: la impresión nunca se queda sin salir por un error de plantilla."""
+    version, plantilla = plantilla_hoja_activa()
+    try:
+        return renderizar_plantilla_hoja(plantilla, viaje, destinos)
+    except Exception as e:
+        print(f"[HOJA] la plantilla v{version} falló ({type(e).__name__}): {e} — se usa la hoja original")
+        try:
+            return renderizar_plantilla_hoja(HOJA_PLANTILLA_DEFECTO, viaje, destinos)
+        except Exception as e2:
+            return f"<p>No se pudo generar la hoja de control: {html_lib.escape(str(e2))}</p>"
+
+
+def _viaje_muestra_hoja():
+    """Último viaje real (para la vista previa del editor) o, si no hay ninguno, uno de ejemplo."""
+    try:
+        with closing(get_conn()) as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM viajes ORDER BY id DESC LIMIT 1")
+            v = cur.fetchone()
+            if v:
+                cur.execute("SELECT * FROM destinos WHERE viaje_id = %s ORDER BY orden", (v["id"],))
+                return dict(v), [dict(d) for d in cur.fetchall()]
+    except Exception:
+        pass
+    v = {"id_viaje": "XX-0001", "cliente": "Cliente de ejemplo", "estado": "Pendiente de Liquidar", "cd_origen": "CD Ejemplo",
+         "transportista": "Transportista Ejemplo", "placa": "123ABC", "piloto": "Piloto Ejemplo", "auxiliar": "Sin Auxiliar",
+         "fecha_creacion": "2026-01-01", "hora_creacion": "08:00:00", "usuario_creador": "usuario"}
+    d = [{"tienda": f"Tienda {n}", "marchamo_ida": f"M-{n}", "marchamo_regreso": "R-1" if n == 2 else "", "roles": n, "tarimas": 0,
+          "cajas": 100 + n, "pedidos": json.dumps([{"pedido": f"1000{n}", "cajas": 100 + n}]), "es_complemento": False} for n in (1, 2)]
+    return v, d
+
+
+def hoja_versiones():
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT version, activa, COALESCE(nota, ''), COALESCE(creado_por, ''), creado FROM plantillas_impresion "
+                    "WHERE nombre = %s ORDER BY version DESC", (HOJA_NOMBRE,))
+        return cur.fetchall()
+
+
+def hoja_html_de_version(version):
+    with closing(get_conn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT html FROM plantillas_impresion WHERE nombre = %s AND version = %s", (HOJA_NOMBRE, version))
+        f = cur.fetchone()
+        return f[0] if f else None
+
+
+def hoja_guardar_version(html, nota, usuario):
+    """Guarda el texto como una versión nueva y la deja activa. Devuelve el número de versión."""
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM plantillas_impresion WHERE nombre = %s", (HOJA_NOMBRE,))
+            nueva = cur.fetchone()[0]
+            cur.execute("UPDATE plantillas_impresion SET activa = FALSE WHERE nombre = %s", (HOJA_NOMBRE,))
+            cur.execute("INSERT INTO plantillas_impresion (nombre, version, html, activa, nota, creado_por) VALUES (%s, %s, %s, TRUE, %s, %s)",
+                        (HOJA_NOMBRE, nueva, html, (nota or "").strip() or None, usuario))
+        conn.commit()
+    plantilla_hoja_activa.clear()
+    registrar_auditoria(usuario, "Hoja impresa", f"Nueva versión {nueva} activada" + (f" — {nota.strip()}" if (nota or "").strip() else ""))
+    return nueva
+
+
+def hoja_activar_version(version, usuario):
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE plantillas_impresion SET activa = FALSE WHERE nombre = %s", (HOJA_NOMBRE,))
+            cur.execute("UPDATE plantillas_impresion SET activa = TRUE WHERE nombre = %s AND version = %s", (HOJA_NOMBRE, version))
+            ok = cur.rowcount == 1
+        conn.commit() if ok else conn.rollback()
+    plantilla_hoja_activa.clear()
+    if ok:
+        registrar_auditoria(usuario, "Hoja impresa", f"Versión {version} activada")
+    return ok
+
+
+def render_editor_hoja_impresa():
+    """Pantalla (solo SuperAdministrador) para editar la plantilla de la Hoja de Control con vista previa e historial."""
+    st.subheader(":material/print: Plantilla de la Hoja de Control")
+    st.caption("Aquí se cambia cómo se imprime la hoja, sin deploy. Primero «Vista previa» (usa tu último viaje real) y solo si se ve bien, "
+               "«Guardar y activar». Cada guardado es una versión nueva y puedes volver a cualquiera. Si una plantilla falla, la app imprime "
+               "con la hoja original. Datos disponibles: `viaje.<columna>`, `destinos` (cada uno con `numero`, `tienda`, `despachos`, "
+               "`despachos_texto` y todas sus columnas), `liquidado`, `es_unisuper`, `despachos_encabezado`, `version_app`. "
+               "Los datos se escapan solos; el cambio llega a todos en máximo un minuto.")
+    plantilla_hoja_activa.clear()
+    version_activa, html_activa = plantilla_hoja_activa()
+    st.session_state.setdefault("hoja_editor_texto", html_activa)
+    with st.expander(f"Versiones guardadas (activa: {version_activa or 'original del sistema'})", expanded=False):
+        vers = hoja_versiones()
+        st.dataframe(pd.DataFrame(vers, columns=["Versión", "Activa", "Nota", "Guardada por", "Fecha"]), hide_index=True, use_container_width=True)
+        opciones = [v[0] for v in vers]
+        if opciones:
+            v_sel = st.selectbox("Versión", opciones, key="hoja_version_sel")
+            b1, b2 = st.columns(2)
+            if b1.button(":material/edit_note: Cargar esa versión en el editor", key="hoja_cargar_version", use_container_width=True):
+                st.session_state["hoja_editor_texto"] = hoja_html_de_version(v_sel) or ""
+                st.rerun()
+            if b2.button(":material/restore: Activar esa versión", key="hoja_activar_version", use_container_width=True):
+                if hoja_activar_version(v_sel, usuario_activo):
+                    st.session_state["hoja_editor_texto"] = hoja_html_de_version(v_sel) or ""
+                    st.success(f"Versión {v_sel} activada.")
+                    st.rerun()
+    if st.button(":material/history: Cargar en el editor la hoja ORIGINAL del sistema", key="hoja_cargar_original"):
+        st.session_state["hoja_editor_texto"] = HOJA_PLANTILLA_DEFECTO
+        st.rerun()
+    texto = st.text_area("Plantilla (HTML con {{ datos }} y {% bloques %})", key="hoja_editor_texto", height=460)
+    nota = st.text_input("Nota de este cambio (opcional)", key="hoja_nota", placeholder="Ej: agregué el despacho en grande")
+    c1, c2 = st.columns(2)
+    v_muestra, d_muestra = _viaje_muestra_hoja()
+    if c1.button(":material/visibility: Vista previa", key="hoja_vista_previa", use_container_width=True):
+        try:
+            components.html(renderizar_plantilla_hoja(texto, v_muestra, d_muestra), height=720, scrolling=True)
+        except Exception as e:
+            st.error(f"La plantilla tiene un error y NO se puede usar: {type(e).__name__}: {e}")
+    if c2.button(":material/check: Guardar y activar", key="hoja_guardar", type="primary", use_container_width=True):
+        try:
+            renderizar_plantilla_hoja(texto, v_muestra, d_muestra)
+        except Exception as e:
+            st.error(f"No se guardó: la plantilla tiene un error ({type(e).__name__}: {e}).")
         else:
-            devuelto_boxes = """
-                        <div class="material-box vacio"></div>
-                        <div class="material-box vacio"></div>
-                        <div class="material-box vacio"></div>"""
-
-        bloques_destino += f"""
-        <div class="destino-card">
-            <div class="destino-header">
-                <div class="destino-header-izq">
-                    <span class="destino-num">{idx}</span> {esc(d['tienda'])}
-                    <span class="marchamo-inline">Marchamo: {esc(d['marchamo_ida'])}</span>
-                    {badge_complemento}
-                </div>
-                {badge_regreso}
-            </div>
-            <div class="destino-body">
-                <div class="material-enviado">
-                    <div class="etiqueta">MATERIAL ENVIADO</div>
-                    <div class="material-grid">
-                        <div class="material-box"><b>{d['roles']}</b><span>ROLES</span></div>
-                        <div class="material-box"><b>{d['tarimas']}</b><span>TARIMAS</span></div>
-                        {material_cajas}
-                    </div>
-                    <div class="sub-info sub-info-grande">No. de Despachos: <b>{pedidos_txt}</b></div>
-                    {documentos_html}
-                    {incidencia_html}
-                    <div class="sello-area">
-                        <span class="etiqueta">SELLO DE TIENDA</span>
-                        <div class="sello-espacio"></div>
-                    </div>
-                </div>
-                <div class="material-devuelto">
-                    <div class="etiqueta">{"DEVUELTO POR LA TIENDA (LIQUIDADO)" if esta_liquidado else "DEVUELTO POR LA TIENDA (LLENAR A MANO)"}</div>
-                    <div class="grid-encabezados">
-                        <span>ROLES</span><span>TARIMAS</span><span>PACAS DE CARTÓN</span>
-                    </div>
-                    <div class="material-grid">{devuelto_boxes}
-                    </div>
-                    <div class="etiqueta" style="margin-top:10px;">CONTROL DE TIEMPOS (LLENAR A MANO)</div>
-                    <div class="grid-encabezados">
-                        <span>LLEGADA</span><span>INICIO DESCARGA</span><span>SALIDA</span>
-                    </div>
-                    <div class="material-grid">
-                        <div class="material-box vacio"></div>
-                        <div class="material-box vacio"></div>
-                        <div class="material-box vacio"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        """
-
-    return f"""
-    <html>
-    <head>
-    <style>
-        @page {{ size: letter; margin: 10mm; }}
-        body {{ font-family: Arial, sans-serif; color: #1a1a1a; padding: 14px; font-size: 13px; }}
-        .hoja {{ max-width: 800px; margin: auto; }}
-        .header {{ display: flex; justify-content: space-between; align-items: flex-start;
-                   border-bottom: 3px solid #0B4A32; padding-bottom: 6px; margin-bottom: 8px; }}
-        .logo {{ font-size: 22px; font-weight: bold; color: #0B4A32; }}
-        .titulo {{ text-align: right; }}
-        .titulo h2 {{ margin: 0; color: #0B4A32; font-size: 16px; }}
-        .titulo p {{ margin: 0; color: #666; font-size: 10px; }}
-        .datos-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px 16px; margin-bottom: 8px; }}
-        .dato label {{ display: block; font-size: 9px; color: #666; text-transform: uppercase; }}
-        .dato span {{ font-size: 12px; font-weight: bold; border-bottom: 1px solid #ccc; display: block; }}
-        .dato-blanco span {{ border-bottom: 1px dashed #999; min-height: 14px; }}
-        .titulo-destinos {{ background: #0B4A32; color: white; padding: 3px 10px; font-weight: bold;
-                             border-radius: 4px; margin-bottom: 6px; font-size: 12px; }}
-        .destino-card {{ border: 1px solid #ccc; border-radius: 5px; margin-bottom: 6px; overflow: hidden; }}
-        .destino-header {{ background: #eef6ef; padding: 4px 10px; font-weight: bold; font-size: 12px;
-                            display: flex; align-items: center; justify-content: space-between;
-                            flex-wrap: wrap; gap: 6px; }}
-        .destino-header-izq {{ display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }}
-        .destino-num {{ background: #0B4A32; color: white; border-radius: 50%; padding: 1px 7px; font-size: 11px; }}
-        .marchamo-inline {{ font-size: 13px; font-weight: bold; color: #0B4A32;
-                             background: #fff; border: 1px solid #0B4A32; border-radius: 4px; padding: 3px 12px; }}
-        .badge-regreso {{ background: #B5622E; color: white; padding: 3px 12px;
-                           border-radius: 4px; font-size: 13px; font-weight: bold; white-space: nowrap; }}
-        .badge-complemento {{ background: #7A3E1D; color: white; padding: 1px 8px;
-                               border-radius: 4px; font-size: 10px; }}
-        .destino-body {{ display: flex; }}
-        .material-enviado, .material-devuelto {{ flex: 1; padding: 5px 8px; }}
-        .material-devuelto {{ border-left: 2px dashed #ccc; }}
-        .etiqueta {{ font-size: 9px; color: #0B4A32; font-weight: bold; margin-bottom: 3px; }}
-        .material-grid {{ display: flex; gap: 5px; }}
-        .material-box {{ flex: 1; border: 1px solid #ccc; border-radius: 4px; text-align: center; padding: 3px 2px; }}
-        .material-box b {{ display: block; font-size: 13px; color: #0B4A32; }}
-        .material-box.vacio {{ min-height: 22px; }}
-        .material-box span {{ font-size: 8px; color: #666; }}
-        .sub-info {{ font-size: 10px; margin-top: 3px; }}
-        .sub-info-grande {{ font-size: 13px; margin-top: 5px; font-weight: 600; }}
-        .grid-encabezados {{ display: flex; gap: 5px; margin-top: 4px; }}
-        .grid-encabezados span {{ flex: 1; text-align: center; font-size: 8px; color: #666; text-transform: uppercase; }}
-        .sello-area {{ margin-top: 10px; }}
-        .sello-espacio {{ min-height: 46px; }}
-        .incidencia {{
-            margin-top: 8px; padding: 8px 10px; background: #FFF4EC;
-            border: 1.5px solid #D9824F; border-radius: 6px;
-        }}
-        .incidencia .etiqueta {{ color: #D9824F; }}
-        .incidencia-texto {{ font-size: 13px; color: #7A3E1D; margin-top: 3px; font-weight: 600; }}
-        .footer {{ display: flex; justify-content: space-between; font-size: 9px; color: #999; margin-top: 10px; }}
-        .btn-imprimir {{ background: #0B4A32; color: white; border: none; padding: 10px 20px;
-                          border-radius: 6px; font-weight: bold; cursor: pointer; margin-bottom: 15px; }}
-
-        @media print {{
-            body {{ padding: 0; font-size: 11px; }}
-            .btn-imprimir {{ display: none; }}
-            .logo, .titulo h2, .dato span, .etiqueta, .destino-num, .material-box b {{ color: #000 !important; }}
-            .titulo-destinos, .destino-header, .destino-num {{ background: #fff !important; border: 1px solid #000; color: #000 !important; }}
-            .marchamo-inline {{ border: 1px solid #000; color: #000 !important; background: #fff !important; }}
-            .badge-regreso {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
-            .badge-complemento {{ background: #fff !important; color: #000 !important; border: 1px solid #000; }}
-            .material-box {{ border: 1px solid #000; }}
-            .destino-card {{ break-inside: avoid; }}
-        }}
-    </style>
-    </head>
-    <body>
-    <div class="hoja">
-        <button class="btn-imprimir" onclick="window.print()">🖨️ Imprimir</button>
-        <div class="header">
-            <div class="logo">RANSA</div>
-            <div class="titulo">
-                <h2>HOJA DE SALIDA</h2>
-                <p>Control de Ruta · Documento de Despacho</p>
-                {f'<p style="margin-top:2px;"><span style="background:#D9824F;color:#fff;padding:2px 10px;border-radius:6px;font-weight:600;font-size:13px;">SIN PEDIDO — {esc(viaje.get("motivo_sin_pedido"))}</span></p>' if viaje.get("motivo_sin_pedido") else ''}
-                <p style="margin-top:4px;">Generado: <b>{viaje['fecha_creacion']} {viaje['hora_creacion']}</b>
-                   por <b>{esc(viaje['usuario_creador'])}</b></p>
-                {f'<p style="margin-top:2px; color:#0B4A32;">✅ Liquidado por <b>{esc(viaje["usuario_liquido"])}</b> el <b>{viaje["fecha_liquidacion"]} {viaje["hora_liquidacion"]}</b></p>' if esta_liquidado else ''}
-            </div>
-        </div>
-        <div class="datos-grid">
-            <div class="dato"><label>No. de Viaje</label><span>{esc(viaje['id_viaje'])}</span></div>
-            <div class="dato"><label>No. de Despacho(s)</label><span>{esc(" - ".join(dict.fromkeys(todos_despachos))) or "—"}</span></div>
-            <div class="dato"><label>Cliente</label><span>{esc(viaje['cliente'])}</span></div>
-            <div class="dato"><label>CD Origen</label><span>{esc(viaje['cd_origen']) or '—'}</span></div>
-            <div class="dato"><label>Transportista</label><span>{esc(viaje['transportista'])}</span></div>
-            <div class="dato"><label>Camión</label><span>{esc(viaje['placa'])}{f' · {esc(viaje["tipo_camion"])}' if viaje.get('tipo_camion') else ''}</span></div>
-            <div class="dato"><label>Furgón</label><span>{esc(viaje['placa_furgon']) if viaje.get('placa_furgon') else 'No Furgón'}</span></div>
-            <div class="dato"><label>Fecha</label><span>{viaje['fecha_creacion']}</span></div>
-            <div class="dato dato-blanco"><label>Horario (Garita — hora real de salida)</label><span>&nbsp;</span></div>
-            <div class="dato"><label>Piloto</label><span>{esc(viaje['piloto'])}</span></div>
-            <div class="dato"><label>Auxiliar</label><span>{esc(viaje['auxiliar'])}</span></div>
-            <div class="dato"><label>Marchamo de Ida</label><span>{marchamo_ida_general}</span></div>
-        </div>
-        <div class="titulo-destinos">DESTINOS DEL VIAJE ({len(destinos)})</div>
-        {bloques_destino}
-        <div class="footer">
-            <span>Hoja generada por el sistema Control de Ruta · Ransa · v{VERSION_APP}</span>
-            <span>Sellar y entregar al finalizar el viaje para su liquidación.</span>
-        </div>
-    </div>
-    </body>
-    </html>
-    """
+            nueva = hoja_guardar_version(texto, nota, usuario_activo)
+            st.success(f"Plantilla guardada como versión {nueva} y activada.")
 
 
 def confirmar_entrega_transporte(viaje_id, entregas, usuario):
@@ -3237,6 +3421,7 @@ def pagina_despacho():
                         st.session_state.num_destinos -= 1
 
                     destinos_viaje = []
+                    despachos_sin_agregar = []   # escribió un No. de Despacho pero no presionó «Agregar Despacho»
                     total_destinos = st.session_state.num_destinos
                     tiendas_usadas_en_form = set()
 
@@ -3297,6 +3482,8 @@ def pagina_despacho():
                                     with fp3:
                                         st.write("")
                                         agregar_pedido = st.button(":material/add: Agregar Despacho", key=f"btn_agregar_pedido_{run}_{i}_{subrun}", use_container_width=True)
+                                    if pedido_codigo.strip() and not agregar_pedido:
+                                        despachos_sin_agregar.append(f"{pedido_codigo.strip()} ({tienda or 'destino ' + str(i + 1)})")
                                     if agregar_pedido:
                                         if not pedido_codigo.strip():
                                             st.warning("Escribe un número de despacho antes de agregarlo.")
@@ -3502,6 +3689,9 @@ def pagina_despacho():
                     st.error("❌ Error: El Marchamo de Regreso no puede ser igual a un Marchamo de Ida de este mismo viaje.")
                 elif viaje_sin_pedido and not motivo_seleccionado:
                     st.error("❌ Error: Elige un Motivo para este viaje sin pedido antes de generarlo.")
+                elif despachos_sin_agregar:
+                    st.error("❌ Escribiste un No. de Despacho pero no lo agregaste: " + ", ".join(despachos_sin_agregar)
+                             + ". Presiona «Agregar Despacho» en esa tienda (o borra el texto) y vuelve a generar el viaje.")
                 elif st.session_state.get(f"route_id_sr_{run}") and sr_int.ruta_en_uso(get_conn, st.session_state.get(f"route_id_sr_{run}")):
                     _folio_en_uso, _estado_en_uso = sr_int.ruta_en_uso(get_conn, st.session_state.get(f"route_id_sr_{run}"))
                     st.error(f"❌ Esta ruta de SimpliRoute ya se utilizó en el viaje {_folio_en_uso} ({_estado_en_uso}). "
@@ -3842,6 +4032,7 @@ def pagina_gestion_viajes():
 
                         st.markdown("##### DATOS POR TIENDA")
                         destinos_editados = []
+                        despachos_invalidos = []
                         for d in sorted(destinos_g, key=lambda x: x["orden"]):
                             tiendas_opciones = list(tiendas_cliente_g.keys())
                             if tiendas_opciones:
@@ -3858,6 +4049,17 @@ def pagina_gestion_viajes():
                             with e3:
                                 cajas_e = st.number_input("Bultos", min_value=0, step=1, value=d["cajas"], key=f"ecajas_{d['id']}")
                             mida_e = st.text_input("Marchamo Ida", value=d["marchamo_ida"], key=f"emida_{d['id']}")
+                            despachos_e = None
+                            if not viaje_g.get("motivo_sin_pedido"):
+                                try:
+                                    _cods_actuales = [str(p.get("pedido")) for p in (json.loads(d["pedidos"]) if d["pedidos"] else []) if p.get("pedido")]
+                                except (json.JSONDecodeError, TypeError, AttributeError):
+                                    _cods_actuales = []
+                                despachos_e = st.text_input(
+                                    "No. de Despacho(s) — separa varios con coma", value=", ".join(_cods_actuales),
+                                    key=f"edespachos_{d['id']}",
+                                    help="Aquí puedes agregar, corregir o quitar el No. de Despacho de esta tienda. "
+                                         "Se imprime en la Hoja de Control. El total de bultos es el campo «Bultos» de arriba.")
                             dc1, dc2, dc3, dc4 = st.columns(4)
                             with dc1:
                                 remitos_e = st.text_input("Remisión", value=d["remitos"] or "", max_chars=10, key=f"eremitos_{d['id']}")
@@ -3873,7 +4075,13 @@ def pagina_gestion_viajes():
                             # igual que en Despacho (es un dato fijo del catálogo).
                             tipo_pago_e = tiendas_cliente_g.get(tienda_e, {}).get("clasificacion", "Local")
                             st.text_input("Clasificación de Destino", value=tipo_pago_e, disabled=True, key=f"etipopago_{d['id']}")
+                            _extra_despachos = {}
+                            if despachos_e is not None:
+                                _codigos_e, _malos_e = despachos_desde_texto(despachos_e)
+                                despachos_invalidos += [f"{c} ({tienda_e})" for c in _malos_e]
+                                _extra_despachos = {"pedidos": pedidos_json_editado(d["pedidos"], _codigos_e, cajas_e)}
                             destinos_editados.append({
+                                **_extra_despachos,
                                 "id": d["id"], "orden": d["orden"], "tienda": tienda_e,
                                 "roles": roles_e, "tarimas": tarimas_e, "cajas": cajas_e,
                                 "marchamo_ida": mida_e.strip(),
@@ -3900,6 +4108,9 @@ def pagina_gestion_viajes():
                                 st.error("❌ El nombre del auxiliar es demasiado largo (máximo 100 caracteres).")
                             elif datos_cam.get("tipo") == TIPO_CABEZAL_FURGON and not placa_furgon_edit:
                                 st.error("❌ Esta unidad es de 20 Ton — falta escribir la Placa del Furgón.")
+                            elif despachos_invalidos:
+                                st.error("❌ No. de Despacho con caracteres no válidos: " + ", ".join(despachos_invalidos)
+                                         + ". Usa solo letras, números, punto, guion o diagonal; separa varios con coma.")
                             else:
                                 ok, msg = editar_viaje(viaje_g["id"], placa_edit, transportista_edit, piloto_edit,
                                                        auxiliar_edit, destinos_editados, marchamo_regreso_edit.strip(),
@@ -4155,7 +4366,7 @@ def pagina_catalogos():
             getattr(st, tipo)(mensaje)
 
         if perfil_activo in ("Administrador", "SuperAdministrador"):
-            catalogos_disponibles = list(CATALOGOS_CONFIG.keys())
+            catalogos_disponibles = list(CATALOGOS_CONFIG.keys()) + ([HOJA_CATALOGO] if perfil_activo == "SuperAdministrador" else [])
             mis_clientes = None  # sin restricción
             st.caption("Descarga la plantilla, llénala en Excel y súbela para actualizar ese catálogo.")
         else:
@@ -4179,6 +4390,9 @@ def pagina_catalogos():
             # Camiones no tiene columna "cliente" en la base de datos — las funciones
             # de guardado ya lo detectan solas y no aplican ningún filtro en ese caso.
             catalogo_sel = st.selectbox("Catálogo a gestionar", catalogos_disponibles)
+            if catalogo_sel == HOJA_CATALOGO:
+                render_editor_hoja_impresa()
+                st.stop()
             config = CATALOGOS_CONFIG[catalogo_sel]
             columnas_mostrar = config["columnas"] + config.get("solo_lectura", [])
             df_actual_completo = leer_catalogo_actual(config["tabla"], columnas_mostrar)
