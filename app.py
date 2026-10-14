@@ -2517,51 +2517,74 @@ def hoja_activar_version(version, usuario):
 
 
 def render_editor_hoja_impresa():
-    """Pantalla (solo SuperAdministrador) para editar la plantilla de la Hoja de Control con vista previa e historial."""
+    """Pantalla (solo SuperAdministrador) para SUBIR la plantilla de la Hoja de Control como archivo .html.
+    Aquí NO se edita código: cada subida queda como una versión nueva con quién la subió y cuándo."""
     st.subheader(":material/print: Plantilla de la Hoja de Control")
-    st.caption("Aquí se cambia cómo se imprime la hoja, sin deploy. Primero «Vista previa» (usa tu último viaje real) y solo si se ve bien, "
-               "«Guardar y activar». Cada guardado es una versión nueva y puedes volver a cualquiera. Si una plantilla falla, la app imprime "
-               "con la hoja original. Datos disponibles: `viaje.<columna>`, `destinos` (cada uno con `numero`, `tienda`, `despachos`, "
-               "`despachos_texto` y todas sus columnas), `liquidado`, `es_unisuper`, `despachos_encabezado`, `version_app`. "
-               "Los datos se escapan solos; el cambio llega a todos en máximo un minuto.")
+    st.caption("La plantilla se SUBE como archivo .html (aquí no se edita código). Primero se ve la vista previa con tu último viaje real y, si se ve bien, "
+               "«Guardar y activar». Cada subida queda como una versión nueva, con quién la subió y cuándo; puedes ver o descargar cualquier versión y "
+               "volver a una anterior. Si una plantilla falla, la app imprime con la hoja original. El cambio llega a todos en máximo un minuto.")
+    _aviso = st.session_state.pop("hoja_flash", None)
+    if _aviso:
+        getattr(st, _aviso[0])(_aviso[1])
     plantilla_hoja_activa.clear()
-    version_activa, html_activa = plantilla_hoja_activa()
-    st.session_state.setdefault("hoja_editor_texto", html_activa)
-    with st.expander(f"Versiones guardadas (activa: {version_activa or 'original del sistema'})", expanded=False):
-        vers = hoja_versiones()
-        st.dataframe(pd.DataFrame(vers, columns=["Versión", "Activa", "Nota", "Guardada por", "Fecha"]), hide_index=True, use_container_width=True)
-        opciones = [v[0] for v in vers]
-        if opciones:
-            v_sel = st.selectbox("Versión", opciones, key="hoja_version_sel")
-            b1, b2 = st.columns(2)
-            if b1.button(":material/edit_note: Cargar esa versión en el editor", key="hoja_cargar_version", use_container_width=True):
-                st.session_state["hoja_editor_texto"] = hoja_html_de_version(v_sel) or ""
-                st.rerun()
-            if b2.button(":material/restore: Activar esa versión", key="hoja_activar_version", use_container_width=True):
-                if hoja_activar_version(v_sel, usuario_activo):
-                    st.session_state["hoja_editor_texto"] = hoja_html_de_version(v_sel) or ""
-                    st.success(f"Versión {v_sel} activada.")
-                    st.rerun()
-    if st.button(":material/history: Cargar en el editor la hoja ORIGINAL del sistema", key="hoja_cargar_original"):
-        st.session_state["hoja_editor_texto"] = HOJA_PLANTILLA_DEFECTO
-        st.rerun()
-    texto = st.text_area("Plantilla (HTML con {{ datos }} y {% bloques %})", key="hoja_editor_texto", height=460)
-    nota = st.text_input("Nota de este cambio (opcional)", key="hoja_nota", placeholder="Ej: agregué el despacho en grande")
-    c1, c2 = st.columns(2)
+    version_activa, _ = plantilla_hoja_activa()
     v_muestra, d_muestra = _viaje_muestra_hoja()
-    if c1.button(":material/visibility: Vista previa", key="hoja_vista_previa", use_container_width=True):
-        try:
-            components.html(renderizar_plantilla_hoja(texto, v_muestra, d_muestra), height=720, scrolling=True)
-        except Exception as e:
-            st.error(f"La plantilla tiene un error y NO se puede usar: {type(e).__name__}: {e}")
-    if c2.button(":material/check: Guardar y activar", key="hoja_guardar", type="primary", use_container_width=True):
-        try:
-            renderizar_plantilla_hoja(texto, v_muestra, d_muestra)
-        except Exception as e:
-            st.error(f"No se guardó: la plantilla tiene un error ({type(e).__name__}: {e}).")
+
+    st.markdown("##### Subir una plantilla nueva")
+    archivo = st.file_uploader("Archivo de plantilla (.html)", type=["html", "htm"], key=f"hoja_archivo_{st.session_state.get('hoja_up_n', 0)}")
+    nota = st.text_input("Nota de este cambio (opcional)", key=f"hoja_nota_{st.session_state.get('hoja_up_n', 0)}",
+                         placeholder="Ej: bolsas de seguridad para UniSuper LTX")
+    if archivo is not None:
+        texto, error = None, None
+        if archivo.size > 300_000:
+            error = "El archivo es demasiado grande (máximo 300 KB)."
         else:
-            nueva = hoja_guardar_version(texto, nota, usuario_activo)
-            st.success(f"Plantilla guardada como versión {nueva} y activada.")
+            try:
+                texto = archivo.getvalue().decode("utf-8-sig")
+            except UnicodeDecodeError:
+                error = "El archivo no está en formato UTF-8. Guárdalo de nuevo como UTF-8 y súbelo otra vez."
+        if texto is not None and re.search(r"<\s*(script|iframe|object|embed)\b|javascript:|https?://", texto, re.I):
+            error = "La plantilla no puede incluir scripts ni direcciones web externas (por seguridad). Quítalos y súbela otra vez."
+        vista = None
+        if not error:
+            try:
+                vista = renderizar_plantilla_hoja(texto, v_muestra, d_muestra)
+            except Exception as e:
+                error = f"La plantilla tiene un error y NO se puede usar: {type(e).__name__}: {e}"
+        if error:
+            st.error(error)
+        else:
+            st.caption("Vista previa con tu último viaje real:")
+            components.html(vista, height=720, scrolling=True)
+            if st.button(":material/check: Guardar y activar", key="hoja_guardar", type="primary", use_container_width=True):
+                nota_final = f"Archivo: {archivo.name}" + (f" — {nota.strip()}" if (nota or "").strip() else "")
+                nueva = hoja_guardar_version(texto, nota_final, usuario_activo)
+                st.session_state["hoja_flash"] = ("success", f"Plantilla subida por {usuario_activo} como versión {nueva} y activada.")
+                st.session_state["hoja_up_n"] = st.session_state.get("hoja_up_n", 0) + 1
+                st.rerun()
+
+    st.markdown("##### Versiones guardadas")
+    vers = hoja_versiones()
+    st.caption(f"Versión activa: {version_activa or 'original del sistema'}")
+    if vers:
+        st.dataframe(pd.DataFrame(vers, columns=["Versión", "Activa", "Nota", "Subida por", "Fecha"]), hide_index=True, use_container_width=True)
+        v_sel = st.selectbox("Versión", [v[0] for v in vers], key="hoja_version_sel")
+        c1, c2, c3 = st.columns(3)
+        if c1.button(":material/visibility: Vista previa de esa versión", key="hoja_ver_version", use_container_width=True):
+            try:
+                components.html(renderizar_plantilla_hoja(hoja_html_de_version(v_sel) or "", v_muestra, d_muestra), height=720, scrolling=True)
+            except Exception as e:
+                st.error(f"Esa versión tiene un error: {type(e).__name__}: {e}")
+        if c2.button(":material/restore: Activar esa versión", key="hoja_activar_version", use_container_width=True):
+            if hoja_activar_version(v_sel, usuario_activo):
+                st.session_state["hoja_flash"] = ("success", f"Versión {v_sel} activada.")
+                st.rerun()
+        c3.download_button(":material/download: Descargar esa versión", data=hoja_html_de_version(v_sel) or "",
+                           file_name=f"hoja_control_v{v_sel}.html", mime="text/html", key="hoja_descargar_version", use_container_width=True)
+    if st.button(":material/history: Volver a la hoja ORIGINAL del sistema", key="hoja_volver_original"):
+        nueva = hoja_guardar_version(HOJA_PLANTILLA_DEFECTO, "Hoja original del sistema", usuario_activo)
+        st.session_state["hoja_flash"] = ("success", f"Hoja original activada como versión {nueva}.")
+        st.rerun()
 
 
 def confirmar_entrega_transporte(viaje_id, entregas, usuario):
