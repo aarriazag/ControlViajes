@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://api.simpliroute.com/v1/"
-TIMEOUT_LISTA_DRIVERS_SEGUNDOS = 25   # la lista completa de conductores (400+) tarda 5-6 s en responder
+TIMEOUT_LISTA_DRIVERS_SEGUNDOS = 25   # las listas completas de SR (400+ conductores; los vehículos) tardan varios segundos; con 8 s se cortaban
 TIMEOUT_SEGUNDOS = 8            # máximo esperando LA RESPUESTA (lectura) de SR, en llamadas ligeras
 CONNECT_TIMEOUT_SEGUNDOS = 5    # máximo para ESTABLECER la conexión con SR; si no, falla rápido
 
@@ -294,7 +294,7 @@ def buscar_vehiculo_sr_por_placa(placa, token=None):
     Nunca se debe volver a llamar una vez que el camión ya tiene id_sr —
     ahí el camino correcto es actualizar_vehiculo_sr() directo por id_sr."""
     clave = clave_placa(placa)
-    ok, data = _sr_request("GET", "routes/vehicles/", token=token)
+    ok, data = _sr_request("GET", "routes/vehicles/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
     if not ok:
         return False, data
     lista = data.get("results", data) if isinstance(data, dict) else data
@@ -773,7 +773,7 @@ def debe_sincronizar_camiones(get_conn_fn, horas=12):
 
 def obtener_vehiculos_sr(token=None):
     """GET /routes/vehicles/ — lista cruda de vehículos en SR."""
-    ok, data = _sr_request("GET", "routes/vehicles/", token=token)
+    ok, data = _sr_request("GET", "routes/vehicles/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
     if not ok:
         return False, data
     lista = data.get("results", data) if isinstance(data, dict) else data

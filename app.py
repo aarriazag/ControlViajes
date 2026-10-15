@@ -4877,6 +4877,23 @@ def pagina_catalogos():
                                 texto = f"✅ Carga masiva completada: '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s)."
                                 if msg != "OK":
                                     texto += f"\n\n⚠️ {msg}"
+                                if config["tabla"] == "cat_camiones":
+                                    # La carga masiva antes NO enviaba las unidades a SimpliRoute (solo el formulario y la tabla lo hacían):
+                                    # se envían ahora todos los camiones activos que sigan pendientes.
+                                    try:
+                                        _token_sr_masivo = sr_int.obtener_token_sr_desde_vault(get_conn)
+                                        if _token_sr_masivo:
+                                            with st.spinner("Enviando las unidades a SimpliRoute…"):
+                                                _res_sr, _resumen_sr = sr_int.reintentar_camiones_pendientes(get_conn, token=_token_sr_masivo)
+                                            texto += f"\n\n🚚 SimpliRoute: {_resumen_sr}"
+                                            _fallidos_sr = [f"{_p}: {_m}" for _p, (_o, _m) in _res_sr.items() if not _o]
+                                            if _fallidos_sr:
+                                                texto += "\n\n⚠️ No se pudieron enviar: " + "; ".join(_fallidos_sr[:5]) + ("…" if len(_fallidos_sr) > 5 else "")
+                                        else:
+                                            texto += "\n\n⚠️ No hay token de SimpliRoute configurado: las unidades quedaron pendientes de sincronizar."
+                                    except Exception as e_sr_masivo:
+                                        _error_tecnico(e_sr_masivo, "sincronizar_camiones_carga_masiva")
+                                        texto += "\n\n⚠️ Las unidades se guardaron, pero no se pudieron enviar a SimpliRoute; quedaron pendientes."
                                 st.session_state["flash_catalogos"] = ("success", texto)
                                 st.session_state.catalogos = cargar_catalogos_desde_db()
                                 st.rerun()
