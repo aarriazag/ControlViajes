@@ -4885,10 +4885,13 @@ def pagina_catalogos():
                                         if _token_sr_masivo:
                                             with st.spinner("Enviando las unidades a SimpliRoute…"):
                                                 _res_sr, _resumen_sr = sr_int.reintentar_camiones_pendientes(get_conn, token=_token_sr_masivo)
-                                            texto += f"\n\n🚚 SimpliRoute: {_resumen_sr}"
-                                            _fallidos_sr = [f"{_p}: {_m}" for _p, (_o, _m) in _res_sr.items() if not _o]
+                                            _fallidos_sr = [_p for _p, (_o, _m) in _res_sr.items() if not _o]
+                                            texto += f"\n\n🚚 SimpliRoute: se enviaron {len(_res_sr) - len(_fallidos_sr)} de {len(_res_sr)} camión(es)"
                                             if _fallidos_sr:
-                                                texto += "\n\n⚠️ No se pudieron enviar: " + "; ".join(_fallidos_sr[:5]) + ("…" if len(_fallidos_sr) > 5 else "")
+                                                texto += (f"; {len(_fallidos_sr)} con falla. El detalle está en \"Integración SimpliRoute\" → "
+                                                          "\"Camiones pendientes\" → \"Reintentar todos\".")
+                                            else:
+                                                texto += "."
                                         else:
                                             texto += "\n\n⚠️ No hay token de SimpliRoute configurado: las unidades quedaron pendientes de sincronizar."
                                     except Exception as e_sr_masivo:
@@ -4969,6 +4972,13 @@ def pagina_catalogos():
                            f"{', '.join(_tipos_sin_mapear_hoy)}. Mapéalos abajo para que sus rutas aparezcan "
                            "en la importación del cliente correcto.")
 
+        # El resultado del reintento se muestra AQUÍ, junto al botón (antes salía arriba de la página, fuera de vista).
+        _res_sr_camiones = st.session_state.pop("resultado_reintento_camiones_sr", None)
+        if _res_sr_camiones:
+            getattr(st, _res_sr_camiones[0])(_res_sr_camiones[1])
+            if len(_res_sr_camiones) > 2 and _res_sr_camiones[2]:
+                with st.expander("Ver detalle técnico (lo que respondió SR)", expanded=False):
+                    st.code(_res_sr_camiones[2], language=None)
         with st.expander(":material/local_shipping: Camiones pendientes de sincronizar con SR", expanded=False):
             with closing(get_conn()) as _conn, _conn.cursor() as _cur:
                 _cur.execute(
@@ -4983,12 +4993,16 @@ def pagina_catalogos():
                 if hay_token_sr and st.button(":material/refresh: Reintentar todos", key="btn_reintentar_camiones_sr"):
                     with st.spinner("Enviando los camiones pendientes a SimpliRoute…"):
                         resultados, resumen = sr_int.reintentar_camiones_pendientes(get_conn, token=token_sr)
-                    _fallidos_sr = [f"- **{_p}**: {_m}" for _p, (_o, _m) in resultados.items() if not _o]
+                    _fallidos_sr = [(_p, _m) for _p, (_o, _m) in resultados.items() if not _o]
+                    _enviados_sr = len(resultados) - len(_fallidos_sr)
                     if _fallidos_sr:
-                        # Antes solo se mostraba el conteo: ahora se ve POR QUÉ falló cada camión.
-                        st.session_state["flash_catalogos"] = ("warning", resumen + "\n\nNo se pudieron enviar:\n\n" + "\n".join(_fallidos_sr))
+                        # Mensaje corto y genérico: qué falló. El detalle técnico de SR queda aparte, para probar.
+                        st.session_state["resultado_reintento_camiones_sr"] = (
+                            "warning",
+                            f"Se enviaron {_enviados_sr} de {len(resultados)} camión(es) a SimpliRoute; {len(_fallidos_sr)} con falla.",
+                            "Camiones con falla:\n\n" + "\n\n".join(f"{_p}: {_m}" for _p, _m in _fallidos_sr))
                     else:
-                        st.session_state["flash_catalogos"] = ("success", resumen)
+                        st.session_state["resultado_reintento_camiones_sr"] = ("success", f"{_enviados_sr} camión(es) enviados a SimpliRoute.")
                     st.rerun()
 
         with st.expander(":material/local_shipping: Camiones nuevos desde SR (pendientes de completar)", expanded=False):
@@ -5049,6 +5063,18 @@ def pagina_catalogos():
             st.session_state["flash_catalogos"] = ("success" if ok_sync_c else "error", resumen_sync_c)
             st.rerun()
 
+        if hay_token_sr:
+            # Coordenadas y visit_type de cada tienda: se toman de las visitas de SR (no se digitan). Cada día de SR tarda ~15 s.
+            _c1, _c2 = st.columns([1, 2])
+            _dias_coord = _c1.selectbox("Días de SR a revisar", [1, 3, 7], index=1, key="dias_coord_sr",
+                                         help="Cada día tarda unos 15 segundos. Con 3 días alcanza para el uso normal.")
+            if _c2.button(":material/pin_drop: Actualizar coordenadas de tiendas desde SimpliRoute", key="btn_sync_coord_sr"):
+                with st.spinner(f"Leyendo {_dias_coord} día(s) de SimpliRoute (unos {15 * _dias_coord} segundos)…"):
+                    _ok_c, _res_c, _det_c = sr_int.sincronizar_coordenadas_tiendas_desde_sr(get_conn, dias=_dias_coord, token=token_sr)
+                (st.success if _ok_c else st.warning)(_res_c)
+                if _det_c:
+                    with st.expander("Ver detalle", expanded=False):
+                        st.code(_det_c, language=None)
         if hay_token_sr and st.button(":material/sync: Sincronizar Pilotos desde SimpliRoute ahora", key="btn_sync_pilotos_manual"):
             ok_sync, resumen_sync = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token_sr)
             st.session_state["flash_catalogos"] = ("success" if ok_sync else "error", resumen_sync)
