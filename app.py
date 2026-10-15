@@ -4981,8 +4981,14 @@ def pagina_catalogos():
             else:
                 st.write(f"{len(_placas_pendientes)} camión(es) pendiente(s): " + ", ".join(_placas_pendientes))
                 if hay_token_sr and st.button(":material/refresh: Reintentar todos", key="btn_reintentar_camiones_sr"):
-                    resultados, resumen = sr_int.reintentar_camiones_pendientes(get_conn, token=token_sr)
-                    st.session_state["flash_catalogos"] = ("success", resumen)
+                    with st.spinner("Enviando los camiones pendientes a SimpliRoute…"):
+                        resultados, resumen = sr_int.reintentar_camiones_pendientes(get_conn, token=token_sr)
+                    _fallidos_sr = [f"- **{_p}**: {_m}" for _p, (_o, _m) in resultados.items() if not _o]
+                    if _fallidos_sr:
+                        # Antes solo se mostraba el conteo: ahora se ve POR QUÉ falló cada camión.
+                        st.session_state["flash_catalogos"] = ("warning", resumen + "\n\nNo se pudieron enviar:\n\n" + "\n".join(_fallidos_sr))
+                    else:
+                        st.session_state["flash_catalogos"] = ("success", resumen)
                     st.rerun()
 
         with st.expander(":material/local_shipping: Camiones nuevos desde SR (pendientes de completar)", expanded=False):
