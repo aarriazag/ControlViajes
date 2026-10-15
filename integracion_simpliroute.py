@@ -9,10 +9,12 @@ Diseño acordado (ver conversación de referencia):
   camión aquí (con transportista, piloto, auxiliar ya resueltos), se manda a
   SR. SR nunca crea camiones por su cuenta — solo recibe.
 
-- PILOTOS: fuente es SR. Carga inicial manual (vincular id_sr a mano una vez).
-  De ahí en adelante, sincronización de SOLO LECTURA desde SR (GET drivers):
-  actualiza los ya vinculados y crea como "pendiente de completar" los que
-  aparezcan nuevos en SR. Control de Ruta NUNCA crea drivers en SR.
+- PILOTOS: el alta se hace en Control de Ruta (Catálogos → Pilotos). Se crea PRIMERO en SR
+  (usuario y contraseña = DPI; el DPI se envía y NO se guarda aquí) y, solo si SR lo crea, se
+  guarda en cat_pilotos con el id_sr que SR devuelve en esa misma respuesta (no hace falta una
+  segunda sincronización). Si el DPI ya existe en SR se ofrece vincularlo. El teléfono (opcional)
+  sí se guarda. La sincronización de LECTURA desde SR (GET drivers) sigue existiendo para reflejar
+  cambios hechos directo en SR (nombre, teléfono) y pilotos creados allá.
 
 - RUTAS: al crear la ruta en SR se manda `reference` = folio del viaje de
   Control de Ruta (id_viaje), para que el mismo identificador se pueda buscar
@@ -44,6 +46,7 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://api.simpliroute.com/v1/"
+TIMEOUT_LISTA_DRIVERS_SEGUNDOS = 25   # la lista completa de conductores (400+) tarda 5-6 s en responder
 TIMEOUT_SEGUNDOS = 8            # máximo esperando LA RESPUESTA (lectura) de SR, en llamadas ligeras
 CONNECT_TIMEOUT_SEGUNDOS = 5    # máximo para ESTABLECER la conexión con SR; si no, falla rápido
 
@@ -472,7 +475,7 @@ def reintentar_camiones_pendientes(get_conn_fn, token=None):
 
 def obtener_drivers_sr(token=None):
     """GET /accounts/drivers/ — lista cruda de conductores en SR."""
-    ok, data = _sr_request("GET", "accounts/drivers/", token=token)
+    ok, data = _sr_request("GET", "accounts/drivers/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
     if not ok:
         return False, data
     lista = data.get("results", data) if isinstance(data, dict) else data
@@ -516,6 +519,10 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
             nombre_sr = normalizar_nombre_catalogo(nombre_raw, "persona", siglas)
             cur.execute("SAVEPOINT sp_piloto")  # un fallo en un piloto no debe abortar a los demás
             try:
+                tel_sr = normalizar_telefono_gt(d.get("phone"))
+                if tel_sr:   # llena el teléfono solo si Control de Ruta todavía no lo tiene
+                    cur.execute("UPDATE cat_pilotos SET telefono = %s WHERE id_sr = %s "
+                                "AND (telefono IS NULL OR btrim(telefono) = '')", (tel_sr, id_sr))
                 cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (id_sr,))
                 fila = cur.fetchone()
                 if fila:
@@ -573,9 +580,9 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
                     nombre_nuevo = nombre_sr if not choque else f"{nombre_sr} (SR {id_sr})"
                     cur.execute(
                         "INSERT INTO cat_pilotos (nombre, id_sr, activo, pendiente_completar, "
-                        "fecha_sincronizacion_sr) VALUES (%s, %s, FALSE, TRUE, %s) "
+                        "fecha_sincronizacion_sr, telefono) VALUES (%s, %s, FALSE, TRUE, %s, %s) "
                         "ON CONFLICT (nombre) DO NOTHING",
-                        (nombre_nuevo, id_sr, datetime.now())
+                        (nombre_nuevo, id_sr, datetime.now(), tel_sr)
                     )
                     nuevos += 1
                 cur.execute("RELEASE SAVEPOINT sp_piloto")
@@ -602,6 +609,141 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
                     + "; ".join(f"id_sr {i}: {m}" for i, m in con_error[:3])
                     + ("…" if len(con_error) > 3 else "."))
     return True, resumen
+
+
+# ---------------------------------------------------------------------------
+# PILOTOS — alta desde Control de Ruta: se crea en SR y SR devuelve el id_sr
+# ---------------------------------------------------------------------------
+# Resultado confirmado con prueba real: POST accounts/drivers/ -> 201 con el "id" del conductor
+# (SR rechaza un username repetido con HTTP 400 "already exists"); DELETE no está permitido.
+# Regla de privacidad: el DPI (usuario y contraseña en SR) se manda a SR y NO se guarda, ni se
+# escribe en mensajes de error, bitácoras o auditoría.
+
+def solo_digitos(valor):
+    return re.sub(r"\D", "", str(valor or ""))
+
+
+def normalizar_telefono_gt(valor):
+    """'5555-1234' / '+502 5555 1234' -> '55551234'. None si no queda un número de 8 dígitos."""
+    digitos = solo_digitos(valor)
+    if len(digitos) == 11 and digitos.startswith("502"):
+        digitos = digitos[3:]
+    return digitos if len(digitos) == 8 else None
+
+
+def validar_datos_piloto(nombre, dpi, dpi_repetido, telefono=None):
+    """Devuelve un mensaje de error (sin incluir el DPI) o None si todo está bien."""
+    if len(" ".join(str(nombre or "").split()).split()) < 2:
+        return "Escribe el nombre completo del piloto (nombre y apellido)."
+    if len(solo_digitos(dpi)) != 13:
+        return "El DPI debe tener exactamente 13 dígitos."
+    if solo_digitos(dpi) != solo_digitos(dpi_repetido):
+        return "Los dos DPI no coinciden. Revísalos."
+    if str(telefono or "").strip() and normalizar_telefono_gt(telefono) is None:
+        return "El teléfono debe tener 8 dígitos (o déjalo vacío)."
+    return None
+
+
+def _nombre_piloto_normalizado(cur, nombre):
+    return normalizar_nombre_catalogo(nombre, "persona", _cargar_siglas(cur))
+
+
+def piloto_es_nuevo(get_conn_fn, nombre):
+    """True si no hay ningún piloto con ese nombre (sin distinguir mayúsculas)."""
+    from contextlib import closing
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        nombre_n = _nombre_piloto_normalizado(cur, nombre)
+        cur.execute("SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)", (nombre_n,))
+        return cur.fetchone() is None
+
+
+def telefono_guardado_piloto(get_conn_fn, nombre):
+    """Teléfono ya guardado de un piloto existente (para no borrarlo al editar otros datos)."""
+    from contextlib import closing
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT telefono FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)",
+                    (_nombre_piloto_normalizado(cur, nombre),))
+        fila = cur.fetchone()
+        return fila[0] if fila and fila[0] else None
+
+
+def _buscar_conductor_sr_por_usuario(dpi, nombre_n, tel, token):
+    ok, drivers = obtener_drivers_sr(token=token)
+    if not ok:
+        return "error", f"Ese DPI ya tiene usuario en SimpliRoute, pero no pude consultar de quién es: {drivers}"
+    for d in drivers:
+        if str(d.get("username", "")).strip() == dpi:
+            return "dpi_existe_en_sr", {"id_sr": d.get("id"), "nombre_sr": (d.get("name") or "").strip(),
+                                        "nombre": nombre_n, "telefono": tel}
+    return "error", ("SimpliRoute indica que ese usuario ya existe, pero no aparece entre los conductores de tu "
+                     "cuenta (puede ser de otra cuenta de SR). Revisa el DPI.")
+
+
+def crear_piloto_en_sr(get_conn_fn, nombre, dpi, telefono=None, token=None):
+    """Crea el piloto en SR y, SOLO si SR lo crea, lo guarda en cat_pilotos con su id_sr.
+    Devuelve (estado, datos):
+      ("creado", {"nombre", "id_sr"})
+      ("nombre_existe", mensaje)            -> ya hay un piloto con ese nombre aquí
+      ("dpi_existe_en_sr", {"id_sr", "nombre_sr", "nombre", "telefono"})  -> la persona decide si vincular
+      ("error", mensaje)                    -> no se guardó nada nuevo (salvo el caso que el mensaje aclare)
+    Nunca lanza. No se usa la lista completa de SR en el camino normal (tarda 5-6 s): solo si el DPI ya existe."""
+    from contextlib import closing
+    dpi = solo_digitos(dpi)
+    tel = normalizar_telefono_gt(telefono)
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        nombre_n = _nombre_piloto_normalizado(cur, nombre)
+        cur.execute("SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)", (nombre_n,))
+        if cur.fetchone():
+            return "nombre_existe", (f"Ya existe un piloto llamado «{nombre_n}». Si es otra persona, "
+                                     f"agrégale el segundo apellido para diferenciarlo.")
+    # La conexión ya se cerró: no se queda abierta esperando a SR.
+    cuerpo = {"username": dpi, "password": dpi, "name": nombre_n, "is_driver": True}
+    if tel:
+        cuerpo["phone"] = tel
+    ok, data = _sr_request("POST", "accounts/drivers/", token=token, json=cuerpo)
+    if not ok:
+        texto = str(data).lower()
+        if "username" in texto and "exist" in texto:
+            return _buscar_conductor_sr_por_usuario(dpi, nombre_n, tel, token)
+        return "error", f"SimpliRoute no pudo crear al piloto: {data}"
+    conductor = data[0] if isinstance(data, list) and data else data
+    id_sr = conductor.get("id") if isinstance(conductor, dict) else None
+    if id_sr is None:
+        return "error", ("SimpliRoute respondió bien pero no devolvió el número (id) del piloto. "
+                         "Revisa en SR si quedó creado antes de reintentar.")
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO cat_pilotos (nombre, activo, id_sr, telefono, pendiente_completar, fecha_sincronizacion_sr) "
+                "VALUES (%s, TRUE, %s, %s, FALSE, %s)", (nombre_n, id_sr, tel, datetime.now()))
+            conn.commit()
+    except Exception as e:
+        return "error", (f"El piloto SÍ se creó en SimpliRoute (número {id_sr}) pero falló al guardarse aquí: "
+                         f"{(str(e).splitlines() or ['error'])[0]}. Vuelve a intentarlo con el mismo DPI y te "
+                         f"pedirá vincularlo.")
+    return "creado", {"nombre": nombre_n, "id_sr": id_sr}
+
+
+def vincular_piloto_existente_sr(get_conn_fn, nombre, id_sr, telefono=None):
+    """Guarda un piloto nuevo en cat_pilotos ligado a un conductor que YA existía en SR (no crea nada en SR)."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            nombre_n = _nombre_piloto_normalizado(cur, nombre)
+            cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (id_sr,))
+            fila = cur.fetchone()
+            if fila:
+                return False, f"Ese conductor de SimpliRoute ya está vinculado al piloto «{fila[0]}». Búscalo en la lista de pilotos."
+            cur.execute("SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)", (nombre_n,))
+            if cur.fetchone():
+                return False, f"Ya existe un piloto llamado «{nombre_n}»."
+            cur.execute(
+                "INSERT INTO cat_pilotos (nombre, activo, id_sr, telefono, pendiente_completar, fecha_sincronizacion_sr) "
+                "VALUES (%s, TRUE, %s, %s, FALSE, %s)", (nombre_n, id_sr, normalizar_telefono_gt(telefono), datetime.now()))
+            conn.commit()
+        return True, f"Piloto «{nombre_n}» vinculado con SimpliRoute (número {id_sr})."
+    except Exception as e:
+        return False, f"No se pudo vincular: {(str(e).splitlines() or ['error'])[0]}"
 
 
 def debe_sincronizar(get_conn_fn, proceso, horas=12):
@@ -981,6 +1123,7 @@ def asegurar_esquema_sr(conn):
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS id_sr BIGINT")
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS pendiente_completar BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS telefono TEXT")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS id_sr BIGINT")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS sincronizado_sr BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")

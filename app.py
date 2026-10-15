@@ -1580,7 +1580,7 @@ CATALOGOS_CONFIG = {
                                   "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
     "Transportistas": {"tabla": "cat_transportistas", "columnas": ["nombre", "razon_social", "activo"], "clave": ["nombre"],
                        "numericas": [], "booleanas": ["activo"]},
-    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
+    "Pilotos": {"tabla": "cat_pilotos", "columnas": ["nombre", "telefono", "activo"], "clave": ["nombre"], "numericas": [],
                "booleanas": ["activo"]},
     "Auxiliares": {"tabla": "cat_auxiliares", "columnas": ["nombre", "activo"], "clave": ["nombre"], "numericas": [],
                   "booleanas": ["activo"]},
@@ -4448,6 +4448,60 @@ def _tipos_sin_mapear_de_hoy(token_cache_key):
     return sorted({t for r in rutas for t in r["visit_types"] if t not in ya_mapeados})
 
 
+def _alta_piloto_con_sr(valores_form, dpi, dpi_repetido):
+    """Alta de un piloto NUEVO: se crea en SimpliRoute (usuario y contraseña = su DPI) y, solo si SR lo crea,
+    se guarda aquí con el número (id_sr) que SR devuelve. El DPI no se guarda ni se escribe en bitácoras."""
+    nombre = valores_form.get("nombre", "")
+    telefono = valores_form.get("telefono")
+    error = sr_int.validar_datos_piloto(nombre, dpi, dpi_repetido, telefono)
+    if error:
+        st.error(f"❌ {error}")
+        return
+    token_sr = sr_int.obtener_token_sr_desde_vault(get_conn)
+    if not token_sr:
+        st.error("❌ No hay conexión configurada con SimpliRoute, así que todavía no se puede crear el piloto.")
+        return
+    try:
+        with st.spinner("Creando el piloto en SimpliRoute…"):
+            estado, datos = sr_int.crear_piloto_en_sr(get_conn, nombre, dpi, telefono, token=token_sr)
+    except Exception as e_sr:
+        st.error(_error_tecnico(e_sr, "crear_piloto_sr"))
+        return
+    if estado == "creado":
+        registrar_auditoria(usuario_activo, "Crear piloto (con SimpliRoute)", f"Piloto {datos['nombre']} · id_sr={datos['id_sr']}")
+        st.session_state["flash_catalogos"] = (
+            "success", f"✅ Piloto «{datos['nombre']}» creado en SimpliRoute (número {datos['id_sr']}) y en Control de Ruta. "
+                       f"Su usuario y contraseña en SR son su DPI.")
+        st.session_state.catalogos = cargar_catalogos_desde_db()
+        st.rerun()
+    elif estado == "dpi_existe_en_sr":
+        st.session_state["piloto_vincular"] = datos   # se confirma abajo: ¿es la misma persona?
+        st.rerun()
+    else:
+        st.error(f"❌ {datos}")
+
+
+def _confirmar_vinculo_piloto():
+    """Ese DPI ya tenía usuario en SR: la persona confirma si es el mismo piloto antes de vincularlo."""
+    pv = st.session_state.get("piloto_vincular")
+    if not pv:
+        return
+    st.warning(f"SimpliRoute ya tiene un conductor con ese DPI: «{pv['nombre_sr']}» (número {pv['id_sr']}). "
+               f"¿Es la misma persona que «{pv['nombre']}»?")
+    c1, c2 = st.columns(2)
+    if c1.button(":material/link: Sí, vincularlo", key="btn_vincular_piloto", use_container_width=True):
+        ok, msg = sr_int.vincular_piloto_existente_sr(get_conn, pv["nombre"], pv["id_sr"], pv.get("telefono"))
+        if ok:
+            registrar_auditoria(usuario_activo, "Vincular piloto con SimpliRoute", f"Piloto {pv['nombre']} · id_sr={pv['id_sr']}")
+        st.session_state["flash_catalogos"] = ("success" if ok else "error", ("✅ " if ok else "❌ ") + msg)
+        st.session_state.pop("piloto_vincular", None)
+        st.session_state.catalogos = cargar_catalogos_desde_db()
+        st.rerun()
+    if c2.button(":material/close: No, cancelar", key="btn_cancelar_vinculo", use_container_width=True):
+        st.session_state.pop("piloto_vincular", None)
+        st.rerun()
+
+
 def pagina_catalogos():
     if perfil_activo not in ["Administrador", "SuperAdministrador", "Supervisor"]:
         st.info("Tu perfil no tiene acceso a la gestión de catálogos.")
@@ -4680,6 +4734,10 @@ def pagina_catalogos():
                         help="Distribución: varias tiendas por viaje, con pedido y cajas (como hoy). "
                              "Transporte: punto a punto, solo confirmación de entrega."
                     )
+                elif col == "telefono" and catalogo_sel == "Pilotos":
+                    valores_form["telefono"] = st.text_input(
+                        "Teléfono (opcional, 8 dígitos)", key=f"campo_{catalogo_sel}_telefono", max_chars=15,
+                        help="Se guarda en Control de Ruta y se envía a SimpliRoute al crear al piloto.")
                 elif col in config.get("booleanas", []):
                     valores_form[col] = st.checkbox("Activo", value=True, key=f"campo_{catalogo_sel}_{col}",
                                                       help="Desmárcalo para que ya no aparezca en los menús de Despacho, sin borrar su historial.")
@@ -4687,6 +4745,12 @@ def pagina_catalogos():
                     valores_form[col] = st.number_input(col.replace("_", " ").title(), min_value=0.0, step=1.0, key=f"campo_{catalogo_sel}_{col}")
                 else:
                     valores_form[col] = st.text_input(col.replace("_", " ").title(), key=f"campo_{catalogo_sel}_{col}")
+            dpi_piloto, dpi_piloto2 = "", ""
+            if catalogo_sel == "Pilotos":
+                st.caption("Piloto NUEVO: se crea también en SimpliRoute con su DPI como usuario y contraseña. El DPI se envía a SR y "
+                           "NO se guarda en Control de Ruta. Si el piloto ya existe, solo se actualizan sus datos y no hace falta el DPI.")
+                dpi_piloto = st.text_input("DPI del piloto (13 dígitos)", key="piloto_dpi", type="password", max_chars=20)
+                dpi_piloto2 = st.text_input("Repite el DPI", key="piloto_dpi2", type="password", max_chars=20)
             guardar_registro = st.button(":material/save: Guardar Registro", key=f"btn_guardar_{catalogo_sel}")
             if guardar_registro:
                 if config["tabla"] == "cat_camiones" and "placa" in valores_form:
@@ -4696,7 +4760,15 @@ def pagina_catalogos():
                     st.error(f"❌ Debes llenar: {', '.join(faltan_llave)} (son la llave del registro).")
                 elif catalogo_sel == "Rendimiento por Camión" and not re.match(r"^\d{2}TM$", valores_form.get("tipo", "")):
                     st.error("❌ El tipo debe tener el formato exacto ##TM (ej. 05TM, 10TM, 15TM) — dos dígitos, sin espacios.")
+                elif catalogo_sel == "Pilotos" and str(valores_form.get("telefono") or "").strip() \
+                        and sr_int.normalizar_telefono_gt(valores_form.get("telefono")) is None:
+                    st.error("❌ El teléfono debe tener 8 dígitos (o déjalo vacío).")
+                elif catalogo_sel == "Pilotos" and sr_int.piloto_es_nuevo(get_conn, valores_form["nombre"]):
+                    _alta_piloto_con_sr(valores_form, dpi_piloto, dpi_piloto2)
                 else:
+                    if catalogo_sel == "Pilotos":   # piloto que ya existe: se normaliza el teléfono y no se borra el que ya tenía
+                        valores_form["telefono"] = (sr_int.normalizar_telefono_gt(valores_form.get("telefono"))
+                                                    or sr_int.telefono_guardado_piloto(get_conn, valores_form["nombre"]))
                     # Si el registro trae un cliente que todavía no existe en el catálogo
                     # de Clientes, hay que crearlo primero — si no, la llave foránea lo rechaza.
                     # (Solo aplica cuando NO hay alcance limitado — un Supervisor nunca
@@ -4722,6 +4794,9 @@ def pagina_catalogos():
                         st.rerun()
                     else:
                         mostrar_resultado_error(msg, perfil_activo)
+
+            if catalogo_sel == "Pilotos":
+                _confirmar_vinculo_piloto()
 
             if not df_actual.empty:
                 st.markdown("#### 🗑️ Eliminar un registro")
@@ -5203,7 +5278,7 @@ def _autosync_sr_si_toca():
     token = None
     try:
         token = sr_int.obtener_token_sr_desde_vault(get_conn)
-        if token and sr_int.debe_sincronizar_pilotos(get_conn, horas=12):
+        if token and sr_int.debe_sincronizar_pilotos(get_conn, horas=24):
             ok, msg = sr_int.sincronizar_pilotos_desde_sr(get_conn, token=token)
             if not ok:
                 print(f"[SR autosync pilotos] {msg}")
