@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from contextlib import closing
 import time
 import integracion_simpliroute as sr_int
+import plan_transporte as plan_tr
 
 
 # --- VERSIÓN DE LA APP ---
@@ -1199,6 +1200,11 @@ def init_db():
             conn.rollback()
         try:
             sr_int.asegurar_esquema_formato(conn)
+        except Exception:
+            conn.rollback()
+        # Plan de Transporte (planes, viajes y paradas). Vive en plan_transporte.py; si fallara, la app arranca igual.
+        try:
+            plan_tr.asegurar_esquema_plan(conn)
         except Exception:
             conn.rollback()
 
@@ -2763,7 +2769,7 @@ except ERRORES_DE_CONEXION as e:
 if not _cuenta_activa:
     st.error("🚫 Tu cuenta fue desactivada. Contacta a un Administrador si crees que es un error.")
     for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password",
-              "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo"):
+              "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo", "modo_plan_transporte"):
         st.session_state.pop(k, None)
     st.stop()
 
@@ -2777,7 +2783,7 @@ ultima_actividad = st.session_state.get("ultima_actividad")
 if ultima_actividad and (ahora_actividad - ultima_actividad).total_seconds() > MINUTOS_INACTIVIDAD_MAXIMOS * 60:
     registrar_auditoria(usuario_activo, "Sesión cerrada por inactividad", f"Más de {MINUTOS_INACTIVIDAD_MAXIMOS} minutos sin actividad")
     for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password",
-              "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo", "ultima_actividad"):
+              "login_confirmado", "config_bloqueada", "cliente_activo_fijo", "cd_origen_fijo", "modo_plan_transporte", "ultima_actividad"):
         st.session_state.pop(k, None)
     st.warning(f"⏱️ Tu sesión se cerró automáticamente por {MINUTOS_INACTIVIDAD_MAXIMOS} minutos sin actividad. Vuelve a entrar.")
     st.stop()
@@ -2852,7 +2858,7 @@ with st.sidebar.popover(f":material/account_circle: {usuario_activo}", use_conta
         st.session_state["config_bloqueada"] = False
         st.session_state["modo_importar_sr"] = False
         st.session_state.pop("rutas_sr_encontradas", None)
-        for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password", "cliente_activo_fijo", "cd_origen_fijo"):
+        for k in ("usuario_activo_fijo", "perfil_activo_fijo", "debe_cambiar_password", "cliente_activo_fijo", "cd_origen_fijo", "modo_plan_transporte"):
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -2913,6 +2919,21 @@ if not st.session_state.get("config_bloqueada"):
         st.session_state["cd_origen_fijo"] = cd_origen_sel
         st.session_state["config_bloqueada"] = True
         st.rerun()
+    # Segunda puerta: el Plan de Transporte trabaja con VARIOS clientes a la vez, así que se entra directo,
+    # sin elegir uno (y sin entrar y salir de cada cliente). El Despacho normal sigue entrando por la puerta de arriba.
+    try:
+        _puerta_plan = (plan_tr.PLAN_TRANSPORTE_ACTIVO and perfil_activo in plan_tr.PERFILES_PLAN
+                        and bool(plan_tr.clientes_transporte(get_conn, clientes_disp)))
+    except Exception:
+        _puerta_plan = False
+    if _puerta_plan:
+        st.sidebar.markdown("**— o —**")
+        if st.sidebar.button(":material/event_note: Plan de Transporte · todos mis clientes", key="btn_entrar_plan_transporte"):
+            st.session_state["modo_plan_transporte"] = True
+            st.session_state["cliente_activo_fijo"] = "(Plan de Transporte)"
+            st.session_state["cd_origen_fijo"] = ""
+            st.session_state["config_bloqueada"] = True
+            st.rerun()
     st.info("👈 Selecciona el Cliente (y el CD Origen si el cliente tiene más de uno) en la "
             "barra lateral, y confirma para comenzar a trabajar.")
     st.stop()
@@ -2926,17 +2947,24 @@ tipo_operacion_actual = st.session_state.catalogos.get("tipo_operacion_por_cd", 
 )
 es_transporte = tipo_operacion_actual == "Transporte"
 
-with st.sidebar.popover(f":material/my_location: {cliente_activo} · CD {cd_origen_fijo}", use_container_width=True):
+_en_modo_plan = st.session_state.get("modo_plan_transporte", False)
+with st.sidebar.popover((":material/event_note: Plan de Transporte · todos mis clientes" if _en_modo_plan
+                         else f":material/my_location: {cliente_activo} · CD {cd_origen_fijo}"), use_container_width=True):
     if es_transporte:
         st.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
-    if st.button(":material/swap_horiz: Cambiar Cliente / CD", key="btn_cambiar_cliente_sidebar", use_container_width=True):
+    if st.button((":material/swap_horiz: Salir del Plan de Transporte" if _en_modo_plan
+                  else ":material/swap_horiz: Cambiar Cliente / CD"), key="btn_cambiar_cliente_sidebar", use_container_width=True):
+        st.session_state.pop("modo_plan_transporte", None)
         st.session_state["config_bloqueada"] = False
         st.session_state["modo_importar_sr"] = False
         st.session_state.pop("rutas_sr_encontradas", None)
         del st.session_state["cliente_activo_fijo"]
         del st.session_state["cd_origen_fijo"]
         st.rerun()
-    st.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
+    if _en_modo_plan:
+        st.caption("Aquí ves todos tus clientes de Transporte. Para crear un viaje en Despacho, sal y elige el cliente.")
+    else:
+        st.caption("⚠️ Si tienes un viaje a medio llenar sin guardar, se pierde al cambiar de cliente.")
 
 # Barra superior — vuelve a ser HTML puro (sin widgets mezclados), porque ya
 # no necesita ningún botón adentro. Se queda con una línea de solo lectura
@@ -5352,16 +5380,37 @@ if st.session_state.get("_modo_base_vacia"):
     pagina_catalogos()
     st.stop()
 
+def pagina_plan_transporte():
+    """Plan de Transporte: carga de planes por Excel, asignación de camiones y seguimiento (todo en plan_transporte.py)."""
+    plan_tr.render(st, get_conn, usuario_activo, perfil_activo,
+                   clientes_permitidos_para(usuario_activo, perfil_activo),
+                   lambda: sr_int.obtener_token_sr_desde_vault(get_conn),
+                   error_fn=_error_tecnico, mostrar_error_fn=mostrar_resultado_error)
+
+
 _PAGINA_GESTION_VIAJES = st.Page(pagina_gestion_viajes, title="Gestión de Viajes", icon=":material/edit_document:")
-pagina_actual = st.navigation([
-    st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:"),
+_PAGINA_DESPACHO = st.Page(pagina_despacho, title="Despacho (Salidas)", icon=":material/local_shipping:")
+_PAGINAS_RESTO = [
     st.Page(pagina_liquidaciones, title="Recepción (Liquidaciones)", icon=":material/receipt_long:"),
     _PAGINA_GESTION_VIAJES,
     st.Page(pagina_reportes, title="Reportes", icon=":material/bar_chart:"),
     st.Page(pagina_catalogos, title="Catálogos", icon=":material/settings:"),
     st.Page(pagina_usuarios, title="Usuarios", icon=":material/manage_accounts:"),
     st.Page(pagina_dashboards, title="Dashboards", icon=":material/dashboard:"),
-])
+]
+_en_modo_plan = st.session_state.get("modo_plan_transporte", False)
+try:
+    _tiene_plan = bool(plan_tr.PLAN_TRANSPORTE_ACTIVO and perfil_activo in plan_tr.PERFILES_PLAN and (
+        _en_modo_plan or plan_tr.clientes_transporte(get_conn, clientes_permitidos_para(usuario_activo, perfil_activo))))
+except Exception:
+    _tiene_plan = _en_modo_plan
+_PAGINA_PLAN = st.Page(pagina_plan_transporte, title="Plan de Transporte", icon=":material/event_note:")
+if _en_modo_plan:
+    # En este modo no hay cliente activo: se muestran todas las páginas que no dependen de uno (todas menos Despacho).
+    _paginas_menu = ([_PAGINA_PLAN] if _tiene_plan else []) + _PAGINAS_RESTO
+else:
+    _paginas_menu = [_PAGINA_DESPACHO] + ([_PAGINA_PLAN] if _tiene_plan else []) + _PAGINAS_RESTO
+pagina_actual = st.navigation(_paginas_menu)
 try:
     _flash_sr = st.session_state.pop("flash_sr", None)
     if _flash_sr:

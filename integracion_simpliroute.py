@@ -1367,6 +1367,19 @@ def preparar_auxiliar_libre(cur, texto):
     return nombre
 
 
+def _es_dummy_de_transporte(cur, id_veh):
+    """True si ese vehículo de SR es el dummy de un cliente de Transporte (Plan de Transporte): es el provisional,
+    así que no se prellena ni se avisa. Si la tabla no existe todavía o algo falla, devuelve False (todo sigue igual)."""
+    try:
+        cur.execute("SELECT to_regclass('cat_transporte_cliente') IS NOT NULL")
+        if not cur.fetchone()[0]:
+            return False
+        cur.execute("SELECT 1 FROM cat_transporte_cliente WHERE vehiculo_dummy_sr = %s LIMIT 1", (id_veh,))
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 def resolver_ruta_para_formulario(get_conn_fn, ruta):
     """Al usar una Ruta importada de SR: decide qué camión y piloto prellenar en el formulario.
     Devuelve {"placa": str|None, "piloto": str|None, "sin_piloto": bool, "avisos": [str]}.
@@ -1384,7 +1397,8 @@ def resolver_ruta_para_formulario(get_conn_fn, ruta):
         with closing(get_conn_fn()) as conn, conn.cursor() as cur:
             # ---- Camión ----
             id_veh, placa_sr = ruta.get("vehicle_sr_id"), ruta.get("vehicle_placa_sr")
-            if id_veh is not None and not (placa_sr is not None and es_placa_dummy_sr(placa_sr)):
+            if (id_veh is not None and not (placa_sr is not None and es_placa_dummy_sr(placa_sr))
+                    and not _es_dummy_de_transporte(cur, id_veh)):
                 cur.execute("SELECT placa, activo FROM cat_camiones WHERE id_sr = %s", (id_veh,))
                 fila = cur.fetchone()
                 if not fila and placa_sr:
