@@ -1614,6 +1614,9 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
         st.warning("Modo prueba activo: los planes se crean como '… -PRUEBA' y no cuentan en el seguimiento real.", icon="🧪")
 
     secciones = ["Asignar camiones", "Cargar plan", "Seguimiento"] + (["Configuración"] if perfil in PERFILES_CONFIG else [])
+    if not cfgs and perfil in PERFILES_CONFIG:
+        st.session_state.setdefault("plan_seccion", "Configuración")     # primera vez: directo a configurar
+        st.info("Primer paso: configura en esta pestaña los clientes de Transporte (cliente de Control de Ruta, vehículo dummy en SR y depósito).")
     sec = st.radio("Sección", secciones, horizontal=True, key="plan_seccion", label_visibility="collapsed")
     try:
         if sec == "Configuración":

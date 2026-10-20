@@ -2922,8 +2922,10 @@ if not st.session_state.get("config_bloqueada"):
     # Segunda puerta: el Plan de Transporte trabaja con VARIOS clientes a la vez, así que se entra directo,
     # sin elegir uno (y sin entrar y salir de cada cliente). El Despacho normal sigue entrando por la puerta de arriba.
     try:
+        # Un Administrador siempre la ve (la configuración de los clientes de Transporte vive dentro de esa pantalla).
         _puerta_plan = (plan_tr.PLAN_TRANSPORTE_ACTIVO and perfil_activo in plan_tr.PERFILES_PLAN
-                        and bool(plan_tr.clientes_transporte(get_conn, clientes_disp)))
+                        and (perfil_activo in plan_tr.PERFILES_CONFIG
+                             or bool(plan_tr.clientes_transporte(get_conn, clientes_disp))))
     except Exception:
         _puerta_plan = False
     if _puerta_plan:
@@ -5401,7 +5403,8 @@ _PAGINAS_RESTO = [
 _en_modo_plan = st.session_state.get("modo_plan_transporte", False)
 try:
     _tiene_plan = bool(plan_tr.PLAN_TRANSPORTE_ACTIVO and perfil_activo in plan_tr.PERFILES_PLAN and (
-        _en_modo_plan or plan_tr.clientes_transporte(get_conn, clientes_permitidos_para(usuario_activo, perfil_activo))))
+        _en_modo_plan or perfil_activo in plan_tr.PERFILES_CONFIG
+        or plan_tr.clientes_transporte(get_conn, clientes_permitidos_para(usuario_activo, perfil_activo))))
 except Exception:
     _tiene_plan = _en_modo_plan
 _PAGINA_PLAN = st.Page(pagina_plan_transporte, title="Plan de Transporte", icon=":material/event_note:")
