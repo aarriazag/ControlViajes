@@ -2944,14 +2944,13 @@ if not st.session_state.get("config_bloqueada"):
     # sin elegir uno (y sin entrar y salir de cada cliente). El Despacho normal sigue entrando por la puerta de arriba.
     try:
         # Un Administrador siempre la ve (la configuración de los clientes de Transporte vive dentro de esa pantalla).
-        _puerta_plan = (plan_tr.PLAN_TRANSPORTE_ACTIVO and perfil_activo in plan_tr.PERFILES_PLAN
-                        and (perfil_activo in plan_tr.PERFILES_CONFIG
-                             or bool(plan_tr.clientes_transporte(get_conn, clientes_disp))))
+        # Solo quien tiene acceso a clientes de Transporte (o un Administrador mientras aún no haya ninguno configurado).
+        _puerta_plan = plan_tr.tiene_acceso(get_conn, perfil_activo, clientes_disp)
     except Exception:
         _puerta_plan = False
     if _puerta_plan:
         st.sidebar.markdown("**— o —**")
-        if st.sidebar.button(":material/event_note: Plan de Transporte · todos mis clientes", key="btn_entrar_plan_transporte"):
+        if st.sidebar.button(":material/event_note: Plan de Transporte", key="btn_entrar_plan_transporte"):
             st.session_state["modo_plan_transporte"] = True
             st.session_state["cliente_activo_fijo"] = "(Plan de Transporte)"
             st.session_state["cd_origen_fijo"] = ""
@@ -2971,7 +2970,7 @@ tipo_operacion_actual = st.session_state.catalogos.get("tipo_operacion_por_cd", 
 es_transporte = tipo_operacion_actual == "Transporte"
 
 _en_modo_plan = st.session_state.get("modo_plan_transporte", False)
-with st.sidebar.popover((":material/event_note: Plan de Transporte · todos mis clientes" if _en_modo_plan
+with st.sidebar.popover((":material/event_note: Plan de Transporte" if _en_modo_plan
                          else f":material/my_location: {cliente_activo} · CD {cd_origen_fijo}"), use_container_width=True):
     if es_transporte:
         st.caption("🚚 Este origen es de Transporte — Despacho pide solo destino y entrega, sin pedidos.")
@@ -5451,11 +5450,9 @@ _PAGINAS_RESTO = [
 ]
 _en_modo_plan = st.session_state.get("modo_plan_transporte", False)
 try:
-    _tiene_plan = bool(plan_tr.PLAN_TRANSPORTE_ACTIVO and perfil_activo in plan_tr.PERFILES_PLAN and (
-        _en_modo_plan or perfil_activo in plan_tr.PERFILES_CONFIG
-        or plan_tr.clientes_transporte(get_conn, clientes_permitidos_para(usuario_activo, perfil_activo))))
+    _tiene_plan = plan_tr.tiene_acceso(get_conn, perfil_activo, clientes_permitidos_para(usuario_activo, perfil_activo))
 except Exception:
-    _tiene_plan = _en_modo_plan
+    _tiene_plan = False
 _PAGINA_PLAN = st.Page(pagina_plan_transporte, title="Plan de Transporte", icon=":material/event_note:")
 if _en_modo_plan:
     # En este modo no hay cliente activo: se muestran todas las páginas que no dependen de uno (todas menos Despacho).

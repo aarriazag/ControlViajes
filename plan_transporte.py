@@ -282,6 +282,26 @@ def clientes_transporte(get_conn_fn, permitidos=None):
     return [c for c in cfgs if c["cliente"] in ok]
 
 
+def hay_clientes_transporte(get_conn_fn):
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM cat_transporte_cliente WHERE activo LIMIT 1")
+        return cur.fetchone() is not None
+
+
+def tiene_acceso(get_conn_fn, perfil, clientes_permitidos):
+    """¿Este usuario puede entrar al Plan de Transporte? Solo si su perfil lo permite Y tiene acceso a al menos un cliente de Transporte
+    configurado. Única excepción: un Administrador, mientras NO exista ningún cliente de Transporte configurado en todo el sistema
+    (para poder hacer la primera configuración). Nunca lanza."""
+    if not PLAN_TRANSPORTE_ACTIVO or perfil not in PERFILES_PLAN:
+        return False
+    try:
+        if clientes_transporte(get_conn_fn, clientes_permitidos):
+            return True
+        return perfil in PERFILES_CONFIG and not hay_clientes_transporte(get_conn_fn)
+    except Exception:
+        return False
+
+
 def guardar_config(get_conn_fn, datos, usuario):
     """Crea o actualiza la configuración de un Cliente Orden. Devuelve (ok, mensaje)."""
     co = _txt(datos.get("cliente_orden"))
@@ -501,7 +521,7 @@ def _clave_destino(codigo, destino):
 # ---------------------------------------------------------------------------
 # Validación (devuelve las filas con errores/avisos; NO guarda nada)
 # ---------------------------------------------------------------------------
-def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, hoy=None):
+def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, hoy=None, clientes_permitidos=None):
     hoy = hoy or hoy_guatemala()
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
         cur.execute("SELECT cliente_orden, cliente, vehiculo_dummy_sr, deposito_nombre, deposito_lat, deposito_lon, "
@@ -545,6 +565,9 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                 f["errores"].append("Falta el Cliente Orden.")
             elif not c:
                 f["errores"].append(f"El Cliente Orden '{co_raw}' no está configurado para Transporte (Configuración).")
+            if c and clientes_permitidos is not None and c["cliente"] not in set(clientes_permitidos):
+                f["errores"].append(f"No tienes acceso al cliente '{c['cliente']}' (Cliente Orden {c['cliente_orden']}).")
+                c = None
             f["cliente_orden"] = c["cliente_orden"] if c else co_raw
             f["cliente"] = c["cliente"] if c else None
             # --- fecha ---
@@ -1066,15 +1089,21 @@ def detalle_plan(get_conn_fn, plan_id):
     return {"plan": dict(p), "viajes": viajes}
 
 
-def listar_cargas(get_conn_fn, prueba, limite=10):
-    """Últimas plantillas cargadas (más nueva primero): [{id, archivo, momento, usuario, filas}]."""
+def listar_cargas(get_conn_fn, prueba, limite=10, clientes=None):
+    """Últimas plantillas cargadas (más nueva primero): [{id, archivo, momento, usuario, filas}]. Con `clientes`, solo las plantillas que
+    tienen paradas de esos clientes (nadie ve plantillas de clientes a los que no tiene acceso)."""
+    filtro, params = "", [bool(prueba)]
+    if clientes is not None:
+        filtro = (" AND EXISTS (SELECT 1 FROM plan_parada pa JOIN plan_transporte p ON p.id = pa.plan_id "
+                  "WHERE pa.carga_id = plan_carga.id AND p.cliente = ANY(%s))")
+        params.append(list(clientes))
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, archivo, momento, usuario, filas FROM plan_carga WHERE prueba = %s ORDER BY id DESC LIMIT %s",
-                    (bool(prueba), limite))
+        cur.execute(f"SELECT id, archivo, momento, usuario, filas FROM plan_carga WHERE prueba = %s{filtro} ORDER BY id DESC LIMIT %s",
+                    params + [limite])
         return [dict(id=a, archivo=b, momento=c, usuario=d, filas=e) for a, b, c, d, e in cur.fetchall()]
 
 
-def estado_carga(get_conn_fn, carga_id):
+def estado_carga(get_conn_fn, carga_id, clientes=None):
     """Qué tan enviada está una plantilla. Un plan cuenta como «enviado» cuando existe en SR y ya no le queda ninguna parada de
     esa plantilla por enviar. Devuelve {planes: [...], planes_total, planes_enviados, paradas_total, paradas_enviadas}."""
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
@@ -1084,7 +1113,9 @@ def estado_carga(get_conn_fn, carga_id):
                    COUNT(*) FILTER (WHERE pa.estado = 'en_sr'),
                    COUNT(*) FILTER (WHERE pa.estado IN ('pendiente','enviando','error'))
             FROM plan_parada pa JOIN plan_transporte p ON p.id = pa.plan_id
-            WHERE pa.carga_id = %s GROUP BY p.id ORDER BY p.fecha, p.cliente""", (carga_id,))
+            WHERE pa.carga_id = %s AND (%s::text[] IS NULL OR p.cliente = ANY(%s))
+            GROUP BY p.id ORDER BY p.fecha, p.cliente""", (carga_id, list(clientes) if clientes is not None else None,
+                                                          list(clientes) if clientes is not None else None))
         planes = []
         for pid, nombre, cliente, co, fecha, plan_sr, activas, en_sr, pend in cur.fetchall():
             if not activas:
@@ -2114,6 +2145,10 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
     if not asegurar_esquema_una_vez(get_conn_fn):
         st.error("No se pudo preparar la base de datos del Plan de Transporte. Avísale a un Administrador.")
         return
+    if not tiene_acceso(get_conn_fn, perfil, clientes_permitidos):
+        st.warning("No tienes acceso al Plan de Transporte: no tienes clientes de Transporte asignados. "
+                   "Si lo necesitas, pídele a un Administrador que te los asigne.")
+        return
 
     def _falla(e, ctx):
         if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
@@ -2153,7 +2188,7 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
         elif sec == "Asignar camiones":
             _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, _falla)
         elif sec == "Cargar plan":
-            _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, _falla)
+            _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, _falla, clientes_permitidos)
         else:
             _seccion_seguimiento(st, get_conn_fn, cfgs, clientes_permitidos, prueba)
     except Exception as e:
@@ -2161,12 +2196,12 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
 
 
 # ---------------------------------------------------------------------------
-def _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba):
+def _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba, clientes=None):
     """Indicador «X de Y planes enviados a SimpliRoute» de la plantilla (carga de Excel) elegida, con su botón de enviar."""
     import pandas as pd
     from datetime import timezone
     from zoneinfo import ZoneInfo
-    cargas = listar_cargas(get_conn_fn, prueba)
+    cargas = listar_cargas(get_conn_fn, prueba, clientes=clientes)
     if not cargas:
         return
     ids = [c["id"] for c in cargas]
@@ -2179,7 +2214,7 @@ def _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba):
         m = c["momento"].replace(tzinfo=timezone.utc).astimezone(ZoneInfo("America/Guatemala")) if c["momento"] else None
         return f"{c['archivo']}  ·  {m:%d/%m %H:%M}" if m else c["archivo"]
     sel = st.selectbox("Plantilla cargada", ids, key="plan_sel_carga", format_func=_etq)
-    est = estado_carga(get_conn_fn, sel)
+    est = estado_carga(get_conn_fn, sel, clientes=clientes)
     if not est["planes"]:
         return
     total, env = est["planes_total"], est["planes_enviados"]
@@ -2214,7 +2249,7 @@ def _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba):
 
 def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     hoy = hoy_guatemala()
-    _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba)
+    _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba, clientes=[c["cliente"] for c in cfgs])
     f1, f2 = st.columns([3, 1])
     opciones = ["Todos mis clientes"] + [c["cliente_orden"] for c in cfgs]
     sel = f1.selectbox("Cliente", opciones, key="plan_f_cliente")
@@ -2436,7 +2471,7 @@ def _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla):
 
 
 # ---------------------------------------------------------------------------
-def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
+def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla, clientes_permitidos=None):
     import hashlib
     import pandas as pd
 
@@ -2450,7 +2485,7 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
         sig = (hashlib.md5(datos).hexdigest(), bool(prueba), bool(permitir))
         if st.session_state.get("plan_up_sig") != sig:
             filas, errs_glob = leer_excel_plan(datos)
-            val = validar_filas(get_conn_fn, filas, prueba=prueba, permitir_repetidas=permitir) if filas else []
+            val = validar_filas(get_conn_fn, filas, prueba=prueba, permitir_repetidas=permitir, clientes_permitidos=clientes_permitidos) if filas else []
             st.session_state.update(plan_up_sig=sig, plan_up_val=val, plan_up_errs=errs_glob)
         val, errs_glob = st.session_state.get("plan_up_val", []), st.session_state.get("plan_up_errs", [])
         for e in errs_glob:
@@ -2528,7 +2563,7 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
             if st.button("Agregar parada", key="plan_m_btn"):
                 tienda, codigo = tiendas[ti]
                 fila = fila_manual(co, fe, str(codigo) if codigo is not None else tienda, tienda, grupo=int(gr) or None, obs=obs, placa=veh_m or "")
-                v = validar_filas(get_conn_fn, [fila], prueba=prueba, permitir_repetidas=permitir)
+                v = validar_filas(get_conn_fn, [fila], prueba=prueba, permitir_repetidas=permitir, clientes_permitidos=clientes_permitidos)
                 if not v[0]["ok"]:
                     for e in v[0]["errores"]:
                         st.error(e)
