@@ -19,6 +19,7 @@ Principios (iguales al resto de la integración con SR):
 """
 import io
 import re
+import time as _time
 import unicodedata
 import warnings
 from contextlib import closing
@@ -1123,6 +1124,60 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
         return {**res, "ok": False, "mensaje": f"Error inesperado al enviar a SR ({type(e).__name__}).", "excepcion": e}
 
 
+PRESUPUESTO_ENVIO_SEGUNDOS = 100     # tiempo máximo de un clic de "enviar todos"; si falta algo, se avisa y se vuelve a presionar
+
+
+def enviar_planes(get_conn_fn, plan_ids, usuario, token=None, presupuesto=None, max_unidades=None):
+    """Envía a SR varios planes seguidos (todos los de una fecha). Por cada plan repite los lotes hasta terminar, se
+    detiene si no hay avance o si se acaba el tiempo, y un plan con errores NO frena a los demás.
+    Devuelve (resumen, ok): resumen = lista de dicts {plan_id, plan, cliente, cliente_orden, plan_nuevo_en_sr, rutas,
+    paradas, pendientes, errores, notas, mensaje}."""
+    presupuesto = PRESUPUESTO_ENVIO_SEGUNDOS if presupuesto is None else presupuesto
+    t0 = _time.time()
+    resumen, todo_ok = [], True
+    for pid in plan_ids:
+        d = detalle_plan(get_conn_fn, pid)
+        if not d:
+            continue
+        plan = d["plan"]
+        fila = {"plan_id": pid, "plan": plan["nombre"], "cliente": plan["cliente"], "cliente_orden": plan["cliente_orden"],
+                "plan_nuevo_en_sr": False, "rutas": 0, "paradas": 0, "pendientes": 0, "errores": [], "notas": [], "mensaje": ""}
+        vp, pp = pendientes_de_envio(d)
+        fila["pendientes"] = vp + pp
+        if not plan.get("plan_id_sr") and (vp + pp) > 0:
+            fila["plan_nuevo_en_sr"] = True
+        if (vp + pp) == 0:
+            fila["mensaje"] = "Ya estaba todo enviado."
+            resumen.append(fila)
+            continue
+        while True:
+            if _time.time() - t0 > presupuesto:
+                fila["mensaje"] = "Se acabó el tiempo de este envío; presiona de nuevo para continuar."
+                break
+            r = enviar_plan_a_sr(get_conn_fn, pid, usuario, token=token, max_unidades=max_unidades)
+            fila["rutas"] += r["rutas"]
+            fila["paradas"] += r["paradas"]
+            fila["pendientes"] = r["pendientes"]
+            fila["errores"] += r["errores"]
+            fila["notas"] += r["notas"]
+            fila["mensaje"] = r["mensaje"]
+            if not r["ok"] and r["rutas"] == 0 and r["paradas"] == 0:
+                break                                   # sin avance: no tiene caso repetir
+            if r["pendientes"] == 0:
+                break
+        if fila["errores"] or fila["pendientes"]:
+            todo_ok = False
+        if fila["plan_nuevo_en_sr"]:
+            with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+                cur.execute("SELECT plan_id_sr FROM plan_transporte WHERE id = %s", (pid,))
+                x = cur.fetchone()
+                fila["plan_nuevo_en_sr"] = bool(x and x[0])
+        resumen.append(fila)
+    _registrar(get_conn_fn, usuario, "enviar_todos", None, None,
+               "; ".join(f"{f['cliente']}: {f['rutas']} ruta(s), {f['paradas']} visita(s), {f['pendientes']} pendiente(s)" for f in resumen))
+    return resumen, todo_ok
+
+
 def _registrar(get_conn_fn, usuario, accion, plan_id=None, viaje_id=None, detalle=""):
     try:
         with closing(get_conn_fn()) as conn, conn.cursor() as cur:
@@ -1668,6 +1723,7 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     if not planes:
         st.info(f"No hay planes{' de prueba' if prueba else ''} para el {fecha:%d/%m/%Y} con ese cliente.")
         return
+    _enviar_todos(st, get_conn_fn, usuario, token_fn, planes, fecha)
     if len(planes) > 1:
         idx = st.selectbox("Plan", range(len(planes)), format_func=lambda i: f"{planes[i]['nombre']}  ·  {planes[i]['viajes']} viaje(s)", key="plan_sel_plan")
         plan = planes[idx]
@@ -1739,6 +1795,43 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     opts = _opciones_asignacion(get_conn_fn)
     for v in viajes:
         _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla)
+
+
+def _enviar_todos(st, get_conn_fn, usuario, token_fn, planes, fecha):
+    """Botón principal: sube a SR TODOS los planes de esa fecha (de los clientes filtrados) y dice cuántos subió de cada cliente."""
+    import pandas as pd
+    res = st.session_state.pop("plan_resumen_envio", None)
+    if res:
+        ok_n = sum(1 for f in res if (f["rutas"] or f["paradas"]) and not f["pendientes"] and not f["errores"])
+        st.success(f"Resultado del envío: {ok_n} de {len(res)} plan(es) quedaron completos en SimpliRoute.") if ok_n == len(res) else \
+            st.warning(f"Resultado del envío: {ok_n} de {len(res)} plan(es) completos. Revisa los que tienen pendientes o errores.")
+        st.dataframe(pd.DataFrame([{
+            "Cliente": f["cliente"], "Plan": f["plan"],
+            "Plan en SR": "Creado ahora" if f["plan_nuevo_en_sr"] else "Ya existía",
+            "Rutas enviadas": str(f["rutas"]), "Visitas enviadas": str(f["paradas"]), "Pendientes": str(f["pendientes"]),
+            "Detalle": (f["errores"][0] if f["errores"] else f["mensaje"])} for f in res]), hide_index=True, use_container_width=True)
+        for f in res:
+            for e in f["errores"][1:6]:
+                st.caption(f"⚠️ {f['cliente']}: {e}")
+    pend_planes, pend_total = 0, 0
+    for pl in planes:
+        d = detalle_plan(get_conn_fn, pl["id"])
+        vp, pp = pendientes_de_envio(d) if d else (0, 0)
+        if vp + pp:
+            pend_planes += 1
+            pend_total += vp + pp
+    etiqueta = (f":material/cloud_upload: Enviar todos los planes del {fecha:%d/%m} a SR ({pend_planes} plan(es) con pendientes)"
+                if pend_planes else f"Todos los planes del {fecha:%d/%m} ya están enviados a SR")
+    if st.button(etiqueta, key="plan_env_todos", type="primary" if pend_planes else "secondary", disabled=not pend_planes,
+                 use_container_width=True, help="Sube a SimpliRoute todos los planes de esta fecha, uno por cliente, y al final te dice cuántos subió de cada uno."):
+        token = token_fn()
+        if not token:
+            _flash(st, "error", "No hay token de SimpliRoute configurado.")
+        else:
+            with st.spinner("Enviando los planes a SimpliRoute… (puede tardar un poco)"):
+                resumen, _ok = enviar_planes(get_conn_fn, [pl["id"] for pl in planes], usuario, token=token)
+            st.session_state["plan_resumen_envio"] = resumen
+        st.rerun()
 
 
 def _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla):
