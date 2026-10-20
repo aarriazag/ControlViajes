@@ -799,6 +799,14 @@ def listar_planes(get_conn_fn, clientes_orden=None, fecha_ini=None, fecha_fin=No
         return [dict(r) for r in cur.fetchall()]
 
 
+def fechas_con_plan(get_conn_fn, clientes_orden, prueba, desde, limite=60):
+    """Fechas (desde `desde` en adelante) que tienen al menos un plan de esos clientes. Sirve para no tener que adivinar la fecha."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT fecha FROM plan_transporte WHERE prueba = %s AND cliente_orden = ANY(%s) AND fecha >= %s "
+                    "ORDER BY fecha LIMIT %s", (bool(prueba), list(clientes_orden), desde, limite))
+        return [r[0] for r in cur.fetchall()]
+
+
 def detalle_plan(get_conn_fn, plan_id):
     """{'plan': {...}, 'viajes': [{..., 'paradas': [...]}]}  (los cancelados al final)."""
     import psycopg2.extras
@@ -1613,6 +1621,9 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
     if prueba:
         st.warning("Modo prueba activo: los planes se crean como '… -PRUEBA' y no cuentan en el seguimiento real.", icon="🧪")
 
+    ir_a = st.session_state.pop("plan_ir_a", None)      # tras guardar un plan: directo a asignar, en la fecha de ese plan
+    if ir_a:
+        st.session_state["plan_seccion"], st.session_state["plan_f_fecha_sel"] = ir_a
     secciones = ["Asignar camiones", "Cargar plan", "Seguimiento"] + (["Configuración"] if perfil in PERFILES_CONFIG else [])
     if not cfgs and perfil in PERFILES_CONFIG:
         st.session_state.setdefault("plan_seccion", "Configuración")     # primera vez: directo a configurar
@@ -1640,13 +1651,22 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     f1, f2 = st.columns([3, 1])
     opciones = ["Todos mis clientes"] + [c["cliente_orden"] for c in cfgs]
     sel = f1.selectbox("Cliente", opciones, key="plan_f_cliente")
-    fecha = f2.date_input("Fecha del plan", value=hoy, key="plan_f_fecha", format="DD/MM/YYYY")
     cos = [c["cliente_orden"] for c in cfgs] if sel == opciones[0] else [sel]
+    fechas = fechas_con_plan(get_conn_fn, cos, prueba, hoy - timedelta(days=7))
+    if not fechas:
+        st.info(f"No hay planes{' de prueba' if prueba else ''} cargados desde hace una semana en adelante. "
+                "Cárgalos en la sección 'Cargar plan'.")
+        return
+    if st.session_state.get("plan_f_fecha_sel") not in fechas:
+        st.session_state.pop("plan_f_fecha_sel", None)
+    proximas = [f for f in fechas if f >= hoy]
+    kw = {} if "plan_f_fecha_sel" in st.session_state else {"index": fechas.index(proximas[0] if proximas else fechas[-1])}
+    fecha = f2.selectbox("Fecha del plan", fechas, key="plan_f_fecha_sel", format_func=lambda d: d.strftime("%a %d/%m/%Y"), **kw)
     if _cada(st, "plan_sync_desp", 20):
         sincronizar_despachados(get_conn_fn)
     planes = listar_planes(get_conn_fn, clientes_orden=cos, fecha_ini=fecha, fecha_fin=fecha, prueba=prueba)
     if not planes:
-        st.info(f"No hay planes{' de prueba' if prueba else ''} para el {fecha:%d/%m/%Y}. Cárgalos en la sección 'Cargar plan'.")
+        st.info(f"No hay planes{' de prueba' if prueba else ''} para el {fecha:%d/%m/%Y} con ese cliente.")
         return
     if len(planes) > 1:
         idx = st.selectbox("Plan", range(len(planes)), format_func=lambda i: f"{planes[i]['nombre']}  ·  {planes[i]['viajes']} viaje(s)", key="plan_sel_plan")
@@ -1726,10 +1746,16 @@ def _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla):
     cerrado = v["estado"] in ("despachado", "cancelado")
     paradas_act = [p for p in v["paradas"] if p["estado"] != "cancelada"]
     with st.container(border=True):
-        c0, c1, c2, c3 = st.columns([3.2, 2, 2, 1.3], vertical_alignment="center")
+        c0, c1, c2, c3, c4 = st.columns([3.4, 1.9, 1.9, 1.2, 0.7], vertical_alignment="top")
         titulo = f"**Viaje {v['num']}**" + (f" · grupo {v['grupo']}" if v["grupo"] is not None else "")
+        if len(paradas_act) == 1:
+            titulo += f" · {paradas_act[0]['destino']}"          # un solo destino: va en el mismo renglón
         c0.markdown(f"{titulo}  \n{_ICONO.get(est.split(' ·')[0], '⚪')} {est}")
-        c0.caption(" → ".join(f"{p['orden']}. {p['destino']}" for p in paradas_act) or "(sin paradas activas)")
+        if len(paradas_act) > 1:                                  # varios destinos: todos a la vista, sin abrir nada
+            for p in paradas_act:
+                c0.caption(f"{p['orden']}. {p['destino']}  ·  {p['codigo_pedido']}" + ("  ⚠️" if p.get("error") else ""))
+        elif not paradas_act:
+            c0.caption("(sin paradas activas)")
         if cerrado:
             c1.write(v.get("placa") or "—")
             c2.write(v.get("piloto") or "—")
@@ -1761,40 +1787,40 @@ def _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla):
                 for a in avisos:
                     _flash(st, "warning", a)
                 st.rerun()
-        if v.get("cambiado_en_sr"):
-            st.caption("🔁 Este viaje se cambió directamente en SimpliRoute; Control de Ruta ya lo tomó.")
-        if v.get("error"):
-            st.caption(f"⚠️ {_corto(v['error'], 200)}")
-        if not cerrado:
-            with st.expander(f"Paradas y opciones ({len(paradas_act)})"):
+            with c4.popover("⋯", help="Opciones del viaje", use_container_width=True):
                 for p in v["paradas"]:
-                    a, b, c = st.columns([4, 2, 1.5], vertical_alignment="center")
-                    a.write(f"{p['orden']}. {p['destino']}  \n:gray[{p['codigo_pedido']}]")
-                    b.write({"pendiente": "Por enviar", "enviando": "Por verificar", "en_sr": "En SR", "cancelada": "Cancelada",
-                             "error": "Con error"}.get(p["estado"], p["estado"]))
-                    if p["estado"] != "cancelada" and c.button("Quitar", key=f"plan_qp_{p['id']}", use_container_width=True):
+                    if p["estado"] == "cancelada":
+                        continue
+                    x, y = st.columns([3, 1.4], vertical_alignment="center")
+                    x.write(f"{p['orden']}. {p['destino']}  \n:gray[{p['codigo_pedido']} · "
+                            + {"pendiente": "por enviar", "enviando": "por verificar", "en_sr": "en SR", "error": "con error"}.get(p["estado"], p["estado"]) + "]")
+                    if y.button("Quitar", key=f"plan_qp_{p['id']}", use_container_width=True):
                         ok, msg = cancelar_parada(get_conn_fn, p["id"], usuario, token=token_fn() if p.get("visit_id_sr") else None)
                         _flash(st, "success" if ok else "error", msg)
                         _reiniciar_widgets(st, [v])
                         st.rerun()
-                    if p.get("error"):
-                        st.caption(f"⚠️ {_corto(p['error'], 200)}")
-                kc = f"plan_cv_{v['id']}"
-                if not st.session_state.get(kc):
-                    if st.button("Cancelar todo el viaje", key=f"plan_cvb_{v['id']}"):
-                        st.session_state[kc] = True
-                        st.rerun()
-                else:
-                    st.warning("¿Cancelar el viaje completo? Si ya está en SimpliRoute, se borran su ruta y sus visitas allá.")
-                    s1, s2 = st.columns(2)
-                    if s1.button("Sí, cancelar el viaje", key=f"plan_cvs_{v['id']}", type="primary"):
-                        ok, msg = cancelar_viaje(get_conn_fn, v["id"], usuario, token=token_fn() if v.get("route_id_sr") else None)
-                        st.session_state.pop(kc, None)
-                        _flash(st, "success" if ok else "error", f"Viaje {v['num']}: {msg}")
-                        st.rerun()
-                    if s2.button("No", key=f"plan_cvn_{v['id']}"):
-                        st.session_state.pop(kc, None)
-                        st.rerun()
+                if st.button("Cancelar todo el viaje", key=f"plan_cvb_{v['id']}", use_container_width=True):
+                    st.session_state[f"plan_cv_{v['id']}"] = True
+                    st.rerun()
+        if v.get("cambiado_en_sr"):
+            st.caption("🔁 Este viaje se cambió directamente en SimpliRoute; Control de Ruta ya lo tomó.")
+        if v.get("error"):
+            st.caption(f"⚠️ {_corto(v['error'], 200)}")
+        for p in paradas_act:
+            if p.get("error") and len(paradas_act) > 1:
+                st.caption(f"⚠️ {p['codigo_pedido']}: {_corto(p['error'], 160)}")
+        kc = f"plan_cv_{v['id']}"
+        if not cerrado and st.session_state.get(kc):
+            st.warning("¿Cancelar el viaje completo? Si ya está en SimpliRoute, se borran su ruta y sus visitas allá.")
+            s1, s2 = st.columns(2)
+            if s1.button("Sí, cancelar el viaje", key=f"plan_cvs_{v['id']}", type="primary"):
+                ok, msg = cancelar_viaje(get_conn_fn, v["id"], usuario, token=token_fn() if v.get("route_id_sr") else None)
+                st.session_state.pop(kc, None)
+                _flash(st, "success" if ok else "error", f"Viaje {v['num']}: {msg}")
+                st.rerun()
+            if s2.button("No", key=f"plan_cvn_{v['id']}"):
+                st.session_state.pop(kc, None)
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1824,12 +1850,11 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
             m1.metric("Filas leídas", len(val))
             m2.metric("Válidas", len(ok_f))
             m3.metric("Con error", len(mal))
-            df = pd.DataFrame([{
-                "Fila": str(f["n"]), "Cliente": str(f["cliente_orden"] or ""), "Fecha": f["fecha"].strftime("%d/%m/%Y") if f["fecha"] else "",
-                "G. Ruta": str(f["grupo"]) if f["grupo"] is not None else "", "Destino": str(f["destino"] or ""),
-                "Resultado": "✅ Válida" if f["ok"] else "❌ Con error",
-                "Detalle": " · ".join(f["errores"] + f["avisos"])} for f in val])
-            st.dataframe(df, hide_index=True, use_container_width=True)
+            if mal and not ok_f and all(any("Ya está cargada" in e for e in f["errores"]) for f in val) and any(f["fecha"] for f in val):
+                st.info("Este archivo ya está guardado como plan. Ve a «Asignar camiones» para enviarlo a SimpliRoute y asignar los camiones.")
+                if st.button("Ir a Asignar camiones", key="plan_ir_asig"):
+                    st.session_state["plan_ir_a"] = ("Asignar camiones", min(f["fecha"] for f in val if f["fecha"]))
+                    st.rerun()
             if ok_f:
                 st.markdown("**Se crearía:**")
                 for (co, fe), r in agrupar_para_vista(ok_f).items():
@@ -1837,22 +1862,29 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
             solo_validas = True
             if mal:
                 solo_validas = st.checkbox("Guardar solo las filas válidas (las que tienen error se ignoran)", key="plan_solo_validas")
-            if st.button(":material/save: Guardar plan como borrador", type="primary", key="plan_guardar",
-                         disabled=not ok_f or not solo_validas):
+            if st.button(":material/save: Guardar plan", type="primary", key="plan_guardar", disabled=not ok_f or not solo_validas,
+                         help="Queda guardado como borrador en Control de Ruta; se envía a SimpliRoute desde 'Asignar camiones'."):
                 r = guardar_filas(get_conn_fn, ok_f, usuario, prueba=prueba)
                 if r["ok"]:
                     for pl in r["planes"]:
                         extra = f", {pl['a_viaje_existente']} agregada(s) a un viaje existente" if pl["a_viaje_existente"] else ""
                         _flash(st, "success", f"{pl['nombre']}: {pl['paradas']} parada(s), {pl['viajes_nuevos']} viaje(s) nuevo(s){extra}.")
-                    _flash(st, "info", "Quedó como borrador. Ve a 'Asignar camiones' para enviarlo a SimpliRoute.")
+                    _flash(st, "info", "Plan guardado. Aquí lo ves para enviarlo a SimpliRoute y asignar camiones.")
                     for k in ("plan_up_sig", "plan_up_val", "plan_up_errs", "plan_solo_validas"):
                         st.session_state.pop(k, None)
                     st.session_state["plan_up_n"] = n_up + 1          # vacía el cargador y libera el archivo
+                    st.session_state["plan_ir_a"] = ("Asignar camiones", min(f["fecha"] for f in ok_f))
                     st.rerun()
                 else:
                     st.error(r["mensaje"])
                     if r.get("excepcion") is not None:
                         falla(r["excepcion"], "plan_guardar")
+            df = pd.DataFrame([{
+                "Fila": str(f["n"]), "Cliente": str(f["cliente_orden"] or ""), "Fecha": f["fecha"].strftime("%d/%m/%Y") if f["fecha"] else "",
+                "G. Ruta": str(f["grupo"]) if f["grupo"] is not None else "", "Destino": str(f["destino"] or ""),
+                "Resultado": "✅ Válida" if f["ok"] else "❌ Con error",
+                "Detalle": " · ".join(f["errores"] + f["avisos"])} for f in val])
+            st.dataframe(df, hide_index=True, use_container_width=True)
     else:
         for k in ("plan_up_sig", "plan_up_val", "plan_up_errs"):
             st.session_state.pop(k, None)
