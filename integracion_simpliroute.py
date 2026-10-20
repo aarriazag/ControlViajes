@@ -1375,6 +1375,19 @@ def _es_dummy_de_transporte(cur, id_veh):
         if not cur.fetchone()[0]:
             return False
         cur.execute("SELECT 1 FROM cat_transporte_cliente WHERE vehiculo_dummy_sr = %s LIMIT 1", (id_veh,))
+        if cur.fetchone() is not None:
+            return True
+        # Grupo de dummies (DC01, DC02...): el vehículo es dummy si su nombre es el prefijo de un cliente + número.
+        cur.execute("""SELECT 1 FROM cat_camiones c JOIN cat_transporte_cliente t ON t.dummy_prefijo IS NOT NULL
+                       WHERE c.id_sr = %s AND UPPER(REGEXP_REPLACE(c.placa, '[^A-Za-z0-9]', '', 'g')) ~ ('^' || UPPER(t.dummy_prefijo) || '[0-9]+$')
+                       LIMIT 1""", (id_veh,))
+        if cur.fetchone() is not None:
+            return True
+        # Genéricos ADICIONALES… (los que usan los clientes sin dummies propios)
+        cur.execute("""SELECT 1 FROM cat_camiones WHERE id_sr = %s AND (
+                           UPPER(REGEXP_REPLACE(placa, '[^A-Za-z0-9]', '', 'g')) LIKE 'ADICIONALES%%'
+                           OR (COALESCE(activo, FALSE) = FALSE
+                               AND UPPER(REGEXP_REPLACE(placa, '[^A-Za-z0-9]', '', 'g')) ~ '^[A-Z]{2,}[0-9]+[A-Z]*$')) LIMIT 1""", (id_veh,))
         return cur.fetchone() is not None
     except Exception:
         return False

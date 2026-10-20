@@ -102,7 +102,7 @@ def _clave_cliente(s):
 
 
 def _txt(v):
-    if v is None:
+    if v is None or (isinstance(v, float) and v != v):      # None o NaN (así llegan las celdas vacías al leer un Excel con pandas)
         return ""
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
@@ -143,6 +143,16 @@ def asegurar_esquema_plan(conn):
         # Columnas que ya añade la integración con SR; se repiten por si el orden de arranque cambia.
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS latitud DOUBLE PRECISION")
         cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS longitud DOUBLE PRECISION")
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS direccion TEXT")
+        # Un código identifica UNA tienda dentro de cada cliente (el mismo código en otro cliente no choca). Si ya hubiera repetidos,
+        # el índice no se crea (la app sigue igual) y se pueden ver en Configuración → Mantenimiento.
+        try:
+            cur.execute("SAVEPOINT sp_idx_codigo")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_tiendas_cliente_codigo ON cat_clientes_tiendas (cliente, codigo_tienda) "
+                        "WHERE codigo_tienda IS NOT NULL")
+            cur.execute("RELEASE SAVEPOINT sp_idx_codigo")
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT sp_idx_codigo")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_mapeo_cliente_sr (visit_type TEXT PRIMARY KEY, cliente TEXT)")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cat_transporte_cliente (
@@ -212,6 +222,14 @@ def asegurar_esquema_plan(conn):
                 creado TIMESTAMP DEFAULT NOW(),
                 UNIQUE (plan_id, codigo_pedido)
             )""")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plan_carga (
+                id SERIAL PRIMARY KEY,
+                momento TIMESTAMP DEFAULT NOW(),
+                usuario TEXT, archivo TEXT, prueba BOOLEAN NOT NULL DEFAULT FALSE, filas INTEGER
+            )""")
+        cur.execute("ALTER TABLE plan_parada ADD COLUMN IF NOT EXISTS carga_id INTEGER")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_plan_parada_carga ON plan_parada (carga_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_plan_viaje_plan ON plan_viaje (plan_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_plan_parada_viaje ON plan_parada (viaje_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_plan_transporte_fecha ON plan_transporte (fecha, cliente_orden)")
@@ -449,18 +467,31 @@ def _parse_float(v):
 
 
 def _buscar_destino(tiendas, cod, nombre):
-    """tiendas: lista de dicts (tienda, codigo, lat, lon) del cliente. Busca por código numérico y luego por nombre."""
+    """tiendas: lista de dicts (tienda, codigo, lat, lon, direccion) del cliente. La IDENTIDAD de un destino es cliente + código:
+    con código numérico solo se busca por código (el mismo código puede existir en otro cliente sin problema).
+    Devuelve (tienda|None, conflicto|None). Si el código no existe pero el NOMBRE sí: si esa tienda no tenía código se le adopta;
+    si ya tenía otro código es un conflicto (no se adivina cuál es el bueno)."""
     cod = _txt(cod)
+    nom_n = _norm(nombre)
     if cod.isdigit():
+        n = int(cod)
         for t in tiendas:
-            if t["codigo"] is not None and int(cod) == t["codigo"]:
-                return t
-    nom_n, cod_n = _norm(nombre), _norm(cod)
+            if t["codigo"] == n:
+                return t, None
+        for t in tiendas:
+            if nom_n and _norm(t["tienda"]) == nom_n:
+                if t["codigo"] is None:
+                    return dict(t, adopta_codigo=n), None
+                return None, (f"Ya existe una tienda llamada '{t['tienda']}' con el código {t['codigo']}, pero el Excel trae el código {n}. "
+                              "El código es lo que identifica a la tienda: revisa cuál es el correcto.")
+        return None, None
+    # Código no numérico (poco común): no hay código que comparar, se identifica por nombre o por el propio texto.
+    cod_n = _norm(cod)
     for t in tiendas:
         tn = _norm(t["tienda"])
         if (nom_n and tn == nom_n) or (cod_n and tn == cod_n):
-            return t
-    return None
+            return t, None
+    return None, None
 
 
 def _clave_destino(codigo, destino):
@@ -490,10 +521,10 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
         clientes_cr = sorted({c["cliente"] for c in cfg.values()})
         tiendas = {}
         if clientes_cr:
-            cur.execute("SELECT cliente, tienda, codigo_tienda, latitud, longitud FROM cat_clientes_tiendas "
+            cur.execute("SELECT cliente, tienda, codigo_tienda, latitud, longitud, direccion FROM cat_clientes_tiendas "
                         "WHERE cliente = ANY(%s)", (clientes_cr,))
-            for cli, tienda, codigo, la, lo in cur.fetchall():
-                tiendas.setdefault(cli, []).append(dict(tienda=tienda, codigo=codigo, lat=la, lon=lo))
+            for cli, tienda, codigo, la, lo, di in cur.fetchall():
+                tiendas.setdefault(cli, []).append(dict(tienda=tienda, codigo=codigo, lat=la, lon=lo, direccion=di))
         cur.execute("SELECT placa, piloto, id_sr, sincronizado_sr FROM cat_camiones")
         camiones = {sr_int.clave_placa(p): dict(placa=p, piloto=pi, id_sr=i, sync=s) for p, pi, i, s in cur.fetchall()}
         cur.execute("SELECT nombre, id_sr FROM cat_pilotos")
@@ -546,12 +577,20 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
             elif lat is not None and not (13.5 <= lat <= 18.5 and -92.5 <= lon <= -88.0):
                 f["avisos"].append("Las coordenadas quedan fuera de Guatemala; revisa que no estén invertidas.")
             dest = None
+            conflicto_dest = None
             if c and cod:
-                dest = _buscar_destino(tiendas.get(c["cliente"], []), cod, nombre)
+                dest, conflicto_dest = _buscar_destino(tiendas.get(c["cliente"], []), cod, nombre)
+            if conflicto_dest:
+                f["errores"].append(conflicto_dest)
             f["dest_nuevo"] = False
             f["dest_codigo"] = int(cod) if cod.isdigit() else None
             if dest:
                 f["destino"] = dest["tienda"]
+                if dest.get("adopta_codigo") is not None:
+                    f["dest_adopta_codigo"] = True
+                    f["avisos"].append(f"La tienda '{dest['tienda']}' no tenía código: se le asignará el {dest['adopta_codigo']}.")
+                elif nombre and _norm(nombre) != _norm(dest["tienda"]):
+                    f["avisos"].append(f"El código {cod} ya existe como '{dest['tienda']}' (el Excel dice '{nombre}'): se usa el nombre del catálogo.")
                 f["lat"] = dest["lat"] if dest["lat"] is not None else lat
                 f["lon"] = dest["lon"] if dest["lon"] is not None else lon
                 f["dest_actualiza_coord"] = dest["lat"] is None and lat is not None
@@ -559,7 +598,7 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                     f["errores"].append(f"El destino '{dest['tienda']}' existe pero no tiene coordenadas: agrégalas en el Excel.")
                 if dest["codigo"] is not None:
                     f["dest_codigo"] = dest["codigo"]
-            elif c and cod:
+            elif c and cod and not conflicto_dest:
                 f["dest_nuevo"] = True
                 f["destino"] = nombre or cod
                 f["lat"], f["lon"] = lat, lon
@@ -573,7 +612,10 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                 f["destino"], f["lat"], f["lon"] = nombre or cod, lat, lon
             f["cod"] = cod
             partes = [_txt(raw.get(k)) for k in ("direccion", "municipio", "depto")]
-            f["direccion"] = ", ".join(p for p in partes if p) or ((f["destino"] + ", Guatemala") if f["destino"] else "")
+            f["direccion_excel"] = ", ".join(p for p in partes if p)
+            f["direccion"] = f["direccion_excel"] or ((f["destino"] + ", Guatemala") if f["destino"] else "")
+            if dest and f["direccion_excel"] and not (dest.get("direccion") or "").strip():
+                f["dest_actualiza_dir"] = True                 # la tienda existe pero no tiene dirección: se completa
             # --- horas y duración ---
             for k, etiqueta in (("ini", "El inicio del horario"), ("fin", "El fin del horario"), ("duracion", "La duración")):
                 h = _parse_hora(raw.get(k))
@@ -704,7 +746,7 @@ def agrupar_para_vista(filas_ok):
 # ---------------------------------------------------------------------------
 # Guardado como borrador (antes de tocar SR)
 # ---------------------------------------------------------------------------
-def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
+def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False, archivo=None):
     """Guarda en Supabase las filas YA validadas. Todo en una transacción por plan, con candado para que dos
     coordinadores a la vez no repitan un consecutivo. Devuelve dict {ok, planes: [...], mensaje}."""
     if not filas_ok:
@@ -717,6 +759,9 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
         with closing(get_conn_fn()) as conn:
             try:
                 with conn.cursor() as cur:
+                    cur.execute("INSERT INTO plan_carga (usuario, archivo, prueba, filas) VALUES (%s,%s,%s,%s) RETURNING id",
+                                (usuario, (archivo or "(captura manual)")[:200], bool(prueba), len(filas_ok)))
+                    carga_id = cur.fetchone()[0]
                     for (co, fecha), lista in por_plan.items():
                         cfg = lista[0]["_cfg"]
                         if cfg.get("auto"):
@@ -744,7 +789,7 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
                         for g, vid in cur.fetchall():
                             viaje_de_grupo[g] = vid
                         for f in lista:
-                            if f.get("dest_nuevo") or f.get("dest_actualiza_coord"):
+                            if f.get("dest_nuevo") or f.get("dest_actualiza_coord") or f.get("dest_actualiza_dir") or f.get("dest_adopta_codigo"):
                                 _upsert_tienda(cur, cfg["cliente"], f)
                             vid = viaje_de_grupo.get(f["grupo"]) if f["grupo"] is not None else None
                             if vid is None:
@@ -768,13 +813,13 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
                             cur.execute("""
                                 INSERT INTO plan_parada (viaje_id, plan_id, orden, consecutivo, codigo_pedido, cod_destino,
                                     destino, direccion, latitud, longitud, ventana_ini, ventana_fin, duracion,
-                                    observaciones, ref_adicional)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                    observaciones, ref_adicional, carga_id)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                                         (vid, plan_id, orden, consec, codigo_pedido(co, fecha, consec),
                                          str(f["dest_codigo"]) if f["dest_codigo"] is not None else (f["cod"] or None),
                                          f["destino"], f["direccion"], f["lat"], f["lon"],
                                          f["ini"] or None, f["fin"] or None, f["duracion"] or None,
-                                         f["obs"] or None, f["ref"] or None))
+                                         f["obs"] or None, f["ref"] or None, carga_id))
                             paradas_nuevas += 1
                         _bitacora(cur, usuario, "cargar_plan", plan_id=plan_id,
                                   detalle=f"{paradas_nuevas} parada(s), {viajes_nuevos} viaje(s) nuevo(s), "
@@ -788,7 +833,7 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
     except Exception as e:
         return {"ok": False, "planes": [], "mensaje": f"No se pudo guardar el plan ({type(e).__name__}). No se guardó nada.",
                 "excepcion": e}
-    return {"ok": True, "planes": resultado, "mensaje": "Plan guardado como borrador."}
+    return {"ok": True, "planes": resultado, "carga_id": carga_id, "mensaje": "Plan guardado como borrador."}
 
 
 def _aplicar_vehiculo_fila(cur, viaje_id, f, usuario):
@@ -810,15 +855,156 @@ def _aplicar_vehiculo_fila(cur, viaje_id, f, usuario):
 
 
 def _upsert_tienda(cur, cliente, f):
-    """Destino nuevo (o sin coordenadas): se agrega/completa en el catálogo de tiendas del cliente."""
+    """Destino nuevo (o al que le falta algo): se agrega/completa en el catálogo. Se identifica por cliente + CÓDIGO (el nombre solo
+    se usa si no hay código). El km no se inventa: una tienda nueva entra con el km vacío."""
     cod = f["dest_codigo"]
-    cur.execute("SELECT 1 FROM cat_clientes_tiendas WHERE cliente = %s AND tienda = %s", (cliente, f["destino"]))
-    if cur.fetchone():
-        cur.execute("UPDATE cat_clientes_tiendas SET latitud = COALESCE(latitud, %s), longitud = COALESCE(longitud, %s) "
-                    "WHERE cliente = %s AND tienda = %s", (f["lat"], f["lon"], cliente, f["destino"]))
+    fila = None
+    if cod is not None:
+        cur.execute("SELECT tienda FROM cat_clientes_tiendas WHERE cliente = %s AND codigo_tienda = %s", (cliente, cod))
+        fila = cur.fetchone()
+    if fila is None:
+        cur.execute("SELECT tienda FROM cat_clientes_tiendas WHERE cliente = %s AND tienda = %s", (cliente, f["destino"]))
+        fila = cur.fetchone()
+    if fila:
+        cur.execute("UPDATE cat_clientes_tiendas SET latitud = COALESCE(latitud, %s), longitud = COALESCE(longitud, %s), "
+                    "direccion = COALESCE(NULLIF(TRIM(direccion), ''), %s), codigo_tienda = COALESCE(codigo_tienda, %s) "
+                    "WHERE cliente = %s AND tienda = %s",
+                    (f["lat"], f["lon"], f.get("direccion_excel") or None, cod, cliente, fila[0]))
     else:
-        cur.execute("INSERT INTO cat_clientes_tiendas (cliente, tienda, km, codigo_tienda, clasificacion, latitud, longitud) "
-                    "VALUES (%s,%s,NULL,%s,'Local',%s,%s)", (cliente, f["destino"], cod, f["lat"], f["lon"]))
+        cur.execute("INSERT INTO cat_clientes_tiendas (cliente, tienda, km, codigo_tienda, clasificacion, latitud, longitud, direccion) "
+                    "VALUES (%s,%s,NULL,%s,'Local',%s,%s,%s)",
+                    (cliente, f["destino"], cod, f["lat"], f["lon"], f.get("direccion_excel") or None))
+
+
+def validar_coordenadas_catalogo(df):
+    """Carga masiva de «Clientes y Tiendas»: valida las columnas OPCIONALES latitud/longitud antes de guardar.
+    Devuelve (df_limpio, errores, avisos). Celdas vacías = «sin dato» (no borran lo que ya hay en el catálogo).
+    Errores (bloquean la carga): una sola de las dos, texto, fuera de rango, 0/0, o latitud y longitud invertidas.
+    Avisos (no bloquean): coordenadas que caen fuera de Guatemala."""
+    if "latitud" not in df.columns and "longitud" not in df.columns:
+        return df, [], []
+    df = df.copy()
+    errores, avisos = [], []
+    if "latitud" not in df.columns or "longitud" not in df.columns:
+        return df, ["El archivo trae solo una de las dos columnas: latitud y longitud deben venir juntas."], []
+    lats, lons = [], []
+    for i, fila in df.iterrows():
+        n = int(i) + 2                                           # fila en el Excel (la 1 es el encabezado)
+        tienda = _txt(fila.get("tienda")) or "(sin nombre)"
+        et = f"Fila {n} ({tienda})"
+        la, ok_la = _parse_float(fila.get("latitud"))
+        lo, ok_lo = _parse_float(fila.get("longitud"))
+        if not ok_la or not ok_lo:
+            errores.append(f"{et}: latitud o longitud no son números.")
+            la = lo = None
+        elif (la is None) != (lo is None):
+            errores.append(f"{et}: trae solo una de las dos (latitud y longitud van juntas).")
+            la = lo = None
+        elif la is not None:
+            if not (-90 <= la <= 90 and -180 <= lo <= 180):
+                errores.append(f"{et}: coordenadas fuera de rango ({la}, {lo}).")
+                la = lo = None
+            elif la == 0 and lo == 0:
+                errores.append(f"{et}: las coordenadas son 0, 0 (celda sin llenar).")
+                la = lo = None
+            elif abs(la) > 40 and abs(lo) < 40:
+                errores.append(f"{et}: latitud y longitud parecen estar invertidas ({la}, {lo}).")
+                la = lo = None
+            else:
+                if not (13.5 <= la <= 18.5 and -92.5 <= lo <= -88.0):
+                    avisos.append(f"{et}: queda fuera de Guatemala ({la}, {lo}); revisa que sea correcto.")
+                la, lo = round(la, 6), round(lo, 6)
+        lats.append(la)
+        lons.append(lo)
+    df["latitud"] = lats
+    df["longitud"] = lons
+    return df, errores, avisos
+
+
+def codigos_repetidos(get_conn_fn):
+    """Códigos que tienen más de una tienda dentro del mismo cliente: [(cliente, codigo, [tiendas])]."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT cliente, codigo_tienda, ARRAY_AGG(tienda ORDER BY tienda) FROM cat_clientes_tiendas "
+                    "WHERE codigo_tienda IS NOT NULL GROUP BY cliente, codigo_tienda HAVING COUNT(*) > 1 ORDER BY cliente, codigo_tienda")
+        return [(a, b, list(c)) for a, b, c in cur.fetchall()]
+
+
+def resolver_carga_tiendas(get_conn_fn, df):
+    """Carga masiva de «Clientes y Tiendas»: la tienda se identifica por CLIENTE + CÓDIGO. Antes de guardar:
+    - si el código ya existe en ese cliente, la fila actualiza ESA tienda (se conserva el nombre del catálogo) aunque el nombre venga distinto;
+    - si el nombre ya existe con OTRO código, o un código se repite en el archivo, es un error (no se adivina);
+    - sin código, se identifica por nombre (y se avisa).
+    Devuelve (df_resuelto, errores, avisos, resumen)."""
+    df = df.copy()
+    errores, avisos = [], []
+    resumen = {"nuevas": 0, "existentes": 0, "sin_codigo": 0, "nombre_distinto": 0}
+    if df.empty or "cliente" not in df.columns or "tienda" not in df.columns:
+        return df, errores, avisos, resumen
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT nombre FROM cat_clientes")
+        cliente_real = {_norm(r[0]): r[0] for r in cur.fetchall()}
+        cur.execute("SELECT cliente, tienda, codigo_tienda FROM cat_clientes_tiendas")
+        por_codigo, por_nombre = {}, {}
+        for cli, tienda, cod in cur.fetchall():
+            if cod is not None:
+                por_codigo[(_norm(cli), int(cod))] = tienda
+            por_nombre[(_norm(cli), _norm(tienda))] = (tienda, cod)
+    vistos_codigo, vistos_nombre = {}, {}
+    nuevos_nombres = []
+    for i, fila in df.iterrows():
+        n = int(i) + 2
+        cli_n, tienda = _norm(fila.get("cliente")), _txt(fila.get("tienda"))
+        et = f"Fila {n} ({tienda or 'sin nombre'})"
+        if not tienda:
+            errores.append(f"{et}: falta el nombre de la tienda.")
+            nuevos_nombres.append(tienda)
+            continue
+        cod_txt = _txt(fila.get("codigo_tienda"))
+        cod = None
+        if cod_txt:
+            try:
+                cod = int(float(cod_txt))
+            except ValueError:
+                errores.append(f"{et}: el código '{cod_txt}' no es un número.")
+        nuevo_nombre = tienda
+        if cod is not None:
+            k = (cli_n, cod)
+            if k in vistos_codigo:
+                errores.append(f"{et}: el código {cod} se repite en el archivo (también en la fila {vistos_codigo[k]}).")
+            vistos_codigo[k] = n
+            if k in por_codigo:
+                nuevo_nombre = por_codigo[k]
+                resumen["existentes"] += 1
+                if _norm(nuevo_nombre) != _norm(tienda):
+                    resumen["nombre_distinto"] += 1
+                    avisos.append(f"{et}: el código {cod} ya es '{nuevo_nombre}'; se actualiza esa tienda y se conserva su nombre.")
+            else:
+                ya = por_nombre.get((cli_n, _norm(tienda)))
+                if ya and ya[1] is not None and int(ya[1]) != cod:
+                    errores.append(f"{et}: ya existe con el código {ya[1]} y el archivo trae el {cod}. Revisa cuál es el correcto.")
+                elif ya:
+                    nuevo_nombre = ya[0]
+                    resumen["existentes"] += 1                       # misma tienda sin código: se le asigna este
+                else:
+                    resumen["nuevas"] += 1
+        else:
+            resumen["sin_codigo"] += 1
+            ya = por_nombre.get((cli_n, _norm(tienda)))
+            if ya:
+                nuevo_nombre = ya[0]
+                resumen["existentes"] += 1
+            else:
+                resumen["nuevas"] += 1
+        kn = (cli_n, _norm(nuevo_nombre))
+        if kn in vistos_nombre and vistos_nombre[kn] != n:
+            errores.append(f"{et}: la tienda aparece dos veces en el archivo (también en la fila {vistos_nombre[kn]}).")
+        vistos_nombre[kn] = n
+        nuevos_nombres.append(nuevo_nombre)
+    df["tienda"] = nuevos_nombres
+    if resumen["sin_codigo"]:
+        avisos.append(f"{resumen['sin_codigo']} fila(s) vienen SIN código: se identifican por nombre, y escribir una tienda distinta crearía un duplicado. "
+                      "Conviene que todas traigan su código.")
+    return df, errores, avisos, resumen
 
 
 def fila_manual(cliente_orden, fecha, cod, nombre, grupo=None, obs="", placa="", conductor=""):
@@ -878,6 +1064,35 @@ def detalle_plan(get_conn_fn, plan_id):
         for v in viajes:
             v["paradas"] = paradas.get(v["id"], [])
     return {"plan": dict(p), "viajes": viajes}
+
+
+def listar_cargas(get_conn_fn, prueba, limite=10):
+    """Últimas plantillas cargadas (más nueva primero): [{id, archivo, momento, usuario, filas}]."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, archivo, momento, usuario, filas FROM plan_carga WHERE prueba = %s ORDER BY id DESC LIMIT %s",
+                    (bool(prueba), limite))
+        return [dict(id=a, archivo=b, momento=c, usuario=d, filas=e) for a, b, c, d, e in cur.fetchall()]
+
+
+def estado_carga(get_conn_fn, carga_id):
+    """Qué tan enviada está una plantilla. Un plan cuenta como «enviado» cuando existe en SR y ya no le queda ninguna parada de
+    esa plantilla por enviar. Devuelve {planes: [...], planes_total, planes_enviados, paradas_total, paradas_enviadas}."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT p.id, p.nombre, p.cliente, p.cliente_orden, p.fecha, p.plan_id_sr,
+                   COUNT(*) FILTER (WHERE pa.estado <> 'cancelada'),
+                   COUNT(*) FILTER (WHERE pa.estado = 'en_sr'),
+                   COUNT(*) FILTER (WHERE pa.estado IN ('pendiente','enviando','error'))
+            FROM plan_parada pa JOIN plan_transporte p ON p.id = pa.plan_id
+            WHERE pa.carga_id = %s GROUP BY p.id ORDER BY p.fecha, p.cliente""", (carga_id,))
+        planes = []
+        for pid, nombre, cliente, co, fecha, plan_sr, activas, en_sr, pend in cur.fetchall():
+            if not activas:
+                continue                                          # todo cancelado: no cuenta
+            planes.append(dict(id=pid, nombre=nombre, cliente=cliente, cliente_orden=co, fecha=fecha, paradas=activas,
+                               paradas_enviadas=en_sr, pendientes=pend, enviado=bool(plan_sr) and pend == 0))
+    return {"planes": planes, "planes_total": len(planes), "planes_enviados": sum(1 for x in planes if x["enviado"]),
+            "paradas_total": sum(x["paradas"] for x in planes), "paradas_enviadas": sum(x["paradas_enviadas"] for x in planes)}
 
 
 def estado_visible(v):
@@ -1918,6 +2133,9 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
     if prueba:
         st.warning("Modo prueba activo: los planes se crean como '… -PRUEBA' y no cuentan en el seguimiento real.", icon="🧪")
 
+    ir_c = st.session_state.pop("plan_ir_carga", None)
+    if ir_c:
+        st.session_state["plan_sel_carga"] = ir_c
     ir_a = st.session_state.pop("plan_ir_a", None)      # tras guardar un plan: directo a asignar, en la fecha de ese plan
     if ir_a:
         st.session_state["plan_seccion"], st.session_state["plan_f_fecha_sel"] = ir_a
@@ -1943,8 +2161,60 @@ def render(st, get_conn_fn, usuario, perfil, clientes_permitidos, token_fn, erro
 
 
 # ---------------------------------------------------------------------------
+def _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba):
+    """Indicador «X de Y planes enviados a SimpliRoute» de la plantilla (carga de Excel) elegida, con su botón de enviar."""
+    import pandas as pd
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    cargas = listar_cargas(get_conn_fn, prueba)
+    if not cargas:
+        return
+    ids = [c["id"] for c in cargas]
+    if st.session_state.get("plan_sel_carga") not in ids:
+        st.session_state.pop("plan_sel_carga", None)
+    por_id = {c["id"]: c for c in cargas}
+
+    def _etq(i):
+        c = por_id[i]
+        m = c["momento"].replace(tzinfo=timezone.utc).astimezone(ZoneInfo("America/Guatemala")) if c["momento"] else None
+        return f"{c['archivo']}  ·  {m:%d/%m %H:%M}" if m else c["archivo"]
+    sel = st.selectbox("Plantilla cargada", ids, key="plan_sel_carga", format_func=_etq)
+    est = estado_carga(get_conn_fn, sel)
+    if not est["planes"]:
+        return
+    total, env = est["planes_total"], est["planes_enviados"]
+    pend_planes = [x for x in est["planes"] if not x["enviado"]]
+    with st.container(border=True):
+        (st.success if env == total else st.info)(f"**{env} de {total} planes enviados a SimpliRoute**  ·  "
+                                                  f"{est['paradas_enviadas']} de {est['paradas_total']} paradas")
+        st.progress(env / total if total else 0.0)
+        st.dataframe(pd.DataFrame([{
+            "Cliente": x["cliente"], "Fecha": x["fecha"].strftime("%a %d/%m"), "Plan": x["nombre"],
+            "Estado": "✅ Enviado" if x["enviado"] else (f"⏳ {x['pendientes']} parada(s) por enviar" if x["pendientes"] else "⏳ Sin enviar"),
+        } for x in est["planes"]]), hide_index=True, use_container_width=True)
+        res = st.session_state.get("plan_resumen_carga")
+        if res and res.get("carga") == sel:
+            for f in res["filas"]:
+                if f["errores"]:
+                    st.warning(f"{f['cliente']} ({f['plan']}): {f['errores'][0]}")
+                elif f["pendientes"]:
+                    st.warning(f"{f['cliente']} ({f['plan']}): {f['mensaje']}")
+        problemas = requisitos_envio(get_conn_fn, pend_planes, token_fn) if pend_planes else []
+        if problemas:
+            st.error("**Todavía no se puede enviar a SimpliRoute:**\n\n" + "\n".join(f"- {t}" for t in problemas))
+        if st.button(f":material/cloud_upload: Enviar los {len(pend_planes)} plan(es) pendientes de esta plantilla" if pend_planes
+                     else "Todos los planes de esta plantilla ya están enviados", key="plan_env_carga",
+                     type="primary" if pend_planes else "secondary", disabled=not pend_planes or bool(problemas), use_container_width=True):
+            token = token_fn()
+            with st.spinner("Enviando los planes de la plantilla a SimpliRoute… (puede tardar un poco)"):
+                resumen, _ok = enviar_planes(get_conn_fn, [x["id"] for x in pend_planes], usuario, token=token)
+            st.session_state["plan_resumen_carga"] = {"carga": sel, "filas": resumen}
+            st.rerun()
+
+
 def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     hoy = hoy_guatemala()
+    _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba)
     f1, f2 = st.columns([3, 1])
     opciones = ["Todos mis clientes"] + [c["cliente_orden"] for c in cfgs]
     sel = f1.selectbox("Cliente", opciones, key="plan_f_cliente")
@@ -2206,8 +2476,9 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
                 solo_validas = st.checkbox("Guardar solo las filas válidas (las que tienen error se ignoran)", key="plan_solo_validas")
             if st.button(":material/save: Guardar plan", type="primary", key="plan_guardar", disabled=not ok_f or not solo_validas,
                          help="Queda guardado como borrador en Control de Ruta; se envía a SimpliRoute desde 'Asignar camiones'."):
-                r = guardar_filas(get_conn_fn, ok_f, usuario, prueba=prueba)
+                r = guardar_filas(get_conn_fn, ok_f, usuario, prueba=prueba, archivo=getattr(archivo, "name", None))
                 if r["ok"]:
+                    st.session_state["plan_ir_carga"] = r.get("carga_id")
                     for pl in r["planes"]:
                         extra = f", {pl['a_viaje_existente']} agregada(s) a un viaje existente" if pl["a_viaje_existente"] else ""
                         _flash(st, "success", f"{pl['nombre']}: {pl['paradas']} parada(s), {pl['viajes_nuevos']} viaje(s) nuevo(s){extra}.")
@@ -2410,6 +2681,11 @@ def _seccion_config(st, get_conn_fn, usuario, token_fn, clientes_permitidos):
             (st.success if ok else st.error)(msg)
 
     with st.expander(":material/cleaning_services: Mantenimiento y bitácora"):
+        rep_cod = codigos_repetidos(get_conn_fn)
+        if rep_cod:
+            st.warning(f"Hay {len(rep_cod)} código(s) repetido(s) dentro de un mismo cliente. Un código debe identificar UNA sola tienda; "
+                       "corrígelos en Catálogos → Clientes y Tiendas (mientras existan, la base no puede bloquear nuevos repetidos): "
+                       + "; ".join(f"{c} · código {k}: {', '.join(t)}" for c, k, t in rep_cod[:8]) + (" …" if len(rep_cod) > 8 else ""))
         if st.button(f"Purgar planes cerrados de más de {DIAS_RETENCION} días", key="plan_purgar"):
             ok, msg = purgar_planes_cerrados(get_conn_fn, usuario)
             (st.success if ok else st.error)(msg)

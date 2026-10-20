@@ -1594,6 +1594,9 @@ CATALOGOS_CONFIG = {
                  "clave": ["placa"], "numericas": [], "booleanas": ["activo"],
                  "opciones_desde_catalogo": {"transportista": "transportistas", "piloto": "pilotos", "auxiliar": "auxiliares", "tipo": "tipos_camion"}},
     "Clientes y Tiendas": {"tabla": "cat_clientes_tiendas", "columnas": ["cliente", "tienda", "codigo_tienda", "km", "clasificacion", "ruta", "direccion"],
+                           # Opcionales SOLO en la carga masiva por Excel: si el archivo no las trae no se tocan; si las trae, una celda
+                           # vacía NO borra la coordenada que ya existe (ver sincronizar_catalogo).
+                           "opcionales": ["latitud", "longitud"],
                            "clave": ["cliente", "tienda"], "numericas": ["codigo_tienda", "km"],
                            "opciones_desplegable": {"clasificacion": ["Local", "Departamental"]},
                            "opciones_desde_catalogo": {"cliente": "clientes_lista_activos"}},
@@ -1623,7 +1626,7 @@ CATALOGOS_CONFIG = {
 # cuenta, esta validación lo detiene antes de que llegue a la base de datos.
 TABLAS_PERMITIDAS = {cfg["tabla"] for cfg in CATALOGOS_CONFIG.values()}
 COLUMNAS_PERMITIDAS_POR_TABLA = {
-    cfg["tabla"]: set(cfg["columnas"]) | set(cfg.get("solo_lectura", []))
+    cfg["tabla"]: set(cfg["columnas"]) | set(cfg.get("solo_lectura", [])) | set(cfg.get("opcionales", []))
     for cfg in CATALOGOS_CONFIG.values()
 }
 
@@ -1694,6 +1697,12 @@ def agregar_o_actualizar_registro(tabla, columnas, clave, valores, usuario, clie
         except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.CheckViolation) as e:
             conn.rollback()
             return False, _mensaje_foreign_key_amigable(e)
+        except psycopg2.errors.UniqueViolation as e:
+            conn.rollback()
+            if getattr(getattr(e, "diag", None), "constraint_name", "") == "uq_tiendas_cliente_codigo":
+                return False, ("Ese código ya lo tiene otra tienda del mismo cliente: el código identifica a la tienda dentro de cada "
+                               "cliente y no se puede repetir (en otro cliente sí puede ser el mismo).")
+            return False, _error_tecnico(e, "catalogo_unico")
         except (psycopg2.errors.InvalidDatetimeFormat, psycopg2.errors.DatetimeFieldOverflow):
             conn.rollback()
             return False, "Una fecha no es válida — usa el formato AAAA-MM-DD (por ejemplo 2026-10-05)."
@@ -1824,10 +1833,13 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
                 cols_sql = ", ".join(columnas)
                 placeholders = ", ".join(["%s"] * len(columnas))
                 no_clave = [c for c in columnas if c not in clave]
-                set_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in no_clave)
+                # Coordenadas: una celda vacía NO borra la que ya existe (vienen de SimpliRoute o de cargas anteriores).
+                set_sql = ", ".join((f"{c} = COALESCE(EXCLUDED.{c}, {tabla}.{c})" if c in ("latitud", "longitud") else f"{c} = EXCLUDED.{c}")
+                                    for c in no_clave)
                 query = f"INSERT INTO {tabla} ({cols_sql}) VALUES ({placeholders})"
                 query += f" ON CONFLICT ({', '.join(clave)}) DO UPDATE SET {set_sql}" if set_sql \
                     else f" ON CONFLICT ({', '.join(clave)}) DO NOTHING"
+                _filas_para_guardar = []
                 for _, row in df_nuevo.iterrows():
                     # Limpiar cada valor antes de mandarlo — una celda numérica
                     # vacía en una fila nueva puede llegar como NaN, o como un
@@ -1852,7 +1864,10 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
                             valores.append(v.item())
                         else:
                             valores.append(v)
-                    cur.execute(query, tuple(valores))
+                    _filas_para_guardar.append(tuple(valores))
+                # Por lotes: miles de filas una por una serían miles de viajes a la base remota. Misma transacción, mismo resultado.
+                from psycopg2.extras import execute_batch
+                execute_batch(cur, query, _filas_para_guardar, page_size=500)
 
             conn.commit()
             registrar_auditoria(usuario, "Sincronizar catálogo (Excel/tabla)", f"Tabla {tabla} · {len(df_nuevo)} fila(s)")
@@ -1862,6 +1877,12 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
         except (psycopg2.errors.ForeignKeyViolation, psycopg2.errors.CheckViolation) as e:
             conn.rollback()
             return False, _mensaje_foreign_key_amigable(e)
+        except psycopg2.errors.UniqueViolation as e:
+            conn.rollback()
+            if getattr(getattr(e, "diag", None), "constraint_name", "") == "uq_tiendas_cliente_codigo":
+                return False, ("Ese código ya lo tiene otra tienda del mismo cliente: el código identifica a la tienda dentro de cada "
+                               "cliente y no se puede repetir (en otro cliente sí puede ser el mismo).")
+            return False, _error_tecnico(e, "catalogo_unico")
         except (psycopg2.errors.InvalidDatetimeFormat, psycopg2.errors.DatetimeFieldOverflow):
             conn.rollback()
             return False, "Una fecha no es válida — usa el formato AAAA-MM-DD (por ejemplo 2026-10-05)."
@@ -4866,7 +4887,7 @@ def pagina_catalogos():
                 st.markdown("#### 1. Descargar plantilla")
                 st.download_button(
                     ":material/download: Descargar plantilla Excel",
-                    data=generar_plantilla_excel(config["columnas"]),
+                    data=generar_plantilla_excel(config["columnas"] + config.get("opcionales", [])),
                     file_name=f"plantilla_{config['tabla']}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
@@ -4879,6 +4900,16 @@ def pagina_catalogos():
                 try:
                     df_nuevo = pd.read_excel(archivo, engine="openpyxl")
                     faltantes = [c for c in config["columnas"] if c not in df_nuevo.columns]
+                    # Columnas opcionales (latitud/longitud): se guardan solo si el archivo las trae, y se validan antes.
+                    _cols_opc = [c for c in config.get("opcionales", []) if c in df_nuevo.columns]
+                    _cols_guardar = config["columnas"] + _cols_opc
+                    _err_coord, _avisos_coord = [], []
+                    if _cols_opc and config["tabla"] == "cat_clientes_tiendas":
+                        df_nuevo, _err_coord, _avisos_coord = plan_tr.validar_coordenadas_catalogo(df_nuevo)
+                    # Tiendas: la identidad es CLIENTE + CÓDIGO (no el nombre). Se resuelve antes de guardar para no crear duplicados.
+                    _err_cod, _avisos_cod, _res_cod = [], [], None
+                    if config["tabla"] == "cat_clientes_tiendas" and not faltantes:
+                        df_nuevo, _err_cod, _avisos_cod, _res_cod = plan_tr.resolver_carga_tiendas(get_conn, df_nuevo)
                     _filas_sin_tonelaje_valido = []
                     if not faltantes and config["tabla"] == "cat_camiones" and "tipo" in df_nuevo.columns:
                         # Auto-corrige variantes conocidas ("5 Ton", "20TN"...) al formato
@@ -4895,14 +4926,32 @@ def pagina_catalogos():
                                  "Excel al formato ##TM (05TM, 10TM, 20TM...) y vuelve a subirlo:")
                         st.dataframe(pd.DataFrame(_filas_sin_tonelaje_valido, columns=["Placa", "Tipo en el archivo"]),
                                      use_container_width=True, hide_index=True)
+                    elif _err_coord or _err_cod:
+                        _todos_err = _err_cod + _err_coord
+                        st.error(f"❌ Hay {len(_todos_err)} problema(s) en el archivo (códigos o coordenadas); corrígelos en el Excel y "
+                                 "vuelve a subirlo (no se cargó nada):")
+                        st.dataframe(pd.DataFrame({"Problema": _todos_err[:200]}), use_container_width=True, hide_index=True)
+                        if len(_todos_err) > 200:
+                            st.caption(f"…y {len(_todos_err) - 200} más.")
                     else:
                         st.markdown("#### Vista previa de lo que se va a cargar")
-                        st.dataframe(df_nuevo[config["columnas"]], use_container_width=True)
+                        if _cols_opc:
+                            st.caption("El archivo incluye latitud y longitud: se guardan junto con lo demás. Una celda vacía NO borra la "
+                                       "coordenada que ya tenga esa tienda.")
+                        if _res_cod:
+                            st.success(f"Por cliente + código: {_res_cod['nuevas']} tienda(s) nueva(s) y {_res_cod['existentes']} que ya existen "
+                                       "(se actualizan, no se duplican).")
+                        _todos_av = _avisos_cod + _avisos_coord
+                        for _av in _todos_av[:10]:
+                            st.warning(f"⚠️ {_av}")
+                        if len(_todos_av) > 10:
+                            st.caption(f"…y {len(_todos_av) - 10} aviso(s) más.")
+                        st.dataframe(df_nuevo[_cols_guardar], use_container_width=True)
                         st.info(f"Esto agrega los registros nuevos y actualiza los que ya existan (por su llave) — "
                                 f"nunca borra nada. '{catalogo_sel}': {len(df_actual)} registro(s) actuales, "
                                 f"{len(df_nuevo)} en el archivo.")
                         if st.button("🔄 Actualizar Catálogo"):
-                            ok, msg = sincronizar_catalogo(config["tabla"], config["columnas"], config["clave"], df_nuevo, usuario_activo, mis_clientes)
+                            ok, msg = sincronizar_catalogo(config["tabla"], _cols_guardar, config["clave"], df_nuevo, usuario_activo, mis_clientes)
                             if ok:
                                 texto = f"✅ Carga masiva completada: '{catalogo_sel}' actualizado con {len(df_nuevo)} registro(s)."
                                 if msg != "OK":
