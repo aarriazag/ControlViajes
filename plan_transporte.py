@@ -41,6 +41,7 @@ PERFILES_CONFIG = ("Administrador", "SuperAdministrador")
 HORA_INICIO_RUTA = "07:00:00"
 HORA_FIN_RUTA = "17:00:00"
 MARCA_PRUEBA = "PRUEBA"
+DUMMY_GENERICO = "ADICIONALES"     # vehículos genéricos de SR (ADICIONALES1 SECO, ADICIONALES2 SECO…): los usa todo cliente sin dummies propios
 
 # Listas de la hoja PARAMETROS de la plantilla (solo como ayuda en pantalla; la validación real
 # usa lo que esté configurado en Control de Ruta).
@@ -155,6 +156,7 @@ def asegurar_esquema_plan(conn):
                 deposito_lon DOUBLE PRECISION,
                 activo BOOLEAN NOT NULL DEFAULT TRUE
             )""")
+        cur.execute("ALTER TABLE cat_transporte_cliente ADD COLUMN IF NOT EXISTS dummy_prefijo TEXT")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS plan_transporte (
                 id SERIAL PRIMARY KEY,
@@ -184,6 +186,7 @@ def asegurar_esquema_plan(conn):
                 creado TIMESTAMP DEFAULT NOW(),
                 UNIQUE (plan_id, num)
             )""")
+        cur.execute("ALTER TABLE plan_viaje ADD COLUMN IF NOT EXISTS dummy_sr_id BIGINT")
         # Un solo viaje ABIERTO por grupo dentro de un plan (el candado contra duplicar un viaje por G. Ruta).
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_viaje_grupo_abierto
@@ -278,19 +281,19 @@ def guardar_config(get_conn_fn, datos, usuario):
                     cur.execute("""
                         INSERT INTO cat_transporte_cliente
                           (cliente_orden, cliente, visit_type, vehiculo_dummy_sr, vehiculo_dummy_nombre,
-                           deposito_nombre, deposito_lat, deposito_lon, activo)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           deposito_nombre, deposito_lat, deposito_lon, activo, dummy_prefijo)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT (cliente_orden) DO UPDATE SET
                           cliente=EXCLUDED.cliente, visit_type=EXCLUDED.visit_type,
                           vehiculo_dummy_sr=EXCLUDED.vehiculo_dummy_sr,
                           vehiculo_dummy_nombre=EXCLUDED.vehiculo_dummy_nombre,
                           deposito_nombre=EXCLUDED.deposito_nombre, deposito_lat=EXCLUDED.deposito_lat,
-                          deposito_lon=EXCLUDED.deposito_lon, activo=EXCLUDED.activo""",
+                          deposito_lon=EXCLUDED.deposito_lon, activo=EXCLUDED.activo, dummy_prefijo=EXCLUDED.dummy_prefijo""",
                                 (co, cli, vt, datos.get("vehiculo_dummy_sr") or None,
                                  _txt(datos.get("vehiculo_dummy_nombre")) or None,
                                  _txt(datos.get("deposito_nombre")) or None,
                                  datos.get("deposito_lat"), datos.get("deposito_lon"),
-                                 bool(datos.get("activo", True))))
+                                 bool(datos.get("activo", True)), (_txt(datos.get("dummy_prefijo")).upper() or None)))
                     if vt:
                         # Así la importación de rutas en Despacho reconoce a qué cliente pertenece el visit_type.
                         cur.execute("INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s,%s) "
@@ -475,7 +478,15 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
         cfg = {}
         for r in cur.fetchall():
             cfg[_clave_cliente(r[0])] = dict(cliente_orden=r[0], cliente=r[1], dummy=r[2], dep=r[3],
-                                             dep_lat=r[4], dep_lon=r[5], visit_type=r[6])
+                                             dep_lat=r[4], dep_lon=r[5], visit_type=r[6], auto=False)
+        # Clientes no configurados: si se pueden identificar sin duda por su nombre, se usan igual (se guardan al guardar el plan).
+        for raw_ in filas:
+            co_ = _txt(raw_.get("cliente_orden"))
+            if co_ and _clave_cliente(co_) not in cfg:
+                cli_ = _cliente_cr_por_nombre(cur, co_)
+                if cli_:
+                    cfg[_clave_cliente(co_)] = dict(cliente_orden=co_, cliente=cli_, dummy=None, dep=None, dep_lat=None, dep_lon=None,
+                                                    visit_type=_prefijo_codigo(co_).lower().replace(" ", ""), auto=True)
         clientes_cr = sorted({c["cliente"] for c in cfg.values()})
         tiendas = {}
         if clientes_cr:
@@ -491,6 +502,9 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
         # Para detectar duplicados contra lo ya guardado y grupos ya despachados.
         claves_plan = set()
         out = []
+        sin_pool_cache = {}
+        cur.execute("SELECT cliente_orden, dummy_prefijo FROM cat_transporte_cliente WHERE dummy_prefijo IS NOT NULL")
+        dummy_pref = dict(cur.fetchall())
         for raw in filas:
             f = dict(n=raw.get("n"), errores=[], avisos=[])
             # --- cliente ---
@@ -569,17 +583,32 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                 f[k] = h
             f["obs"] = _txt(raw.get("obs"))
             f["ref"] = _txt(raw.get("ref"))
-            # --- placa / conductor ---
+            # --- vehículo del viaje (columna Placa): genérico (DC01, ADICIONALES1...) o camión real ---
             placa_raw = _txt(raw.get("placa"))
-            f["placa"] = None
+            f["placa"] = None            # camión REAL asignado (None si es genérico)
+            f["vehiculo"] = None         # lo que trae la columna, ya normalizado
+            f["vehiculo_sr_id"] = None
+            f["generico"] = False
             if placa_raw:
                 cam = camiones.get(sr_int.clave_placa(placa_raw))
                 if not cam:
-                    f["errores"].append(f"La placa '{placa_raw}' no existe en el catálogo de camiones.")
+                    f["errores"].append(f"El vehículo '{placa_raw}' no está en el catálogo de Control de Ruta. "
+                                        "Si es un genérico de SimpliRoute, sincroniza camiones (Catálogos → Integración SimpliRoute).")
+                elif not cam["id_sr"]:
+                    f["errores"].append(f"El vehículo {cam['placa']} no está sincronizado con SimpliRoute; sincroniza camiones primero.")
                 else:
-                    f["placa"] = cam["placa"]
-                    if not cam["id_sr"]:
-                        f["avisos"].append(f"El camión {cam['placa']} no está sincronizado con SR: no se podrá asignar allá.")
+                    f["vehiculo"] = cam["placa"]
+                    f["vehiculo_sr_id"] = int(cam["id_sr"])
+                    f["generico"] = es_generico(cam["placa"])
+                    if not f["generico"]:
+                        f["placa"] = cam["placa"]
+            elif c:
+                if c["cliente_orden"] not in sin_pool_cache:
+                    sin_pool_cache[c["cliente_orden"]] = not (c.get("auto") is False and pool_propio(get_conn_fn, {
+                        "dummy_prefijo": dummy_pref.get(c["cliente_orden"]), "vehiculo_dummy_sr": c.get("dummy"), "vehiculo_dummy_nombre": ""}))
+                if sin_pool_cache[c["cliente_orden"]]:
+                    f["errores"].append("Falta el vehículo en la columna Placa (error de plantilla): usa el genérico, como DC01 o "
+                                        "ADICIONALES1, o el camión real.")
             cond_raw = _txt(raw.get("conductor"))
             f["conductor"] = None
             if cond_raw and _norm(cond_raw) not in ("sin asignar", "sinasignar"):
@@ -601,7 +630,7 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
             if f["grupo"] is not None and f["fecha"] and f["cliente"]:
                 grupos.setdefault((f["cliente_orden"], f["fecha"], f["grupo"]), []).append(f)
         for (co, fe, gr), lista in grupos.items():
-            for campo, etiqueta in (("placa", "placas"), ("conductor", "conductores"), ("dep_salida", "depósitos de salida")):
+            for campo, etiqueta in (("vehiculo", "vehículos (Placa)"), ("conductor", "conductores"), ("dep_salida", "depósitos de salida")):
                 vals = {f[campo] for f in lista if f[campo]}
                 if len(vals) > 1:
                     for f in lista:
@@ -690,6 +719,13 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
                 with conn.cursor() as cur:
                     for (co, fecha), lista in por_plan.items():
                         cfg = lista[0]["_cfg"]
+                        if cfg.get("auto"):
+                            cur.execute("""INSERT INTO cat_transporte_cliente (cliente_orden, cliente, visit_type, activo)
+                                           VALUES (%s,%s,%s,TRUE) ON CONFLICT (cliente_orden) DO NOTHING""",
+                                        (cfg["cliente_orden"], cfg["cliente"], cfg["visit_type"]))
+                            cur.execute("INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s,%s) ON CONFLICT (visit_type) DO NOTHING",
+                                        (cfg["visit_type"], cfg["cliente"]))
+                            _bitacora(cur, usuario, "cliente_automatico", detalle=f"{cfg['cliente_orden']} -> {cfg['cliente']}")
                         nom = nombre_plan(co, fecha, prueba)
                         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (nom,))
                         cur.execute("""INSERT INTO plan_transporte (cliente_orden, cliente, fecha, nombre, prueba, creado_por)
@@ -727,8 +763,7 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
                                 cur.execute("SELECT COALESCE(MAX(orden),0)+1 FROM plan_parada WHERE viaje_id = %s", (vid,))
                                 orden = cur.fetchone()[0]
                                 paradas_a_existente += 1
-                            if f["placa"]:
-                                _fijar_camion_piloto(cur, vid, f["placa"], f["conductor"], usuario, solo_local=True)
+                            _aplicar_vehiculo_fila(cur, vid, f, usuario)
                             consec += 1
                             cur.execute("""
                                 INSERT INTO plan_parada (viaje_id, plan_id, orden, consecutivo, codigo_pedido, cod_destino,
@@ -754,6 +789,24 @@ def guardar_filas(get_conn_fn, filas_ok, usuario, prueba=False):
         return {"ok": False, "planes": [], "mensaje": f"No se pudo guardar el plan ({type(e).__name__}). No se guardó nada.",
                 "excepcion": e}
     return {"ok": True, "planes": resultado, "mensaje": "Plan guardado como borrador."}
+
+
+def _aplicar_vehiculo_fila(cur, viaje_id, f, usuario):
+    """Vehículo de la fila (columna Placa) en el viaje: un genérico queda como el vehículo con el que se crea la ruta en SR (el viaje
+    sigue «sin camión»); un camión real queda asignado. Nunca pisa lo que el viaje ya tenga."""
+    cur.execute("SELECT placa, dummy_sr_id, piloto FROM plan_viaje WHERE id = %s", (viaje_id,))
+    placa_act, dummy_act, piloto_act = cur.fetchone()
+    if f.get("vehiculo_sr_id"):
+        if f["generico"]:
+            if dummy_act is None and placa_act is None:
+                cur.execute("UPDATE plan_viaje SET dummy_sr_id = %s WHERE id = %s", (f["vehiculo_sr_id"], viaje_id))
+        elif placa_act is None:
+            _fijar_camion_piloto(cur, viaje_id, f["placa"], f["conductor"], usuario)
+            return
+    if f.get("conductor") and piloto_act is None:
+        cur.execute("SELECT id_sr FROM cat_pilotos WHERE nombre = %s", (f["conductor"],))
+        r = cur.fetchone()
+        cur.execute("UPDATE plan_viaje SET piloto = %s, piloto_sr_id = %s WHERE id = %s", (f["conductor"], r[0] if r else None, viaje_id))
 
 
 def _upsert_tienda(cur, cliente, f):
@@ -885,13 +938,13 @@ def _upd(get_conn_fn, tabla, fila_id, **campos):
         conn.commit()
 
 
-def _payload_ruta(plan, viaje, cfg, ref):
+def _payload_ruta(plan, viaje, cfg, ref, dummy_id):
     dep_nom = viaje.get("deposito_nombre") or cfg.get("deposito_nombre") or "Base Ransa Guatemala"
     lat = viaje.get("deposito_lat") or cfg.get("deposito_lat") or sr_int.UBICACION_BASE_VEHICULOS_SR["latitud"]
     lon = viaje.get("deposito_lon") or cfg.get("deposito_lon") or sr_int.UBICACION_BASE_VEHICULOS_SR["longitud"]
     p = {
         "plan": plan["plan_id_sr"],
-        "vehicle": viaje.get("vehiculo_sr_id") or cfg["vehiculo_dummy_sr"],
+        "vehicle": viaje.get("vehiculo_sr_id") or dummy_id,
         "planned_date": plan["fecha"].isoformat(),
         "estimated_time_start": HORA_INICIO_RUTA, "estimated_time_end": HORA_FIN_RUTA,
         "location_start_address": dep_nom, "location_start_latitude": round(float(lat), 6),
@@ -1020,8 +1073,12 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
         plan, viajes = d["plan"], d["viajes"]
         cfgs = [c for c in listar_config(get_conn_fn) if c["cliente_orden"] == plan["cliente_orden"]]
         cfg = cfgs[0] if cfgs else None
-        if not cfg or not cfg.get("vehiculo_dummy_sr"):
-            return {**res, "ok": False, "mensaje": "Falta el vehículo dummy de este cliente (pestaña Configuración)."}
+        if cfg and not pool_propio(get_conn_fn, cfg):
+            autoconfigurar_dummy(get_conn_fn, plan["cliente_orden"])
+            cfg = next((x for x in listar_config(get_conn_fn) if x["cliente_orden"] == plan["cliente_orden"]), cfg)
+        if not cfg:
+            return {**res, "ok": False, "mensaje": "Este cliente no está configurado para Transporte (pestaña Configuración)."}
+        pool = pool_dummies(get_conn_fn, cfg)          # respaldo: solo para viajes que no traen vehículo en su Placa
         if plan["prueba"] and MARCA_PRUEBA not in plan["nombre"].upper():
             return {**res, "ok": False, "mensaje": "Un plan de prueba debe llevar PRUEBA en el nombre."}
 
@@ -1061,6 +1118,7 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
                     continue
                 ref = activas[0]["codigo_pedido"]
                 rid = None
+                dummy_id = v.get("dummy_sr_id") or (pool[(int(v["num"]) - 1) % len(pool)]["id"] if pool else None)
                 if str(v.get("error") or "").startswith("INCIERTA"):
                     # La vez anterior SR no contestó: puede que la ruta sí se haya creado. Se revisa antes de crear otra.
                     if rutas_dia is None:
@@ -1069,7 +1127,12 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
                     if rid:
                         res["notas"].append(f"Viaje {v['num']}: la ruta ya existía en SR; se reutilizó.")
                 if not rid:
-                    payload = _payload_ruta(plan, v, cfg, ref)
+                    dummy_id = v.get("dummy_sr_id") or (pool[(int(v["num"]) - 1) % len(pool)]["id"] if pool else None)
+                    if not v.get("vehiculo_sr_id") and not dummy_id:
+                        _upd(get_conn_fn, "plan_viaje", v["id"], error="Falta el vehículo (columna Placa del Excel)")
+                        res["errores"].append(f"Viaje {v['num']}: falta el vehículo (columna Placa del Excel).")
+                        continue
+                    payload = _payload_ruta(plan, v, cfg, ref, dummy_id)
                     ok, data = sr_int._sr_request("POST", "routes/routes/", token=token, json=payload)
                     unidades += 1
                     if not ok:
@@ -1084,7 +1147,8 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
                     res["errores"].append(f"Viaje {v['num']}: SR no devolvió el id de la ruta.")
                     continue
                 nuevo_estado = "asignado" if v.get("vehiculo_sr_id") else "en_sr"
-                _upd(get_conn_fn, "plan_viaje", v["id"], route_id_sr=str(rid), estado=nuevo_estado, error=None)
+                _upd(get_conn_fn, "plan_viaje", v["id"], route_id_sr=str(rid), estado=nuevo_estado, error=None,
+                     dummy_sr_id=(None if v.get("vehiculo_sr_id") else dummy_id))
                 v["route_id_sr"], v["estado"] = str(rid), nuevo_estado
                 res["rutas"] += 1
                 pend = [p for p in v["paradas"] if p["estado"] in ("pendiente", "error")]
@@ -1122,6 +1186,175 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
         return res
     except Exception as e:
         return {**res, "ok": False, "mensaje": f"Error inesperado al enviar a SR ({type(e).__name__}).", "excepcion": e}
+
+
+_PALABRAS_NO_CLIENTE = {"CITY", "LOCAL", "GUATEMALA", "SOCIEDAD", "ANONIMA", "COMERCIAL", "DE", "LA", "LOS", "LAS", "SECO", "FRIO"}
+
+
+def _palabras_cliente(cliente_orden, cliente):
+    """Palabras que identifican al cliente en el nombre de su dummy: 'GT-DOLLAR CITY' -> {'DOLLAR'}; 'Diana (La Comercial)' -> {'DIANA'}."""
+    palabras = set()
+    for t in (_prefijo_codigo(cliente_orden), re.sub(r"\(.*?\)", " ", cliente or "")):
+        for w in re.findall(r"[A-Z0-9]+", _norm(t).upper()):
+            if len(w) >= 4 and w not in _PALABRAS_NO_CLIENTE:
+                palabras.add(w)
+    return palabras
+
+
+def vehiculos_sincronizados(get_conn_fn, solo_dummies=True):
+    """Vehículos de cat_camiones con id de SR. solo_dummies=True deja fuera las placas normales (123ABC): lo que queda son
+    los provisionales con nombre (DOLLARCITY1, UNISUPERIMPORTADO25...), que la sincronización de camiones ya trajo de SR."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT placa, id_sr FROM cat_camiones WHERE id_sr IS NOT NULL ORDER BY placa")
+        filas = cur.fetchall()
+    out = [{"id": int(i), "nombre": p} for p, i in filas]
+    if solo_dummies:
+        out = [v for v in out if not re.match(r"^[0-9]{3}[A-Z]{3}$", str(v["nombre"]).upper())]
+    return out
+
+
+def es_generico(nombre):
+    """Vehículo genérico (DC01, ADICIONALES1 SECO, UNISUPERIMPORTADO25...): nombre con letras y número, no una placa normal (896BYM)."""
+    k = sr_int.clave_placa(nombre)
+    return bool(k) and not re.match(r"^[0-9]{3}[A-Z]{3}$", k) and bool(re.match(r"^[A-Z]{2,}[0-9]+[A-Z]*$", k))
+
+
+def _clave_dummy(nombre):
+    return re.sub(r"[^A-Z0-9]", "", str(nombre).upper())
+
+
+def grupos_dummy(get_conn_fn):
+    """Grupos de dummies ya sincronizados, por prefijo: {'DC': [{'id','nombre','num'}...], 'DI': [...]}. Un dummy es un vehículo con
+    nombre letras+número (DC01, DC02...); las placas normales (896BYM) no cuentan."""
+    grupos = {}
+    for v in vehiculos_sincronizados(get_conn_fn):
+        m = re.match(r"^([A-Z]+)(\d+)$", _clave_dummy(v["nombre"]))
+        if m and not m.group(1).startswith(DUMMY_GENERICO):
+            grupos.setdefault(m.group(1), []).append(dict(v, num=int(m.group(2))))
+    for lista in grupos.values():
+        lista.sort(key=lambda x: x["num"])
+    return grupos
+
+
+def dummies_genericos(get_conn_fn):
+    """Vehículos genéricos «ADICIONALES…» ya sincronizados, en orden (ADICIONALES1 SECO, ADICIONALES2 SECO…). Lista de {'id','nombre'}."""
+    out = [v for v in vehiculos_sincronizados(get_conn_fn) if _clave_dummy(v["nombre"]).startswith(DUMMY_GENERICO)]
+    def _clave_orden(v):
+        m = re.search(r"(\d+)", str(v["nombre"]))
+        return (int(m.group(1)) if m else 0, "FRIO" in _clave_dummy(v["nombre"]), str(v["nombre"]))   # primero los SECO
+    return sorted(out, key=_clave_orden)
+
+
+def pool_propio(get_conn_fn, cfg):
+    """Dummies PROPIOS del cliente: su grupo configurado (DC01, DC02...) o, si no hay grupo, el único vehículo elegido."""
+    pref = _clave_dummy(cfg.get("dummy_prefijo") or "")
+    if pref:
+        g = grupos_dummy(get_conn_fn).get(pref, [])
+        if g:
+            return [{"id": x["id"], "nombre": x["nombre"]} for x in g]
+    if cfg.get("vehiculo_dummy_sr"):
+        return [{"id": int(cfg["vehiculo_dummy_sr"]), "nombre": cfg.get("vehiculo_dummy_nombre") or ""}]
+    return []
+
+
+def pool_dummies(get_conn_fn, cfg):
+    """Dummies que usan los viajes de este cliente: los propios si tiene; si no, los genéricos ADICIONALES."""
+    return pool_propio(get_conn_fn, cfg) or [{"id": v["id"], "nombre": v["nombre"]} for v in dummies_genericos(get_conn_fn)]
+
+
+def todos_los_dummies_ids(get_conn_fn, cfg):
+    """Ids de cualquier vehículo que cuente como «sin camión» para este cliente (propios o genéricos)."""
+    return {x["id"] for x in pool_propio(get_conn_fn, cfg)} | {v["id"] for v in dummies_genericos(get_conn_fn)}
+
+
+def sugerir_prefijo(cliente_orden, grupos):
+    """DOLLAR CITY -> 'DC' (iniciales) si existe ese grupo. Solo para nombres de 2 palabras o más; si no, no adivina."""
+    palabras = [w for w in re.findall(r"[A-Z0-9]+", _norm(_prefijo_codigo(cliente_orden)).upper()) if w not in _PALABRAS_NO_CLIENTE or w == "CITY"]
+    if len(palabras) >= 2:
+        ini = "".join(w[0] for w in palabras)
+        if ini in grupos:
+            return ini
+    return None
+
+
+def candidatos_dummy(get_conn_fn, cliente_orden, cliente):
+    """Para clientes con UN solo dummy cuyo nombre contiene el del cliente (ej. UNISUPERIMPORTADO25)."""
+    palabras = _palabras_cliente(cliente_orden, cliente)
+    if not palabras:
+        return []
+    return [v for v in vehiculos_sincronizados(get_conn_fn)
+            if any(w in _clave_dummy(v["nombre"]) for w in palabras) and not _clave_dummy(v["nombre"]).startswith(DUMMY_GENERICO)]
+
+
+def autoconfigurar_dummy(get_conn_fn, cliente_orden, usuario="sistema"):
+    """Deja configurado el dummy del cliente si se puede identificar sin ambigüedad: (1) por las iniciales (DOLLAR CITY -> grupo DC) o
+    (2) un único vehículo con su nombre. Devuelve (ok, texto|n_candidatos)."""
+    try:
+        cfgs = [c for c in listar_config(get_conn_fn) if c["cliente_orden"] == cliente_orden]
+        if not cfgs:
+            return False, 0
+        c = cfgs[0]
+        pool = pool_propio(get_conn_fn, c)
+        if pool:
+            return True, (c.get("dummy_prefijo") or pool[0]["nombre"])
+        grupos = grupos_dummy(get_conn_fn)
+        pref = sugerir_prefijo(cliente_orden, grupos)
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            if pref:
+                cur.execute("UPDATE cat_transporte_cliente SET dummy_prefijo=%s WHERE cliente_orden=%s AND dummy_prefijo IS NULL", (pref, cliente_orden))
+                _bitacora(cur, usuario, "dummy_automatico", detalle=f"{cliente_orden} -> grupo {pref}")
+                conn.commit()
+                return True, pref
+        cands = candidatos_dummy(get_conn_fn, cliente_orden, c["cliente"])
+        if len(cands) != 1:
+            return False, len(cands)
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE cat_transporte_cliente SET vehiculo_dummy_sr=%s, vehiculo_dummy_nombre=%s WHERE cliente_orden=%s AND vehiculo_dummy_sr IS NULL",
+                        (cands[0]["id"], cands[0]["nombre"], cliente_orden))
+            _bitacora(cur, usuario, "dummy_automatico", detalle=f"{cliente_orden} -> {cands[0]['nombre']}")
+            conn.commit()
+        return True, cands[0]["nombre"]
+    except Exception:
+        return False, 0
+
+
+def _cliente_cr_por_nombre(cur, cliente_orden):
+    """Cliente de Control de Ruta que corresponde a un «Cliente Orden» de la plantilla, si hay UNO solo posible por nombre
+    (GT-DOLLAR CITY -> el único cliente cuyo nombre contiene DOLLAR). None si no hay o hay varios."""
+    palabras = _palabras_cliente(cliente_orden, "")
+    if not palabras:
+        return None
+    cur.execute("SELECT nombre FROM cat_clientes WHERE COALESCE(activo, TRUE)")
+    hallados = [r[0] for r in cur.fetchall() if any(w in re.sub(r"[^A-Z0-9]", "", _norm(r[0]).upper()) for w in palabras)]
+    return hallados[0] if len(hallados) == 1 else None
+
+
+def requisitos_envio(get_conn_fn, planes, token_fn):
+    """Qué falta para poder enviar estos planes a SR. Devuelve lista de textos (vacía = todo listo)."""
+    problemas = []
+    try:
+        tok = token_fn()
+    except Exception:
+        tok = None
+    if not tok:
+        problemas.append("No hay token de SimpliRoute disponible (se toma de Supabase Vault, secreto «simpliroute_api_token»). "
+                         "Avísale a un Administrador.")
+    cfg = {c["cliente_orden"]: c for c in listar_config(get_conn_fn)}
+    for co in sorted({pl["cliente_orden"] for pl in planes}):
+        if co not in cfg:
+            problemas.append(f"{co}: no está configurado para Transporte (pestaña Configuración).")
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        for pl in planes:
+            c = cfg.get(pl["cliente_orden"])
+            if c and pool_dummies(get_conn_fn, c):
+                continue                                     # tiene dummy por defecto configurado: cubre a los viajes sin Placa
+            cur.execute("""SELECT COUNT(*) FROM plan_viaje WHERE plan_id = %s AND route_id_sr IS NULL AND estado NOT IN ('cancelado','despachado')
+                           AND vehiculo_sr_id IS NULL AND dummy_sr_id IS NULL""", (pl["id"],))
+            n = cur.fetchone()[0]
+            if n:
+                problemas.append(f"{pl['nombre']}: {n} viaje(s) sin vehículo. Falta la columna Placa en el Excel (usa el genérico, "
+                                 "como DC01 o ADICIONALES1, o el camión real).")
+    return problemas
 
 
 PRESUPUESTO_ENVIO_SEGUNDOS = 100     # tiempo máximo de un clic de "enviar todos"; si falta algo, se avisa y se vuelve a presionar
@@ -1336,7 +1569,8 @@ def refrescar_desde_sr(get_conn_fn, plan_id, usuario, token=None):
         lista = data.get("results", data) if isinstance(data, dict) else data
         rutas = {str(r.get("id")): r for r in (lista or [])}
         cfgs = [c for c in listar_config(get_conn_fn) if c["cliente_orden"] == plan["cliente_orden"]]
-        dummy = cfgs[0]["vehiculo_dummy_sr"] if cfgs else None
+        ids_dummy = (todos_los_dummies_ids(get_conn_fn, cfgs[0]) if cfgs else set()) | \
+            {x["id"] for x in vehiculos_sincronizados(get_conn_fn) if es_generico(x["nombre"])}
         cambios = []
         with closing(get_conn_fn()) as conn, conn.cursor() as cur:
             cur.execute("SELECT placa, id_sr FROM cat_camiones WHERE id_sr IS NOT NULL")
@@ -1351,11 +1585,11 @@ def refrescar_desde_sr(get_conn_fn, plan_id, usuario, token=None):
                     cambios.append(f"Viaje {v['num']}: la ruta ya no existe en SR.")
                     continue
                 veh_sr, drv_sr = r.get("vehicle"), r.get("driver")
-                mismo_veh = (veh_sr == v.get("vehiculo_sr_id")) or (v.get("vehiculo_sr_id") is None and veh_sr == dummy)
+                mismo_veh = (veh_sr == v.get("vehiculo_sr_id")) or (v.get("vehiculo_sr_id") is None and veh_sr in ids_dummy)
                 mismo_drv = (drv_sr == v.get("piloto_sr_id")) or (drv_sr is None and v.get("piloto_sr_id") is None)
                 if mismo_veh and mismo_drv:
                     continue
-                if veh_sr == dummy:
+                if veh_sr in ids_dummy:
                     cur.execute("UPDATE plan_viaje SET placa=NULL, piloto=NULL, vehiculo_sr_id=NULL, piloto_sr_id=NULL, "
                                 "estado='en_sr', cambiado_en_sr=TRUE WHERE id=%s", (v["id"],))
                     cambios.append(f"Viaje {v['num']}: en SR se volvió a dejar sin camión.")
@@ -1539,7 +1773,11 @@ def cargar_destinos_prueba(get_conn_fn, cliente_dollar, cliente_diana, usuario):
             except Exception:
                 conn.rollback()
                 raise
-        return True, f"Listo: {n} destino(s) de prueba creados."
+        extra = []
+        for co in DESTINOS_PRUEBA:
+            ok_auto, dato = autoconfigurar_dummy(get_conn_fn, co, usuario)
+            extra.append(f"{co}: dummy {dato}" if ok_auto else f"{co}: dummy sin identificar")
+        return True, f"Listo: {n} destino(s) de prueba creados. " + "; ".join(extra) + "."
     except Exception as e:
         return False, f"No se pudieron crear los destinos de prueba ({type(e).__name__})."
 
@@ -1601,6 +1839,10 @@ def _opciones_asignacion(get_conn_fn):
         with closing(get_conn_fn()) as conn, conn.cursor() as cur:
             cur.execute("SELECT placa, piloto FROM cat_camiones WHERE id_sr IS NOT NULL AND COALESCE(activo, TRUE) ORDER BY placa")
             filas = cur.fetchall()
+            cur.execute("SELECT DISTINCT dummy_prefijo FROM cat_transporte_cliente WHERE dummy_prefijo IS NOT NULL")
+            prefs = [_clave_dummy(r[0]) for r in cur.fetchall()]
+            filas = [f for f in filas if not any(re.match("^" + re.escape(pf) + r"\d+$", _clave_dummy(f[0])) for pf in prefs)
+                     and not _clave_dummy(f[0]).startswith(DUMMY_GENERICO) and not es_generico(f[0])]
             cur.execute("SELECT nombre FROM cat_pilotos WHERE COALESCE(activo, TRUE) ORDER BY nombre")
             pil = [r[0] for r in cur.fetchall()]
         _OPCIONES.update(t=_time.time(), placas=[f[0] for f in filas], piloto_de={f[0]: f[1] for f in filas if f[1]}, pilotos=pil)
@@ -1723,7 +1965,7 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     if not planes:
         st.info(f"No hay planes{' de prueba' if prueba else ''} para el {fecha:%d/%m/%Y} con ese cliente.")
         return
-    _enviar_todos(st, get_conn_fn, usuario, token_fn, planes, fecha)
+    problemas_envio = _enviar_todos(st, get_conn_fn, usuario, token_fn, planes, fecha)
     if len(planes) > 1:
         idx = st.selectbox("Plan", range(len(planes)), format_func=lambda i: f"{planes[i]['nombre']}  ·  {planes[i]['viajes']} viaje(s)", key="plan_sel_plan")
         plan = planes[idx]
@@ -1754,7 +1996,7 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
         b1, b2, b3 = st.columns([2, 2, 3])
         hay_pend = (por_enviar_v + por_enviar_p) > 0
         if b1.button(f":material/cloud_upload: Enviar pendientes a SR ({por_enviar_v + por_enviar_p})", key=f"plan_env_{plan['id']}",
-                     type="primary" if hay_pend else "secondary", disabled=not hay_pend, use_container_width=True):
+                     type="primary" if hay_pend else "secondary", disabled=not hay_pend or bool(problemas_envio), use_container_width=True):
             token = token_fn()
             if not token:
                 _flash(st, "error", "No hay token de SimpliRoute configurado.")
@@ -1798,40 +2040,47 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
 
 
 def _enviar_todos(st, get_conn_fn, usuario, token_fn, planes, fecha):
-    """Botón principal: sube a SR TODOS los planes de esa fecha (de los clientes filtrados) y dice cuántos subió de cada cliente."""
+    """Botón principal: sube a SR TODOS los planes de esa fecha (de los clientes filtrados) y dice cuántos subió de cada cliente.
+    Devuelve la lista de requisitos que faltan (vacía si se puede enviar)."""
     import pandas as pd
-    res = st.session_state.pop("plan_resumen_envio", None)
-    if res:
-        ok_n = sum(1 for f in res if (f["rutas"] or f["paradas"]) and not f["pendientes"] and not f["errores"])
-        st.success(f"Resultado del envío: {ok_n} de {len(res)} plan(es) quedaron completos en SimpliRoute.") if ok_n == len(res) else \
-            st.warning(f"Resultado del envío: {ok_n} de {len(res)} plan(es) completos. Revisa los que tienen pendientes o errores.")
+    problemas = requisitos_envio(get_conn_fn, planes, token_fn)
+    if problemas:
+        st.error("**Todavía no se puede enviar a SimpliRoute:**\n\n" + "\n".join(f"- {t}" for t in problemas))
+    res = st.session_state.get("plan_resumen_envio")
+    if res and res.get("fecha") == fecha:
+        filas = res["filas"]
+        ok_n = sum(1 for f in filas if not f["pendientes"] and not f["errores"] and (f["rutas"] or f["paradas"] or "Ya estaba" in f["mensaje"]))
+        caja = st.success if ok_n == len(filas) else st.warning
+        caja(f"Resultado del último envío: {ok_n} de {len(filas)} plan(es) completos en SimpliRoute."
+             + ("" if ok_n == len(filas) else " Revisa los que tienen pendientes o errores."))
         st.dataframe(pd.DataFrame([{
             "Cliente": f["cliente"], "Plan": f["plan"],
             "Plan en SR": "Creado ahora" if f["plan_nuevo_en_sr"] else "Ya existía",
             "Rutas enviadas": str(f["rutas"]), "Visitas enviadas": str(f["paradas"]), "Pendientes": str(f["pendientes"]),
-            "Detalle": (f["errores"][0] if f["errores"] else f["mensaje"])} for f in res]), hide_index=True, use_container_width=True)
-        for f in res:
+            "Detalle": (f["errores"][0] if f["errores"] else f["mensaje"])} for f in filas]), hide_index=True, use_container_width=True)
+        for f in filas:
             for e in f["errores"][1:6]:
                 st.caption(f"⚠️ {f['cliente']}: {e}")
-    pend_planes, pend_total = 0, 0
+        if st.button("Ocultar resultado", key="plan_ocultar_res"):
+            st.session_state.pop("plan_resumen_envio", None)
+            st.rerun()
+    pend_planes = 0
     for pl in planes:
         d = detalle_plan(get_conn_fn, pl["id"])
         vp, pp = pendientes_de_envio(d) if d else (0, 0)
         if vp + pp:
             pend_planes += 1
-            pend_total += vp + pp
     etiqueta = (f":material/cloud_upload: Enviar todos los planes del {fecha:%d/%m} a SR ({pend_planes} plan(es) con pendientes)"
                 if pend_planes else f"Todos los planes del {fecha:%d/%m} ya están enviados a SR")
-    if st.button(etiqueta, key="plan_env_todos", type="primary" if pend_planes else "secondary", disabled=not pend_planes,
-                 use_container_width=True, help="Sube a SimpliRoute todos los planes de esta fecha, uno por cliente, y al final te dice cuántos subió de cada uno."):
+    if st.button(etiqueta, key="plan_env_todos", type="primary" if pend_planes else "secondary",
+                 disabled=not pend_planes or bool(problemas), use_container_width=True,
+                 help="Sube a SimpliRoute todos los planes de esta fecha, uno por cliente, y al final te dice cuántos subió de cada uno."):
         token = token_fn()
-        if not token:
-            _flash(st, "error", "No hay token de SimpliRoute configurado.")
-        else:
-            with st.spinner("Enviando los planes a SimpliRoute… (puede tardar un poco)"):
-                resumen, _ok = enviar_planes(get_conn_fn, [pl["id"] for pl in planes], usuario, token=token)
-            st.session_state["plan_resumen_envio"] = resumen
+        with st.spinner("Enviando los planes a SimpliRoute… (puede tardar un poco)"):
+            resumen, _ok = enviar_planes(get_conn_fn, [pl["id"] for pl in planes], usuario, token=token)
+        st.session_state["plan_resumen_envio"] = {"fecha": fecha, "filas": resumen}
         st.rerun()
+    return problemas
 
 
 def _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla):
@@ -1998,10 +2247,16 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla):
             ti = b1.selectbox("Destino", range(len(tiendas)), key="plan_m_dest",
                               format_func=lambda i: f"{tiendas[i][1]} · {tiendas[i][0]}" if tiendas[i][1] is not None else tiendas[i][0])
             gr = b2.number_input("G. Ruta (0 = viaje propio)", min_value=0, step=1, value=0, key="plan_m_gr")
+            gens = [v["nombre"] for v in vehiculos_sincronizados(get_conn_fn) if es_generico(v["nombre"])]
+            idx_g = next((i for i, n in enumerate(gens) if _clave_dummy(n).startswith(DUMMY_GENERICO)), 0)
+            veh_m = st.selectbox("Vehículo (Placa)", gens, index=idx_g if gens else None, key="plan_m_veh",
+                                 help="El genérico con el que se crea la ruta en SimpliRoute (como DC01 o ADICIONALES1). El camión real se asigna después.") if gens else None
+            if not gens:
+                st.caption("No encontré vehículos genéricos sincronizados; sincroniza camiones desde SimpliRoute.")
             obs = st.text_input("Observaciones (opcional)", key="plan_m_obs")
             if st.button("Agregar parada", key="plan_m_btn"):
                 tienda, codigo = tiendas[ti]
-                fila = fila_manual(co, fe, str(codigo) if codigo is not None else tienda, tienda, grupo=int(gr) or None, obs=obs)
+                fila = fila_manual(co, fe, str(codigo) if codigo is not None else tienda, tienda, grupo=int(gr) or None, obs=obs, placa=veh_m or "")
                 v = validar_filas(get_conn_fn, [fila], prueba=prueba, permitir_repetidas=permitir)
                 if not v[0]["ok"]:
                     for e in v[0]["errores"]:
@@ -2056,7 +2311,7 @@ def _seccion_config(st, get_conn_fn, usuario, token_fn, clientes_permitidos):
     cfgs = listar_config(get_conn_fn)
     if cfgs:
         st.dataframe(pd.DataFrame([{"Cliente Orden": c["cliente_orden"], "Cliente": c["cliente"], "visit_type": c["visit_type"] or "",
-                                    "Dummy en SR": c["vehiculo_dummy_nombre"] or "(falta)", "Depósito": c["deposito_nombre"] or "",
+                                    "Dummies": (f"grupo {c['dummy_prefijo']}" if c.get("dummy_prefijo") else (c["vehiculo_dummy_nombre"] or f"genéricos {DUMMY_GENERICO}")), "Depósito": c["deposito_nombre"] or "",
                                     "Activo": "Sí" if c["activo"] else "No"} for c in cfgs]), hide_index=True, use_container_width=True)
     with closing(get_conn_fn()) as conn, conn.cursor() as cur:
         cur.execute("SELECT nombre FROM cat_clientes WHERE COALESCE(activo, TRUE) ORDER BY nombre")
@@ -2069,34 +2324,66 @@ def _seccion_config(st, get_conn_fn, usuario, token_fn, clientes_permitidos):
                            index=clientes_cr.index(actual["cliente"]) if actual.get("cliente") in clientes_cr else 0) if clientes_cr else None
         vt = a2.text_input("visit_type en SR", value=actual.get("visit_type") or _prefijo_codigo(co).lower().replace(" ", ""), key="plan_c_vt",
                            help="Así reconoce Despacho a qué cliente pertenecen las rutas importadas de SR.")
-        st.markdown("**Vehículo dummy en SR**")
-        if actual.get("vehiculo_dummy_nombre"):
-            st.caption(f"Actual: {actual['vehiculo_dummy_nombre']} (id {actual['vehiculo_dummy_sr']})")
-        filtro = st.text_input("Buscar por nombre o placa", key="plan_c_vf", placeholder="ej. dollar")
-        if st.button("Cargar vehículos de SR", key="plan_c_vb"):
-            ok, lista = _vehiculos_sr(token_fn())
-            if not ok:
-                st.error(f"No pude consultar SR: {lista}")
-        vehs = [v for v in _VEH_SR["lista"] if not filtro or filtro.lower() in (v["nombre"] + " " + v["placa"]).lower()][:200]
-        vsel = st.selectbox("Vehículo dummy", range(len(vehs)), key="plan_c_vs", format_func=lambda i: f"{vehs[i]['nombre'] or '(sin nombre)'} · {vehs[i]['placa']} · id {vehs[i]['id']}") if vehs else None
-        if not vehs:
-            st.caption("Presiona «Cargar vehículos de SR» y filtra para elegir el dummy.")
+        st.caption("El vehículo de cada viaje viene en la columna **Placa** del Excel; aquí no hay que elegir dummies.")
+        # variables por defecto (el bloque opcional las redefine solo si se abre y se usa)
+        grupo_sel, un_solo, vsel, vehs, en_sr = None, False, None, [], False
+        with st.expander("Opcional: vehículo por defecto para filas sin Placa"):
+            st.markdown("**Dummies del cliente**")
+            grupos = grupos_dummy(get_conn_fn)
+            gen = dummies_genericos(get_conn_fn)
+            st.caption(f"Si no eliges nada, el cliente usa los genéricos «{DUMMY_GENERICO}» que ya están sincronizados "
+                       + (f"({len(gen)}: {gen[0]['nombre']} … {gen[-1]['nombre']}). " if gen else "(no encontré ninguno todavía). ")
+                       + "Solo elige un grupo si el cliente tiene el suyo (como DC01, DC02…). No se crea ningún vehículo: cada viaje toma el siguiente dummy.")
+            sug = sugerir_prefijo(co, grupos)
+            prefs = [""] + sorted(grupos)
+            ya = _clave_dummy(actual.get("dummy_prefijo") or "")
+            idx_def = prefs.index(ya) if ya in prefs else 0        # por defecto ninguno: sin Placa en el Excel = error de plantilla
+            grupo_sel = st.selectbox("Grupo de dummies", prefs, index=idx_def, key=f"plan_c_grp_{co}",
+                                     format_func=lambda x: f"Genéricos «{DUMMY_GENERICO}» (por defecto)" if not x else
+                                     f"{x}  ·  {len(grupos[x])} vehículo(s): {grupos[x][0]['nombre']} … {grupos[x][-1]['nombre']}")
+            if sug and not ya:
+                st.caption(f"Sugerido por las iniciales de «{co}»: **{sug}**.")
+            if not grupos:
+                st.caption("No encontré dummies sincronizados. Sincroniza camiones desde SimpliRoute en Catálogos → Integración SimpliRoute.")
+            un_solo = st.checkbox("Este cliente usa un solo vehículo dummy (no un grupo)", key=f"plan_c_uno_{co}", value=bool(actual.get("vehiculo_dummy_sr") and not ya))
+            vsel, vehs, en_sr = None, [], False
+            if un_solo:
+                if actual.get("vehiculo_dummy_nombre"):
+                    st.caption(f"Actual: {actual['vehiculo_dummy_nombre']} (id {actual['vehiculo_dummy_sr']})")
+                en_sr = st.checkbox("No aparece: buscarlo directo en SimpliRoute", key="plan_c_fsr")
+                filtro = st.text_input("Buscar por nombre", key="plan_c_vf", placeholder="ej. unisuper")
+                if en_sr:
+                    if st.button("Cargar vehículos de SR", key="plan_c_vb"):
+                        ok, lista = _vehiculos_sr(token_fn())
+                        if not ok:
+                            st.error(f"No pude consultar SR: {lista}")
+                    vehs = [dict(id=v["id"], nombre=v["nombre"] or v["placa"], lat=v["lat"], lon=v["lon"]) for v in _VEH_SR["lista"]]
+                else:
+                    vehs = vehiculos_sincronizados(get_conn_fn)
+                vehs = [v for v in vehs if not filtro or filtro.lower() in str(v["nombre"]).lower()][:200]
+                vsel = st.selectbox("Vehículo dummy", range(len(vehs)), key="plan_c_vs",
+                                    format_func=lambda i: f"{vehs[i]['nombre'] or '(sin nombre)'} · id {vehs[i]['id']}") if vehs else None
         d1, d2, d3 = st.columns([3, 1, 1])
         dep = d1.selectbox("Depósito de salida y retorno", [""] + DEPOSITOS_PARAMETROS, key="plan_c_dep",
                            index=([""] + DEPOSITOS_PARAMETROS).index(actual["deposito_nombre"]) if actual.get("deposito_nombre") in DEPOSITOS_PARAMETROS else 0)
         base = sr_int.UBICACION_BASE_VEHICULOS_SR
         lat = d2.number_input("Latitud", value=float(actual.get("deposito_lat") or base["latitud"]), format="%.6f", key="plan_c_lat")
         lon = d3.number_input("Longitud", value=float(actual.get("deposito_lon") or base["longitud"]), format="%.6f", key="plan_c_lon")
-        usar_dummy = st.checkbox("Tomar las coordenadas del depósito de la ubicación del vehículo dummy en SR", key="plan_c_ud")
+        usar_dummy = st.checkbox("Tomar las coordenadas del depósito de la ubicación del vehículo (solo si lo buscaste en SR)", key="plan_c_ud") if en_sr else False
         act = st.checkbox("Activo", value=actual.get("activo", True), key="plan_c_act")
         if st.button("Guardar configuración", type="primary", key="plan_c_save", disabled=not cli):
             datos = dict(cliente_orden=co, cliente=cli, visit_type=vt, deposito_nombre=dep or None, deposito_lat=lat, deposito_lon=lon, activo=act,
-                         vehiculo_dummy_sr=actual.get("vehiculo_dummy_sr"), vehiculo_dummy_nombre=actual.get("vehiculo_dummy_nombre"))
-            if vsel is not None:
-                v = vehs[vsel]
-                datos.update(vehiculo_dummy_sr=v["id"], vehiculo_dummy_nombre=v["nombre"] or v["placa"])
-                if usar_dummy and v["lat"] and v["lon"]:
-                    datos.update(deposito_lat=float(v["lat"]), deposito_lon=float(v["lon"]))
+                         vehiculo_dummy_sr=None, vehiculo_dummy_nombre=None, dummy_prefijo=None)
+            if un_solo:
+                if vsel is not None:
+                    v = vehs[vsel]
+                    datos.update(vehiculo_dummy_sr=v["id"], vehiculo_dummy_nombre=v["nombre"])
+                    if usar_dummy and v.get("lat") and v.get("lon"):
+                        datos.update(deposito_lat=float(v["lat"]), deposito_lon=float(v["lon"]))
+                else:
+                    datos.update(vehiculo_dummy_sr=actual.get("vehiculo_dummy_sr"), vehiculo_dummy_nombre=actual.get("vehiculo_dummy_nombre"))
+            else:
+                datos.update(dummy_prefijo=grupo_sel or None)
             ok, msg = guardar_config(get_conn_fn, datos, usuario)
             (st.success if ok else st.error)(msg)
             if ok:
