@@ -36,6 +36,7 @@ MODO_PRUEBA_POR_DEFECTO = True     # True = los planes nuevos llevan " -PRUEBA" 
 LOTE_ENVIO = 25                    # máximo de rutas+visitas que se envían a SR por clic
 DIAS_RETENCION = 90                # planes cerrados con más días que esto se pueden purgar
 MAX_FILAS_EXCEL = 500
+MAX_VIAJES_POR_PLACA_DIA = 2       # un camión REAL en más viajes el mismo día casi seguro es un error de la plantilla (doble viaje = 2)
 PERFILES_PLAN = ("Administrador", "SuperAdministrador", "Operador", "Supervisor")
 PERFILES_CONFIG = ("Administrador", "SuperAdministrador")
 HORA_INICIO_RUTA = "07:00:00"
@@ -701,6 +702,27 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                     for f in lista:
                         f["errores"].append(f"El grupo {gr} trae {etiqueta} distintos: {', '.join(sorted(vals))}.")
 
+        # --- un camión real en demasiados viajes el mismo día (casi seguro: placa genérica puesta como real, o error de plantilla) ---
+        viajes_por_placa = {}
+        for f in out:
+            if f.get("placa") and f["fecha"] and f["cliente"]:
+                viajes_por_placa.setdefault((f["placa"], f["fecha"]), set()).add(
+                    ("g", f["cliente_orden"], f["grupo"]) if f["grupo"] is not None else ("fila", f["n"]))
+        if viajes_por_placa:
+            cur.execute("""SELECT v.placa, p.fecha, COUNT(*) FROM plan_viaje v JOIN plan_transporte p ON p.id = v.plan_id
+                           WHERE v.placa = ANY(%s) AND p.fecha = ANY(%s) AND v.estado <> 'cancelado' AND p.prueba = %s GROUP BY v.placa, p.fecha""",
+                        (sorted({k[0] for k in viajes_por_placa}), sorted({k[1] for k in viajes_por_placa}), bool(prueba)))
+            ya_en_bd = {(a, b): c_ for a, b, c_ in cur.fetchall()}
+            for (placa_k, fecha_k), viajes_k in viajes_por_placa.items():
+                total_k = len(viajes_k) + ya_en_bd.get((placa_k, fecha_k), 0)
+                if total_k > MAX_VIAJES_POR_PLACA_DIA:
+                    for f in out:
+                        if f.get("placa") == placa_k and f["fecha"] == fecha_k:
+                            f["errores"].append(
+                                f"El camión {placa_k} quedaría en {total_k} viajes el {fecha_k:%d/%m/%Y} (máximo {MAX_VIAJES_POR_PLACA_DIA}). "
+                                "Si es un vehículo genérico (como DC01 o ADICIONALES1) ponlo con su nombre; si es un camión real, "
+                                "cada viaje debe llevar el suyo o dejarse sin asignar.")
+
         # --- duplicados dentro del archivo ---
         if not permitir_repetidas:
             vistos = {}
@@ -1209,6 +1231,26 @@ def _titulo_visita(p):
     return f"{cod} {p['destino']}".strip() if cod.isdigit() else p["destino"]
 
 
+def visit_type_por_defecto(cliente_orden):
+    """GT-DOLLAR CITY -> 'dollarcity' (así viene en SR). Sin él, Despacho no reconocería de qué cliente es la ruta importada."""
+    return re.sub(r"[^a-z0-9]", "", _prefijo_codigo(cliente_orden or "").lower())
+
+
+def _asegurar_visit_type(get_conn_fn, cfg):
+    """Si el cliente no tiene visit_type guardado, se guarda el derivado y se deja mapeado al cliente (para la importación de rutas)."""
+    vt = cfg.get("visit_type") or visit_type_por_defecto(cfg.get("cliente_orden"))
+    if not vt:
+        return
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE cat_transporte_cliente SET visit_type = %s WHERE cliente_orden = %s AND (visit_type IS NULL OR visit_type = '')",
+                        (vt, cfg["cliente_orden"]))
+            cur.execute("INSERT INTO cat_mapeo_cliente_sr (visit_type, cliente) VALUES (%s,%s) ON CONFLICT (visit_type) DO NOTHING", (vt, cfg["cliente"]))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _payload_visita(plan, viaje, p, cfg):
     d = {
         "route": viaje["route_id_sr"], "title": _titulo_visita(p),
@@ -1218,8 +1260,9 @@ def _payload_visita(plan, viaje, p, cfg):
     }
     if p.get("observaciones"):
         d["notes"] = p["observaciones"]
-    if cfg.get("visit_type"):
-        d["visit_type"] = cfg["visit_type"]
+    vt = cfg.get("visit_type") or visit_type_por_defecto(cfg.get("cliente_orden"))
+    if vt:
+        d["visit_type"] = vt
     if p.get("duracion"):
         d["duration"] = p["duracion"]
     if p.get("ventana_ini"):
@@ -1319,6 +1362,8 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
         plan, viajes = d["plan"], d["viajes"]
         cfgs = [c for c in listar_config(get_conn_fn) if c["cliente_orden"] == plan["cliente_orden"]]
         cfg = cfgs[0] if cfgs else None
+        if cfg:
+            _asegurar_visit_type(get_conn_fn, cfg)
         if cfg and not pool_propio(get_conn_fn, cfg):
             autoconfigurar_dummy(get_conn_fn, plan["cliente_orden"])
             cfg = next((x for x in listar_config(get_conn_fn) if x["cliente_orden"] == plan["cliente_orden"]), cfg)
@@ -1601,6 +1646,21 @@ def requisitos_envio(get_conn_fn, planes, token_fn):
                 problemas.append(f"{pl['nombre']}: {n} viaje(s) sin vehículo. Falta la columna Placa en el Excel (usa el genérico, "
                                  "como DC01 o ADICIONALES1, o el camión real).")
     return problemas
+
+
+def advertencias_envio(get_conn_fn, planes):
+    """Avisos que NO bloquean el envío pero conviene leer: p. ej. depósito sin coordenadas (las rutas saldrían de la ubicación base)."""
+    avisos = []
+    try:
+        cfg = {c["cliente_orden"]: c for c in listar_config(get_conn_fn)}
+        for co in sorted({pl["cliente_orden"] for pl in planes}):
+            c = cfg.get(co)
+            if c and (c.get("deposito_lat") is None or c.get("deposito_lon") is None):
+                avisos.append(f"{co}: el depósito no tiene coordenadas en Configuración; las rutas saldrán y regresarán a la ubicación base de Ransa, "
+                              "no al depósito, y SR calculará mal sus distancias.")
+    except Exception:
+        pass
+    return avisos
 
 
 PRESUPUESTO_ENVIO_SEGUNDOS = 100     # tiempo máximo de un clic de "enviar todos"; si falta algo, se avisa y se vuelve a presionar
@@ -2235,6 +2295,8 @@ def _panel_plantilla(st, get_conn_fn, usuario, token_fn, prueba, clientes=None):
                 elif f["pendientes"]:
                     st.warning(f"{f['cliente']} ({f['plan']}): {f['mensaje']}")
         problemas = requisitos_envio(get_conn_fn, pend_planes, token_fn) if pend_planes else []
+        for _av in (advertencias_envio(get_conn_fn, pend_planes) if pend_planes else []):
+            st.warning(_av)
         if problemas:
             st.error("**Todavía no se puede enviar a SimpliRoute:**\n\n" + "\n".join(f"- {t}" for t in problemas))
         if st.button(f":material/cloud_upload: Enviar los {len(pend_planes)} plan(es) pendientes de esta plantilla" if pend_planes
@@ -2502,6 +2564,9 @@ def _seccion_cargar(st, get_conn_fn, usuario, cfgs, prueba, falla, clientes_perm
                 if st.button("Ir a Asignar camiones", key="plan_ir_asig"):
                     st.session_state["plan_ir_a"] = ("Asignar camiones", min(f["fecha"] for f in val if f["fecha"]))
                     st.rerun()
+            if ok_f and not prueba and any(f["fecha"] <= hoy_guatemala() for f in ok_f):
+                st.warning("Estás cargando un plan para **hoy** en modo REAL: al enviarlo se crearán rutas reales en SimpliRoute que se mezclan con las "
+                           "de hoy (y que «Importar Rutas» de Despacho verá). Para un piloto, marca «Modo prueba» o usa una fecha futura.")
             if ok_f:
                 st.markdown("**Se crearía:**")
                 for (co, fe), r in agrupar_para_vista(ok_f).items():
