@@ -894,7 +894,14 @@ def _aplicar_vehiculo_fila(cur, viaje_id, f, usuario):
             if dummy_act is None and placa_act is None:
                 cur.execute("UPDATE plan_viaje SET dummy_sr_id = %s WHERE id = %s", (f["vehiculo_sr_id"], viaje_id))
         elif placa_act is None:
-            _fijar_camion_piloto(cur, viaje_id, f["placa"], f["conductor"], usuario)
+            piloto = f["conductor"]
+            if not piloto:                       # sin conductor en el Excel: el piloto habitual de ese camión en Control de Ruta
+                cur.execute("SELECT piloto FROM cat_camiones WHERE placa = %s", (f["placa"],))
+                r_ = cur.fetchone()
+                if r_ and r_[0]:
+                    cur.execute("SELECT 1 FROM cat_pilotos WHERE nombre = %s", (r_[0],))
+                    piloto = r_[0] if cur.fetchone() else None
+            _fijar_camion_piloto(cur, viaje_id, f["placa"], piloto, usuario)
             return
     if f.get("conductor") and piloto_act is None:
         cur.execute("SELECT id_sr FROM cat_pilotos WHERE nombre = %s", (f["conductor"],))
@@ -1184,11 +1191,19 @@ def sincronizar_despachados(get_conn_fn):
             sr_int._asegurar_tabla_vinculo(conn)
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE plan_viaje pv SET estado = 'despachado', id_viaje_cr = s.id_viaje
+                    UPDATE plan_viaje pv SET estado = 'despachado', id_viaje_cr = s.id_viaje,
+                        placa = COALESCE(pv.placa, NULLIF(vj.placa, '')),
+                        piloto = COALESCE(pv.piloto, NULLIF(vj.piloto, '')),
+                        vehiculo_sr_id = COALESCE(pv.vehiculo_sr_id, (SELECT c.id_sr FROM cat_camiones c WHERE c.placa = vj.placa LIMIT 1)),
+                        piloto_sr_id = COALESCE(pv.piloto_sr_id, (SELECT pi.id_sr FROM cat_pilotos pi WHERE pi.nombre = vj.piloto LIMIT 1))
                     FROM sr_vinculo_viaje s JOIN viajes vj ON vj.id_viaje = s.id_viaje
                     WHERE pv.route_id_sr = s.route_id_sr AND vj.estado <> 'Anulado'
                       AND pv.estado IN ('pendiente','en_sr','asignado')""")
                 n = cur.rowcount
+                # Los ya despachados antes de este cambio y que quedaron sin placa/piloto también se completan.
+                cur.execute("""
+                    UPDATE plan_viaje pv SET placa = COALESCE(pv.placa, NULLIF(vj.placa, '')), piloto = COALESCE(pv.piloto, NULLIF(vj.piloto, ''))
+                    FROM viajes vj WHERE pv.estado = 'despachado' AND pv.id_viaje_cr = vj.id_viaje AND (pv.placa IS NULL OR pv.piloto IS NULL)""")
             conn.commit()
         return n
     except Exception:
@@ -1900,10 +1915,11 @@ def _viaje_y_plan(get_conn_fn, viaje_id):
         return dict(v), dict(p)
 
 
-def refrescar_desde_sr(get_conn_fn, plan_id, usuario, token=None):
+def refrescar_desde_sr(get_conn_fn, plan_id, usuario, token=None, solo_completar=False):
     """Consulta las rutas de SR de la fecha del plan (sin visitas: es ligero) y detecta lo que se cambió allá:
     otro camión/piloto, o una ruta que ya no existe. Nunca pisa en silencio: marca el viaje como 'cambiado en SR'.
-    Devuelve (ok, mensaje, cambios)."""
+    Con solo_completar=True (lo que se hace solo al abrir la pantalla) únicamente LLENA lo que Control de Ruta no tiene (camión o piloto
+    vacíos) con lo que figure en SR; lo que Control de Ruta ya tiene no se toca. Devuelve (ok, mensaje, cambios)."""
     if not token:
         return False, "No hay token de SimpliRoute.", []
     try:
@@ -1934,9 +1950,26 @@ def refrescar_desde_sr(get_conn_fn, plan_id, usuario, token=None):
                 if r is None:
                     cur.execute("UPDATE plan_viaje SET error=%s WHERE id=%s",
                                 ("La ruta no se encontró en SR (¿se borró allá?)", v["id"]))
-                    cambios.append(f"Viaje {v['num']}: la ruta ya no existe en SR.")
+                    if not solo_completar:
+                        cambios.append(f"Viaje {v['num']}: la ruta ya no existe en SR.")
                     continue
                 veh_sr, drv_sr = r.get("vehicle"), r.get("driver")
+                if solo_completar:
+                    sets, vals, partes = [], [], []
+                    if v.get("vehiculo_sr_id") is None and veh_sr is not None and veh_sr not in ids_dummy:
+                        placa = placa_de.get(int(veh_sr))
+                        sets += ["placa = %s", "vehiculo_sr_id = %s", "estado = 'asignado'", "cambiado_en_sr = TRUE"]
+                        vals += [placa, veh_sr]
+                        partes.append(placa or "un vehículo que no está en el catálogo")
+                    if v.get("piloto_sr_id") is None and not v.get("piloto") and drv_sr is not None:
+                        piloto = piloto_de.get(int(drv_sr))
+                        sets += ["piloto = %s", "piloto_sr_id = %s"]
+                        vals += [piloto, drv_sr]
+                        partes.append(piloto or "un piloto que no está en el catálogo")
+                    if sets:
+                        cur.execute(f"UPDATE plan_viaje SET {', '.join(sets)} WHERE id = %s", vals + [v["id"]])
+                        cambios.append(f"Viaje {v['num']}: " + " / ".join(partes) + ".")
+                    continue
                 mismo_veh = (veh_sr == v.get("vehiculo_sr_id")) or (v.get("vehiculo_sr_id") is None and veh_sr in ids_dummy)
                 mismo_drv = (drv_sr == v.get("piloto_sr_id")) or (drv_sr is None and v.get("piloto_sr_id") is None)
                 if mismo_veh and mismo_drv:
@@ -2201,6 +2234,48 @@ def _opciones_asignacion(get_conn_fn):
     return _OPCIONES
 
 
+def diagnostico_vehiculos(get_conn_fn):
+    """Resumen de los camiones del catálogo: cuántos se ofrecen para asignar y por qué no se ofrecen los demás."""
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT placa, activo, id_sr, COALESCE(pendiente_completar, FALSE) FROM cat_camiones")
+        filas = cur.fetchall()
+    r = {"disponibles": 0, "inactivos": [], "sin_sr": [], "genericos": [], "total": len(filas)}
+    for placa, activo, id_sr, pend in filas:
+        if id_sr is None:
+            r["sin_sr"].append(placa)
+        elif es_generico(placa):
+            r["genericos"].append(placa)
+        elif activo is False or pend:
+            r["inactivos"].append(placa)
+        else:
+            r["disponibles"] += 1
+    return r
+
+
+def diagnosticar_placa(get_conn_fn, texto):
+    """¿Por qué (no) aparece este camión? Devuelve (ok, mensaje)."""
+    texto = _txt(texto)
+    if not texto:
+        return True, ""
+    clave = sr_int.clave_placa(texto)
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT placa, activo, id_sr, COALESCE(pendiente_completar, FALSE) FROM cat_camiones")
+        hallados = [r for r in cur.fetchall() if sr_int.clave_placa(r[0]) == clave or _clave_dummy(r[0]) == _clave_dummy(texto)]
+    if not hallados:
+        return False, (f"«{texto}» NO está en el catálogo de camiones de Control de Ruta. Aunque exista en SimpliRoute, hay que traerlo: "
+                       "Catálogos → Integración SimpliRoute → sincronizar camiones.")
+    placa, activo, id_sr, pend = hallados[0]
+    if id_sr is None:
+        return False, f"{placa} está en el catálogo pero NO tiene el id de SimpliRoute (no está sincronizado). Sincroniza camiones desde SimpliRoute."
+    if es_generico(placa):
+        return False, (f"{placa} se trata como vehículo GENÉRICO (su nombre es letras + número, no una placa), por eso nunca se ofrece como camión real. "
+                       "Es correcto si es un dummy; si es un camión real con ese nombre, avísale a un Administrador.")
+    if activo is False or pend:
+        return False, (f"{placa} está sincronizado pero INACTIVO / pendiente de completar" + (" (lo creó la sincronización con SR)" if pend else "") +
+                       ". Ábrelo en Catálogos → Camiones, complétalo y márcalo como activo; luego presiona «Actualizar lista» aquí.")
+    return True, f"{placa} está disponible para asignar (id de SR {id_sr}). Si no lo ves, presiona «Actualizar lista»: la lista se guarda 2 minutos."
+
+
 def _vehiculos_sr(token):
     """Lista ligera de vehículos de SR (id, nombre, placa, ubicación). Una sola copia, 5 minutos."""
     if _time.time() - _VEH_SR["t"] > 300 or not _VEH_SR["lista"]:
@@ -2389,6 +2464,15 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
         st.warning("El plan ya no existe.")
         return
     viajes = d["viajes"]
+    if any(v.get("route_id_sr") and v["estado"] in ("en_sr", "asignado") for v in viajes) and _cada(st, f"plan_auto_ref_{plan['id']}", 120):
+        _tok = token_fn()
+        if _tok:       # una consulta ligera (rutas del día): completa camión/piloto que falten con lo que figure en SimpliRoute
+            _ok_r, _msg_r, _camb = refrescar_desde_sr(get_conn_fn, plan["id"], usuario, token=_tok, solo_completar=True)
+            if _camb:
+                for _c in _camb[:10]:
+                    _flash(st, "info", "Traído de SimpliRoute — " + _c)
+                _reiniciar_widgets(st, viajes)
+                st.rerun()
     activos = [v for v in viajes if v["estado"] != "cancelado"]
     con_camion = sum(1 for v in activos if v["estado"] in ("asignado", "despachado"))
     por_enviar_v, por_enviar_p = pendientes_de_envio(d)
@@ -2447,6 +2531,22 @@ def _seccion_asignar(st, get_conn_fn, usuario, token_fn, cfgs, prueba, falla):
     if not viajes:
         st.info("Este plan todavía no tiene viajes.")
         return
+    with st.expander("¿No aparece un camión para asignar?"):
+        dg = diagnostico_vehiculos(get_conn_fn)
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Disponibles", dg["disponibles"], help="Activos, con id de SimpliRoute y que no son genéricos.")
+        g2.metric("Inactivos / por completar", len(dg["inactivos"]), help="Sincronizados desde SR pero sin completar o inactivos en Catálogos.")
+        g3.metric("Sin id de SR", len(dg["sin_sr"]), help="Están en el catálogo pero no sincronizados con SimpliRoute.")
+        g4.metric("Genéricos (dummies)", len(dg["genericos"]), help="Nombre de letras + número (DC01, ADICIONALES1…): no se ofrecen como camión real.")
+        if dg["inactivos"]:
+            st.caption("Inactivos / por completar: " + ", ".join(dg["inactivos"][:30]) + (" …" if len(dg["inactivos"]) > 30 else ""))
+        busca = st.text_input("Escribe la placa que no encuentras", key="plan_diag_placa", placeholder="ej. 330BHZ o C-330BHZ")
+        if busca.strip():
+            ok_d, msg_d = diagnosticar_placa(get_conn_fn, busca)
+            (st.success if ok_d else st.warning)(msg_d)
+        if st.button("Actualizar lista de camiones", key="plan_diag_refrescar"):
+            _OPCIONES["t"] = 0.0
+            st.rerun()
     opts = _opciones_asignacion(get_conn_fn)
     for v in viajes:
         _tarjeta_viaje(st, get_conn_fn, usuario, token_fn, plan, v, opts, falla)
