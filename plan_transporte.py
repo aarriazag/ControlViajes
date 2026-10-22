@@ -36,6 +36,7 @@ MODO_PRUEBA_POR_DEFECTO = True     # True = los planes nuevos llevan " -PRUEBA" 
 LOTE_ENVIO = 25                    # máximo de rutas+visitas que se envían a SR por clic
 DIAS_RETENCION = 90                # planes cerrados con más días que esto se pueden purgar
 MAX_FILAS_EXCEL = 500
+DIAS_COORD_SR = 3                  # días de visitas de SR que se revisan para completar coordenadas que falten
 MAX_VIAJES_POR_PLACA_DIA = 2       # un camión REAL en más viajes el mismo día casi seguro es un error de la plantilla (doble viaje = 2)
 PERFILES_PLAN = ("Administrador", "SuperAdministrador", "Operador", "Supervisor")
 PERFILES_CONFIG = ("Administrador", "SuperAdministrador")
@@ -619,7 +620,8 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                 f["lon"] = dest["lon"] if dest["lon"] is not None else lon
                 f["dest_actualiza_coord"] = dest["lat"] is None and lat is not None
                 if f["lat"] is None:
-                    f["errores"].append(f"El destino '{dest['tienda']}' existe pero no tiene coordenadas: agrégalas en el Excel.")
+                    f["coord_pendiente_sr"] = True
+                    f["avisos"].append("Sin coordenadas: se tomarán de SimpliRoute (visitas de los últimos días) al enviar el plan.")
                 if dest["codigo"] is not None:
                     f["dest_codigo"] = dest["codigo"]
             elif c and cod and not conflicto_dest:
@@ -629,7 +631,8 @@ def validar_filas(get_conn_fn, filas, prueba=False, permitir_repetidas=False, ho
                 if not nombre:
                     f["errores"].append("Destino nuevo: falta el nombre del domicilio.")
                 if lat is None:
-                    f["errores"].append("Destino nuevo: faltan las coordenadas (latitud y longitud).")
+                    f["coord_pendiente_sr"] = True
+                    f["avisos"].append("Destino nuevo sin coordenadas: se agregará al catálogo y sus coordenadas se tomarán de SimpliRoute al enviar.")
                 else:
                     f["avisos"].append("Destino nuevo: se agregará al catálogo de tiendas del cliente.")
             else:
@@ -1320,6 +1323,46 @@ def _rutas_sr_del_dia(plan, token):
     return {(str(r.get("plan")), str(r.get("reference"))): str(r.get("id")) for r in (lista or [])}
 
 
+def _completar_coordenadas(get_conn_fn, plan, viajes, token, res):
+    """Antes de crear las visitas: a las paradas sin coordenadas se las busca (1) en el catálogo de tiendas y, si no están, (2) en las visitas
+    recientes de SimpliRoute (una sola consulta, que además deja las coordenadas en el catálogo para la próxima vez). Lo que no aparezca queda
+    como «error: sin coordenadas» SOLO esa parada (no frena el resto del plan) y se reintenta al volver a enviar."""
+    faltan = [(v, p) for v in viajes if v["estado"] not in ("cancelado", "despachado") for p in v["paradas"]
+              if p["estado"] in ("pendiente", "error") and (p["latitud"] is None or p["longitud"] is None)]
+    if not faltan:
+        return
+
+    def _leer_catalogo():
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            for _v, p in faltan:
+                if p["latitud"] is not None and p["longitud"] is not None:
+                    continue
+                cod = str(p.get("cod_destino") or "")
+                if cod.isdigit():
+                    cur.execute("SELECT latitud, longitud FROM cat_clientes_tiendas WHERE cliente = %s AND codigo_tienda = %s", (plan["cliente"], int(cod)))
+                else:
+                    cur.execute("SELECT latitud, longitud FROM cat_clientes_tiendas WHERE cliente = %s AND tienda = %s", (plan["cliente"], p["destino"]))
+                r = cur.fetchone()
+                if r and r[0] is not None and r[1] is not None:
+                    cur.execute("UPDATE plan_parada SET latitud = %s, longitud = %s WHERE id = %s", (r[0], r[1], p["id"]))
+                    p["latitud"], p["longitud"] = r[0], r[1]
+            conn.commit()
+
+    _leer_catalogo()
+    if any((p["latitud"] is None or p["longitud"] is None) and p["estado"] == "pendiente" for _v, p in faltan):
+        ok, resumen, _det = sr_int.sincronizar_coordenadas_tiendas_desde_sr(get_conn_fn, dias=DIAS_COORD_SR, token=token)
+        res["notas"].append(("Coordenadas completadas desde SimpliRoute: " if ok else "No pude consultar las coordenadas en SimpliRoute: ") + str(resumen))
+        _leer_catalogo()
+    msg = (f"Sin coordenadas: la tienda no aparece en las visitas de SimpliRoute de los últimos {DIAS_COORD_SR} días ni tiene coordenadas en el "
+           "catálogo. Cárgalas en Catálogos (columnas latitud y longitud) y vuelve a enviar.")
+    for _v, p in faltan:
+        if p["latitud"] is None or p["longitud"] is None:
+            if p["estado"] != "error" or p.get("error") != msg:
+                _upd(get_conn_fn, "plan_parada", p["id"], estado="error", error=msg)
+                p["estado"], p["error"] = "error", msg
+            res["errores"].append(f"{p['codigo_pedido']} ({p['destino']}): sin coordenadas.")
+
+
 def _resolver_inciertas(get_conn_fn, plan, viajes, token):
     """Paradas que quedaron 'enviando' (se cortó la conexión a medias): se consulta SR UNA vez por fecha para
     ver si la visita sí se creó, y solo si no existe vuelve a 'pendiente'. Así nunca se duplica una visita."""
@@ -1392,6 +1435,9 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
         if aviso:
             res["notas"].append(aviso)
 
+        # 2b) Coordenadas que falten (catálogo → SimpliRoute).
+        _completar_coordenadas(get_conn_fn, plan, viajes, token, res)
+
         # 3) Rutas y visitas pendientes, por lotes.
         unidades = 0
         rutas_dia = None
@@ -1407,6 +1453,8 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
                 activas = [p for p in v["paradas"] if p["estado"] != "cancelada"]
                 if not activas:
                     continue
+                if not any(p["latitud"] is not None and p["longitud"] is not None for p in activas):
+                    continue                                    # ninguna parada de este viaje tiene ubicación: no se crea una ruta vacía
                 ref = activas[0]["codigo_pedido"]
                 rid = None
                 dummy_id = v.get("dummy_sr_id") or (pool[(int(v["num"]) - 1) % len(pool)]["id"] if pool else None)
@@ -1447,9 +1495,7 @@ def enviar_plan_a_sr(get_conn_fn, plan_id, usuario, token=None, max_unidades=Non
                 if unidades >= max_unidades:
                     break
                 if p["latitud"] is None or p["longitud"] is None:
-                    _upd(get_conn_fn, "plan_parada", p["id"], estado="error", error="Sin coordenadas")
-                    res["errores"].append(f"{p['codigo_pedido']}: la parada no tiene coordenadas.")
-                    continue
+                    continue                                    # ya quedó marcada «sin coordenadas» arriba (_completar_coordenadas)
                 _upd(get_conn_fn, "plan_parada", p["id"], estado="enviando")        # antes de llamar a SR
                 ok, valor, nota = _crear_visita_sr(_payload_visita(plan, v, p, cfg), token)
                 unidades += 1
@@ -1697,8 +1743,8 @@ def enviar_planes(get_conn_fn, plan_ids, usuario, token=None, presupuesto=None, 
             fila["rutas"] += r["rutas"]
             fila["paradas"] += r["paradas"]
             fila["pendientes"] = r["pendientes"]
-            fila["errores"] += r["errores"]
-            fila["notas"] += r["notas"]
+            fila["errores"] = list(dict.fromkeys(fila["errores"] + r["errores"]))      # sin repetir el mismo error en cada lote
+            fila["notas"] = list(dict.fromkeys(fila["notas"] + r["notas"]))
             fila["mensaje"] = r["mensaje"]
             if not r["ok"] and r["rutas"] == 0 and r["paradas"] == 0:
                 break                                   # sin avance: no tiene caso repetir
@@ -2786,6 +2832,16 @@ def _seccion_config(st, get_conn_fn, usuario, token_fn, clientes_permitidos):
             st.warning(f"Hay {len(rep_cod)} código(s) repetido(s) dentro de un mismo cliente. Un código debe identificar UNA sola tienda; "
                        "corrígelos en Catálogos → Clientes y Tiendas (mientras existan, la base no puede bloquear nuevos repetidos): "
                        + "; ".join(f"{c} · código {k}: {', '.join(t)}" for c, k, t in rep_cod[:8]) + (" …" if len(rep_cod) > 8 else ""))
+        cdias, cbtn = st.columns([1, 3], vertical_alignment="bottom")
+        dias_sr = cdias.number_input("Días de SR a revisar", min_value=1, max_value=14, value=DIAS_COORD_SR, key="plan_dias_coord")
+        if cbtn.button("Buscar en SimpliRoute las coordenadas que falten en el catálogo", key="plan_coord_sr",
+                       help="Copia a Catálogos la latitud y longitud de las tiendas que aparecen en las visitas recientes de SR (cliente + código). "
+                            "No toca nombre ni km. Cada día revisado tarda unos 15 segundos."):
+            with st.spinner("Consultando SimpliRoute…"):
+                ok, resumen, detalle = sr_int.sincronizar_coordenadas_tiendas_desde_sr(get_conn_fn, dias=int(dias_sr), token=token_fn())
+            (st.success if ok else st.error)(resumen)
+            if detalle:
+                st.caption(detalle)
         if st.button(f"Purgar planes cerrados de más de {DIAS_RETENCION} días", key="plan_purgar"):
             ok, msg = purgar_planes_cerrados(get_conn_fn, usuario)
             (st.success if ok else st.error)(msg)
