@@ -4635,9 +4635,20 @@ def pagina_catalogos():
                          "'🔄 Actualizar catálogos' arriba (puede que se haya agregado después de que abriste esta pantalla)." if opciones_vivas
                          else "⚠️ Ese catálogo está vacío todavía — agrega al menos un registro ahí primero."
                 )
+            # Orden: con filas agregables/borrables Streamlit desactiva el orden por clic en el encabezado, así que se ofrece aquí.
+            # Siempre se muestran TODAS las filas (nunca se filtra): este botón de guardar borra lo que no venga en la tabla.
+            _oc1, _oc2, _oc3 = st.columns([2, 1, 3], vertical_alignment="bottom")
+            _orden_col = _oc1.selectbox("Ordenar por", ["(orden original)"] + list(df_actual_completo.columns), key=f"orden_col_{catalogo_sel}")
+            _orden_desc = _oc2.checkbox("Descendente", key=f"orden_desc_{catalogo_sel}")
+            _oc3.caption("Cambiar el orden recarga la tabla: guarda antes lo que hayas editado." +
+                         (" En «activo», lo inactivo sale primero." if "activo" in df_actual_completo.columns else ""))
+            df_para_editor = df_actual_completo
+            if _orden_col != "(orden original)":
+                df_para_editor = df_actual_completo.sort_values(_orden_col, ascending=not _orden_desc, kind="stable",
+                                                                na_position="last").reset_index(drop=True)
             df_editado = st.data_editor(
-                df_actual_completo, use_container_width=True, height=280, num_rows="dynamic",
-                column_config=column_config, key=f"editor_{catalogo_sel}"
+                df_para_editor, use_container_width=True, height=280, num_rows="dynamic",
+                column_config=column_config, key=f"editor_{catalogo_sel}_{_orden_col}_{int(_orden_desc)}"
             )
             if st.button(":material/save: Guardar Cambios de la Tabla", key=f"guardar_editor_{catalogo_sel}"):
                 if config["tabla"] == "cat_camiones" and "placa" in df_editado.columns:
@@ -5093,6 +5104,56 @@ def pagina_catalogos():
                 st.dataframe(pd.DataFrame(_camiones_pend_sr, columns=["Placa (de SR)", "ID en SR"]), use_container_width=True, hide_index=True)
                 st.caption("SR no trae el tipo ni el transportista. Complétalos en el catálogo de Camiones (arriba) y márcalos "
                            "activos cuando estén listos; al activarlos desaparecen de esta lista y ya se pueden usar en Despacho.")
+
+                # --- Completar y activar VARIOS a la vez (típico: un lote de camiones de un mismo transportista) ---
+                st.markdown("**Completar y activar en bloque**")
+                st.caption("Elige los camiones, el tipo (tonelaje) y el transportista una sola vez y se aplican a todos. Sin tipo y transportista "
+                           "Despacho muestra «None» y no puede calcular el costo ni el rendimiento, por eso son obligatorios para activar.")
+                _placas_pend_bloque = [r[0] for r in _camiones_pend_sr]
+                _sel_bloque = st.multiselect("Camiones a completar", _placas_pend_bloque, default=[], key="bulk_cam_sel",
+                                             placeholder="Elige uno o varios (o todos con el botón de abajo)")
+                st.button("Seleccionar todos los pendientes", key="bulk_cam_todos",
+                          on_click=lambda _p=list(_placas_pend_bloque): st.session_state.update(bulk_cam_sel=_p))
+                _b1, _b2, _b3 = st.columns(3)
+                _tipo_bloque = _b1.selectbox("Tipo (tonelaje)", st.session_state.catalogos["tipos_camion"], index=None,
+                                             placeholder="Elige el tipo", key="bulk_cam_tipo")
+                _transp_bloque = _b2.selectbox("Transportista", st.session_state.catalogos["transportistas"], index=None,
+                                               placeholder="Elige el transportista", key="bulk_cam_transp")
+                _cap_bloque = _b3.number_input("Capacidad de cajas (0 = no cambiar)", min_value=0, step=1, value=0, key="bulk_cam_cap")
+                _activar_bloque = st.checkbox("Activarlos al guardar", value=True, key="bulk_cam_activar")
+                _falta = []
+                if not _sel_bloque:
+                    _falta.append("elige al menos un camión")
+                if _activar_bloque and not _tipo_bloque:
+                    _falta.append("elige el tipo")
+                if _activar_bloque and not _transp_bloque:
+                    _falta.append("elige el transportista")
+                if _falta:
+                    st.caption("Para aplicar: " + ", ".join(_falta) + ".")
+                if st.button(f":material/done_all: Aplicar a {len(_sel_bloque)} camión(es)", key="bulk_cam_aplicar", type="primary", disabled=bool(_falta)):
+                    try:
+                        with closing(get_conn()) as _conn, _conn.cursor() as _cur:
+                            _cur.execute(
+                                "UPDATE cat_camiones SET tipo = COALESCE(%s, tipo), transportista = COALESCE(%s, transportista), "
+                                "capacidad_cajas = COALESCE(%s, capacidad_cajas), activo = %s, "
+                                "pendiente_completar = CASE WHEN %s THEN FALSE ELSE pendiente_completar END "
+                                "WHERE placa = ANY(%s) AND pendiente_completar = TRUE AND activo = FALSE",
+                                (_tipo_bloque, _transp_bloque, (int(_cap_bloque) or None), bool(_activar_bloque), bool(_activar_bloque), list(_sel_bloque)))
+                            _n_bloque = _cur.rowcount
+                            _conn.commit()
+                        registrar_auditoria(usuario_activo, "Completar/activar camiones en bloque",
+                                            f"{_n_bloque} camión(es): {', '.join(_sel_bloque[:25])}{'…' if len(_sel_bloque) > 25 else ''} · "
+                                            f"tipo {_tipo_bloque or '—'} · transportista {_transp_bloque or '—'} · activo {bool(_activar_bloque)}")
+                        try:
+                            plan_tr._OPCIONES["t"] = 0.0          # la lista de camiones del Plan de Transporte se refresca al instante
+                        except Exception:
+                            pass
+                        st.session_state.catalogos = cargar_catalogos_desde_db()
+                        st.session_state["flash_catalogos"] = ("success", f"✅ {_n_bloque} camión(es) {'completados y activados' if _activar_bloque else 'completados'}.")
+                        st.session_state.pop("bulk_cam_sel", None)
+                        st.rerun()
+                    except Exception as _e_bloque:
+                        mostrar_resultado_error(_error_tecnico(_e_bloque, "camiones_en_bloque"), perfil_activo)
 
         with st.expander(":material/person: Pilotos pendientes de completar (nuevos desde SR)", expanded=False):
             with closing(get_conn()) as _conn, _conn.cursor() as _cur:
