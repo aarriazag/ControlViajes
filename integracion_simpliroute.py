@@ -9,10 +9,12 @@ Diseño acordado (ver conversación de referencia):
   camión aquí (con transportista, piloto, auxiliar ya resueltos), se manda a
   SR. SR nunca crea camiones por su cuenta — solo recibe.
 
-- PILOTOS: fuente es SR. Carga inicial manual (vincular id_sr a mano una vez).
-  De ahí en adelante, sincronización de SOLO LECTURA desde SR (GET drivers):
-  actualiza los ya vinculados y crea como "pendiente de completar" los que
-  aparezcan nuevos en SR. Control de Ruta NUNCA crea drivers en SR.
+- PILOTOS: el alta se hace en Control de Ruta (Catálogos → Pilotos). Se crea PRIMERO en SR
+  (usuario y contraseña = DPI; el DPI se envía y NO se guarda aquí) y, solo si SR lo crea, se
+  guarda en cat_pilotos con el id_sr que SR devuelve en esa misma respuesta (no hace falta una
+  segunda sincronización). Si el DPI ya existe en SR se ofrece vincularlo. El teléfono (opcional)
+  sí se guarda. La sincronización de LECTURA desde SR (GET drivers) sigue existiendo para reflejar
+  cambios hechos directo en SR (nombre, teléfono) y pilotos creados allá.
 
 - RUTAS: al crear la ruta en SR se manda `reference` = folio del viaje de
   Control de Ruta (id_viaje), para que el mismo identificador se pueda buscar
@@ -44,6 +46,7 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://api.simpliroute.com/v1/"
+TIMEOUT_LISTA_DRIVERS_SEGUNDOS = 25   # las listas completas de SR (400+ conductores; los vehículos) tardan varios segundos; con 8 s se cortaban
 TIMEOUT_SEGUNDOS = 8            # máximo esperando LA RESPUESTA (lectura) de SR, en llamadas ligeras
 CONNECT_TIMEOUT_SEGUNDOS = 5    # máximo para ESTABLECER la conexión con SR; si no, falla rápido
 
@@ -314,7 +317,7 @@ def asegurar_esquema_formato(conn):
     conn.commit()
 
 
-def buscar_vehiculo_sr_por_placa(placa, token=None):
+def buscar_vehiculo_sr_por_placa(placa, token=None, lista=None):
     """GET /routes/vehicles/ y busca coincidencia exacta por license_plate
     (ya normalizada). Se usa SOLO la primera vez que un camión se sincroniza
     (cuando todavía no tenemos su id_sr) — para no crear un duplicado si
@@ -322,10 +325,11 @@ def buscar_vehiculo_sr_por_placa(placa, token=None):
     Nunca se debe volver a llamar una vez que el camión ya tiene id_sr —
     ahí el camino correcto es actualizar_vehiculo_sr() directo por id_sr."""
     clave = clave_placa(placa)
-    ok, data = _sr_request("GET", "routes/vehicles/", token=token)
-    if not ok:
-        return False, data
-    lista = data.get("results", data) if isinstance(data, dict) else data
+    if lista is None:   # al reintentar varios camiones, la lista se pide UNA sola vez y se reutiliza
+        ok, data = _sr_request("GET", "routes/vehicles/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
+        if not ok:
+            return False, data
+        lista = data.get("results", data) if isinstance(data, dict) else data
     for v in lista:
         if es_placa_dummy_sr(v.get("license_plate")):
             continue
@@ -358,7 +362,51 @@ def obtener_token_sr_desde_vault(get_conn_fn):
 # VEHÍCULOS — Control de Ruta manda, SR solo recibe
 # ---------------------------------------------------------------------------
 
-def _payload_vehiculo(placa, tipo, id_sr_piloto):
+def _obtener_lista_vehiculos_sr(token=None):
+    """GET /routes/vehicles/ -> (True, lista) o (False, mensaje). Una consulta de ~1 s con ~1000 vehículos."""
+    ok, data = _sr_request("GET", "routes/vehicles/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
+    if not ok:
+        return False, data
+    return True, (data.get("results", data) if isinstance(data, dict) else data)
+
+
+# Datos que SR EXIGE para crear un vehículo (HTTP 400 si faltan) y que Ángel definió:
+#  - Ubicación de salida y de llegada: la misma (ingreso y retorno comparten coordenadas).
+#  - Capacidad según el tonelaje del tipo: 5 Ton -> 500000, 10 Ton -> 1000000 (100,000 por tonelada).
+UBICACION_BASE_VEHICULOS_SR = {"latitud": 14.53501, "longitud": -90.60756}
+DIRECCION_BASE_RESPALDO_SR = "Base Ransa Guatemala"   # solo si ningún vehículo de SR trae dirección para esas coordenadas
+CAPACIDAD_SR_POR_TONELADA = 100000
+
+
+def capacidad_sr_por_tipo(tipo):
+    """'10TM' / '10 Ton' / '05TM' -> capacidad que SR espera (tonelaje x 100,000). None si no se reconoce el tonelaje."""
+    m = re.search(r"\d+", str(tipo or ""))
+    toneladas = int(m.group()) if m else 0
+    return toneladas * CAPACIDAD_SR_POR_TONELADA if toneladas > 0 else None
+
+
+def ubicacion_base_vehiculos(lista=None):
+    """Los 6 campos de ubicación que pide SR: coordenadas fijas (salida = llegada). La dirección se toma de los
+    vehículos de SR que ya usan esas mismas coordenadas; si no hay ninguno, se usa un texto de respaldo."""
+    from collections import Counter
+    lat, lon = UBICACION_BASE_VEHICULOS_SR["latitud"], UBICACION_BASE_VEHICULOS_SR["longitud"]
+    cuenta = Counter()
+    for v in lista or []:
+        if v.get("deleted"):
+            continue
+        try:
+            if (round(float(v.get("location_start_latitude")), 4) == round(lat, 4)
+                    and round(float(v.get("location_start_longitude")), 4) == round(lon, 4)
+                    and str(v.get("location_start_address") or "").strip()):
+                cuenta[str(v["location_start_address"]).strip()] += 1
+        except (TypeError, ValueError):
+            continue
+    direccion = cuenta.most_common(1)[0][0] if cuenta else DIRECCION_BASE_RESPALDO_SR
+    return {"location_start_address": direccion, "location_start_latitude": lat, "location_start_longitude": lon,
+            "location_end_address": direccion, "location_end_latitude": lat, "location_end_longitude": lon}
+
+
+def _payload_vehiculo(placa, tipo, id_sr_piloto, capacidad=None, ubicacion=None):
     """Payload común para crear/actualizar un vehículo en SR a partir de los
     datos que ya viven en cat_camiones. `id_sr_piloto` puede ser None si el
     piloto asignado todavía no tiene vínculo con SR — en ese caso se manda
@@ -369,13 +417,20 @@ def _payload_vehiculo(placa, tipo, id_sr_piloto):
         "license_plate": placa,
         "reference_id": placa,
         "default_driver": id_sr_piloto,
+        **({"capacity": capacidad} if capacidad else {}),
+        **(ubicacion or {}),
     }
 
 
-def crear_vehiculo_sr(placa, tipo, id_sr_piloto=None, token=None):
+def crear_vehiculo_sr(placa, tipo, id_sr_piloto=None, token=None, capacidad=None, ubicacion=None):
     """POST /routes/vehicles/ — usar SOLO cuando el camión todavía no tiene
-    id_sr guardado en cat_camiones (primera vez que se sincroniza)."""
-    payload = _payload_vehiculo(placa, tipo, id_sr_piloto)
+    id_sr guardado en cat_camiones (primera vez que se sincroniza).
+    SR exige capacidad y las ubicaciones de salida/llegada (HTTP 400 si faltan)."""
+    if not capacidad:
+        return False, f"No se pudo calcular la capacidad: el tipo de camión «{tipo}» no tiene un tonelaje reconocible (ej. 05TM, 10TM)."
+    if not ubicacion:
+        return False, "Falta la ubicación base de los vehículos, que SR exige para crear uno."
+    payload = _payload_vehiculo(placa, tipo, id_sr_piloto, capacidad, ubicacion)
     ok, data = _sr_request("POST", "routes/vehicles/", token=token, json=payload)
     if not ok:
         return False, data
@@ -401,7 +456,7 @@ def actualizar_vehiculo_sr(id_sr, placa, tipo, id_sr_piloto=None, token=None):
     return True, id_sr
 
 
-def sincronizar_camion_con_sr(get_conn_fn, placa, token=None):
+def sincronizar_camion_con_sr(get_conn_fn, placa, token=None, lista_vehiculos=None):
     """Función de alto nivel: lee el camión y su piloto desde la base local,
     decide si hay que CREAR o ACTUALIZAR en SR, y si sale bien, guarda el
     id_sr/estado en cat_camiones. `get_conn_fn` se recibe como parámetro (en
@@ -422,6 +477,7 @@ def sincronizar_camion_con_sr(get_conn_fn, placa, token=None):
         if not fila:
             return False, f"El camión con placa {placa} no existe en cat_camiones."
         placa_db, tipo, piloto, id_sr_actual = fila
+        capacidad = capacidad_sr_por_tipo(tipo)   # 5 Ton -> 500000, 10 Ton -> 1000000
 
         id_sr_piloto = None
         if piloto:
@@ -444,14 +500,23 @@ def sincronizar_camion_con_sr(get_conn_fn, placa, token=None):
             # Primera vez que este camión se sincroniza: buscamos por placa
             # por si alguien ya lo dio de alta manualmente en SR antes de
             # hoy — para no crear un duplicado.
-            ok_busqueda, id_existente = buscar_vehiculo_sr_por_placa(placa_db, token=token)
+            if lista_vehiculos is None:   # un solo camión (formulario): se pide la lista aquí, una vez
+                ok_busqueda, lista_o_error = _obtener_lista_vehiculos_sr(token)
+                if ok_busqueda:
+                    lista_vehiculos = lista_o_error
+                    ok_busqueda, id_existente = buscar_vehiculo_sr_por_placa(placa_db, token=token, lista=lista_vehiculos)
+                else:
+                    id_existente = lista_o_error
+            else:
+                ok_busqueda, id_existente = buscar_vehiculo_sr_por_placa(placa_db, token=token, lista=lista_vehiculos)
             if not ok_busqueda:
                 ok, resultado, id_sr_nuevo = False, f"No se pudo verificar si ya existía en SR: {id_existente}", None
             elif id_existente:
                 ok, resultado = actualizar_vehiculo_sr(id_existente, placa_db, tipo, id_sr_piloto, token=token)
                 id_sr_nuevo = id_existente if ok else None
             else:
-                ok, resultado = crear_vehiculo_sr(placa_db, tipo, id_sr_piloto, token=token)
+                ok, resultado = crear_vehiculo_sr(placa_db, tipo, id_sr_piloto, token=token, capacidad=capacidad,
+                                                  ubicacion=ubicacion_base_vehiculos(lista_vehiculos))
                 id_sr_nuevo = resultado if ok else None
 
         try:
@@ -490,11 +555,22 @@ def reintentar_camiones_pendientes(get_conn_fn, token=None):
         placas_pendientes = [r[0] for r in cur.fetchall()]
 
     resultados = {}
+    if not placas_pendientes:
+        return resultados, "No hay camiones pendientes."
+    # La lista de vehículos de SR se pide UNA sola vez (antes se pedía una vez por camión: 13 camiones = 13 consultas
+    # de varios segundos cada una, con riesgo de cortarse por tiempo o de que SR limite las peticiones).
+    ok_lista, lista_vehiculos = _obtener_lista_vehiculos_sr(token)
+    if not ok_lista:
+        motivo = f"No se pudo consultar la lista de vehículos de SR: {lista_vehiculos}"
+        return {p: (False, motivo) for p in placas_pendientes}, f"0 de {len(placas_pendientes)} camión(es) pendiente(s) sincronizados."
     for placa in placas_pendientes:
-        ok, msg = sincronizar_camion_con_sr(get_conn_fn, placa, token=token)
+        ok, msg = sincronizar_camion_con_sr(get_conn_fn, placa, token=token, lista_vehiculos=lista_vehiculos)
         resultados[placa] = (ok, msg)
     exitosos = sum(1 for ok, _ in resultados.values() if ok)
-    return resultados, f"{exitosos} de {len(resultados)} camión(es) pendiente(s) sincronizados."
+    resumen = f"{exitosos} de {len(resultados)} camión(es) pendiente(s) sincronizados."
+    ubic = ubicacion_base_vehiculos(lista_vehiculos)
+    resumen += f" Ubicación de salida y llegada usada al crear en SR: {ubic['location_start_address']}."
+    return resultados, resumen
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +579,7 @@ def reintentar_camiones_pendientes(get_conn_fn, token=None):
 
 def obtener_drivers_sr(token=None):
     """GET /accounts/drivers/ — lista cruda de conductores en SR."""
-    ok, data = _sr_request("GET", "accounts/drivers/", token=token)
+    ok, data = _sr_request("GET", "accounts/drivers/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
     if not ok:
         return False, data
     lista = data.get("results", data) if isinstance(data, dict) else data
@@ -547,6 +623,10 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
             nombre_sr = normalizar_nombre_catalogo(nombre_raw, "persona", siglas)
             cur.execute("SAVEPOINT sp_piloto")  # un fallo en un piloto no debe abortar a los demás
             try:
+                tel_sr = normalizar_telefono_gt(d.get("phone"))
+                if tel_sr:   # llena el teléfono solo si Control de Ruta todavía no lo tiene
+                    cur.execute("UPDATE cat_pilotos SET telefono = %s WHERE id_sr = %s "
+                                "AND (telefono IS NULL OR btrim(telefono) = '')", (tel_sr, id_sr))
                 cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (id_sr,))
                 fila = cur.fetchone()
                 if fila:
@@ -604,9 +684,9 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
                     nombre_nuevo = nombre_sr if not choque else f"{nombre_sr} (SR {id_sr})"
                     cur.execute(
                         "INSERT INTO cat_pilotos (nombre, id_sr, activo, pendiente_completar, "
-                        "fecha_sincronizacion_sr) VALUES (%s, %s, FALSE, TRUE, %s) "
+                        "fecha_sincronizacion_sr, telefono) VALUES (%s, %s, FALSE, TRUE, %s, %s) "
                         "ON CONFLICT (nombre) DO NOTHING",
-                        (nombre_nuevo, id_sr, datetime.now())
+                        (nombre_nuevo, id_sr, datetime.now(), tel_sr)
                     )
                     nuevos += 1
                 cur.execute("RELEASE SAVEPOINT sp_piloto")
@@ -633,6 +713,141 @@ def sincronizar_pilotos_desde_sr(get_conn_fn, token=None):
                     + "; ".join(f"id_sr {i}: {m}" for i, m in con_error[:3])
                     + ("…" if len(con_error) > 3 else "."))
     return True, resumen
+
+
+# ---------------------------------------------------------------------------
+# PILOTOS — alta desde Control de Ruta: se crea en SR y SR devuelve el id_sr
+# ---------------------------------------------------------------------------
+# Resultado confirmado con prueba real: POST accounts/drivers/ -> 201 con el "id" del conductor
+# (SR rechaza un username repetido con HTTP 400 "already exists"); DELETE no está permitido.
+# Regla de privacidad: el DPI (usuario y contraseña en SR) se manda a SR y NO se guarda, ni se
+# escribe en mensajes de error, bitácoras o auditoría.
+
+def solo_digitos(valor):
+    return re.sub(r"\D", "", str(valor or ""))
+
+
+def normalizar_telefono_gt(valor):
+    """'5555-1234' / '+502 5555 1234' -> '55551234'. None si no queda un número de 8 dígitos."""
+    digitos = solo_digitos(valor)
+    if len(digitos) == 11 and digitos.startswith("502"):
+        digitos = digitos[3:]
+    return digitos if len(digitos) == 8 else None
+
+
+def validar_datos_piloto(nombre, dpi, dpi_repetido, telefono=None):
+    """Devuelve un mensaje de error (sin incluir el DPI) o None si todo está bien."""
+    if len(" ".join(str(nombre or "").split()).split()) < 2:
+        return "Escribe el nombre completo del piloto (nombre y apellido)."
+    if len(solo_digitos(dpi)) != 13:
+        return "El DPI debe tener exactamente 13 dígitos."
+    if solo_digitos(dpi) != solo_digitos(dpi_repetido):
+        return "Los dos DPI no coinciden. Revísalos."
+    if str(telefono or "").strip() and normalizar_telefono_gt(telefono) is None:
+        return "El teléfono debe tener 8 dígitos (o déjalo vacío)."
+    return None
+
+
+def _nombre_piloto_normalizado(cur, nombre):
+    return normalizar_nombre_catalogo(nombre, "persona", _cargar_siglas(cur))
+
+
+def piloto_es_nuevo(get_conn_fn, nombre):
+    """True si no hay ningún piloto con ese nombre (sin distinguir mayúsculas)."""
+    from contextlib import closing
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        nombre_n = _nombre_piloto_normalizado(cur, nombre)
+        cur.execute("SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)", (nombre_n,))
+        return cur.fetchone() is None
+
+
+def telefono_guardado_piloto(get_conn_fn, nombre):
+    """Teléfono ya guardado de un piloto existente (para no borrarlo al editar otros datos)."""
+    from contextlib import closing
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT telefono FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)",
+                    (_nombre_piloto_normalizado(cur, nombre),))
+        fila = cur.fetchone()
+        return fila[0] if fila and fila[0] else None
+
+
+def _buscar_conductor_sr_por_usuario(dpi, nombre_n, tel, token):
+    ok, drivers = obtener_drivers_sr(token=token)
+    if not ok:
+        return "error", f"Ese DPI ya tiene usuario en SimpliRoute, pero no pude consultar de quién es: {drivers}"
+    for d in drivers:
+        if str(d.get("username", "")).strip() == dpi:
+            return "dpi_existe_en_sr", {"id_sr": d.get("id"), "nombre_sr": (d.get("name") or "").strip(),
+                                        "nombre": nombre_n, "telefono": tel}
+    return "error", ("SimpliRoute indica que ese usuario ya existe, pero no aparece entre los conductores de tu "
+                     "cuenta (puede ser de otra cuenta de SR). Revisa el DPI.")
+
+
+def crear_piloto_en_sr(get_conn_fn, nombre, dpi, telefono=None, token=None):
+    """Crea el piloto en SR y, SOLO si SR lo crea, lo guarda en cat_pilotos con su id_sr.
+    Devuelve (estado, datos):
+      ("creado", {"nombre", "id_sr"})
+      ("nombre_existe", mensaje)            -> ya hay un piloto con ese nombre aquí
+      ("dpi_existe_en_sr", {"id_sr", "nombre_sr", "nombre", "telefono"})  -> la persona decide si vincular
+      ("error", mensaje)                    -> no se guardó nada nuevo (salvo el caso que el mensaje aclare)
+    Nunca lanza. No se usa la lista completa de SR en el camino normal (tarda 5-6 s): solo si el DPI ya existe."""
+    from contextlib import closing
+    dpi = solo_digitos(dpi)
+    tel = normalizar_telefono_gt(telefono)
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        nombre_n = _nombre_piloto_normalizado(cur, nombre)
+        cur.execute("SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)", (nombre_n,))
+        if cur.fetchone():
+            return "nombre_existe", (f"Ya existe un piloto llamado «{nombre_n}». Si es otra persona, "
+                                     f"agrégale el segundo apellido para diferenciarlo.")
+    # La conexión ya se cerró: no se queda abierta esperando a SR.
+    cuerpo = {"username": dpi, "password": dpi, "name": nombre_n, "is_driver": True}
+    if tel:
+        cuerpo["phone"] = tel
+    ok, data = _sr_request("POST", "accounts/drivers/", token=token, json=cuerpo)
+    if not ok:
+        texto = str(data).lower()
+        if "username" in texto and "exist" in texto:
+            return _buscar_conductor_sr_por_usuario(dpi, nombre_n, tel, token)
+        return "error", f"SimpliRoute no pudo crear al piloto: {data}"
+    conductor = data[0] if isinstance(data, list) and data else data
+    id_sr = conductor.get("id") if isinstance(conductor, dict) else None
+    if id_sr is None:
+        return "error", ("SimpliRoute respondió bien pero no devolvió el número (id) del piloto. "
+                         "Revisa en SR si quedó creado antes de reintentar.")
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO cat_pilotos (nombre, activo, id_sr, telefono, pendiente_completar, fecha_sincronizacion_sr) "
+                "VALUES (%s, TRUE, %s, %s, FALSE, %s)", (nombre_n, id_sr, tel, datetime.now()))
+            conn.commit()
+    except Exception as e:
+        return "error", (f"El piloto SÍ se creó en SimpliRoute (número {id_sr}) pero falló al guardarse aquí: "
+                         f"{(str(e).splitlines() or ['error'])[0]}. Vuelve a intentarlo con el mismo DPI y te "
+                         f"pedirá vincularlo.")
+    return "creado", {"nombre": nombre_n, "id_sr": id_sr}
+
+
+def vincular_piloto_existente_sr(get_conn_fn, nombre, id_sr, telefono=None):
+    """Guarda un piloto nuevo en cat_pilotos ligado a un conductor que YA existía en SR (no crea nada en SR)."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            nombre_n = _nombre_piloto_normalizado(cur, nombre)
+            cur.execute("SELECT nombre FROM cat_pilotos WHERE id_sr = %s", (id_sr,))
+            fila = cur.fetchone()
+            if fila:
+                return False, f"Ese conductor de SimpliRoute ya está vinculado al piloto «{fila[0]}». Búscalo en la lista de pilotos."
+            cur.execute("SELECT 1 FROM cat_pilotos WHERE lower(btrim(nombre)) = lower(%s)", (nombre_n,))
+            if cur.fetchone():
+                return False, f"Ya existe un piloto llamado «{nombre_n}»."
+            cur.execute(
+                "INSERT INTO cat_pilotos (nombre, activo, id_sr, telefono, pendiente_completar, fecha_sincronizacion_sr) "
+                "VALUES (%s, TRUE, %s, %s, FALSE, %s)", (nombre_n, id_sr, normalizar_telefono_gt(telefono), datetime.now()))
+            conn.commit()
+        return True, f"Piloto «{nombre_n}» vinculado con SimpliRoute (número {id_sr})."
+    except Exception as e:
+        return False, f"No se pudo vincular: {(str(e).splitlines() or ['error'])[0]}"
 
 
 def debe_sincronizar(get_conn_fn, proceso, horas=12):
@@ -662,7 +877,7 @@ def debe_sincronizar_camiones(get_conn_fn, horas=12):
 
 def obtener_vehiculos_sr(token=None):
     """GET /routes/vehicles/ — lista cruda de vehículos en SR."""
-    ok, data = _sr_request("GET", "routes/vehicles/", token=token)
+    ok, data = _sr_request("GET", "routes/vehicles/", token=token, timeout=TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
     if not ok:
         return False, data
     lista = data.get("results", data) if isinstance(data, dict) else data
@@ -808,6 +1023,32 @@ def crear_ruta_sr(id_viaje, id_sr_vehiculo, id_sr_piloto, planned_date,
     return True, route_id
 
 
+_PATRON_OLEADA = re.compile(r"OLEADA\s*[=:]\s*0*(\d+)", re.IGNORECASE)
+
+
+def oleada_de_notes(notes):
+    """'OLEADA=0000023769' -> '23769' (sin los ceros de relleno). None si las notes no traen oleada."""
+    m = _PATRON_OLEADA.search(str(notes or ""))
+    return m.group(1) if m else None
+
+
+def _a_numero(x):
+    try:
+        n = float(x)
+        return n if n == n else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def cajas_de_visita(v):
+    """Cajas de una Visita de SR. Desde el cambio de TI van en `load_4`; las visitas que no lo traen
+    (otros visit_type, o anteriores al cambio) siguen usando `load_3`, como antes."""
+    n = _a_numero(v.get("load_4"))
+    if n <= 0:
+        n = _a_numero(v.get("load_3"))
+    return int(n) if n == int(n) else n
+
+
 def importar_rutas_sr(fecha, token=None):
     """Trae todas las Rutas de SR de una fecha, y por cada una agrupa sus
     Visitas por tienda (título), sumando `load_3` como cajas — el mismo
@@ -869,14 +1110,17 @@ def importar_rutas_sr(fecha, token=None):
             tienda = v.get("title") or "(sin nombre)"
             if tienda not in por_tienda:
                 por_tienda[tienda] = {"tienda": tienda, "cajas": 0, "pedidos": [], "orden_sugerido": None,
-                                      # Datos de la tienda según SR: solo se usan si la tienda hay que crearla
-                                      # en el catálogo (tienda nueva que aún no existe en Control de Ruta).
-                                      "direccion": v.get("address"), "lat": v.get("latitude"),
-                                      "lon": v.get("longitude"), "visit_type": v.get("visit_type")}
-            cajas_visita = v.get("load_3") or 0
+                                      "oleadas": {}, "visitas_sin_oleada": 0}
+            cajas_visita = cajas_de_visita(v)
+            oleada = oleada_de_notes(v.get("notes"))
             por_tienda[tienda]["cajas"] += cajas_visita
+            if oleada:    # la oleada ES el No. de Despacho: se suman las cajas de todas sus visitas
+                por_tienda[tienda]["oleadas"][oleada] = por_tienda[tienda]["oleadas"].get(oleada, 0) + cajas_visita
+            else:
+                por_tienda[tienda]["visitas_sin_oleada"] += 1
             por_tienda[tienda]["pedidos"].append({
                 "pedido": v.get("reference"),
+                "oleada": oleada,
                 "cajas": cajas_visita,
                 "visit_id": v.get("id"),
                 "origen": "SR",
@@ -891,6 +1135,9 @@ def importar_rutas_sr(fecha, token=None):
                 if actual is None or orden_visita < actual:
                     por_tienda[tienda]["orden_sugerido"] = orden_visita
 
+        for d_ in por_tienda.values():
+            d_["despachos"] = [{"pedido": o, "cajas": c, "origen": "SR"} for o, c in d_["oleadas"].items()]
+
         destinos_ordenados = sorted(
             por_tienda.values(),
             key=lambda d: d["orden_sugerido"] if d["orden_sugerido"] is not None else float("inf")
@@ -904,6 +1151,7 @@ def importar_rutas_sr(fecha, token=None):
             "driver_nombre_sr": nombres_sr.get(ruta.get("driver")),
             "total_visitas": len(visitas_de_ruta),
             "visit_types": visit_types,
+            "oleadas": sorted({o for d_ in por_tienda.values() for o in d_["oleadas"]}),
             "destinos": destinos_ordenados,
         })
 
@@ -979,6 +1227,12 @@ def asegurar_esquema_sr(conn):
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS id_sr BIGINT")
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS pendiente_completar BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")
+        cur.execute("ALTER TABLE cat_pilotos ADD COLUMN IF NOT EXISTS telefono TEXT")
+        # Coordenadas y visit_type de cada tienda: NO se digitan, se llenan solas desde las visitas de SR
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS latitud DOUBLE PRECISION")
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS longitud DOUBLE PRECISION")
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS visit_type_sr TEXT")
+        cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS coord_sr_fecha TIMESTAMP")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS id_sr BIGINT")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS sincronizado_sr BOOLEAN DEFAULT FALSE")
         cur.execute("ALTER TABLE cat_camiones ADD COLUMN IF NOT EXISTS fecha_sincronizacion_sr TIMESTAMP")
@@ -1030,7 +1284,8 @@ FORMATO_CATALOGOS = {
                                ("piloto", "persona", ("cat_pilotos", "nombre")),
                                ("auxiliar", "persona", ("cat_auxiliares", "nombre"))],
     "cat_clientes_tiendas":   [("cliente", "entidad", ("cat_clientes", "nombre")),
-                               ("tienda", "entidad", ("cat_clientes_tiendas", "tienda", "cliente"))],
+                               ("tienda", "entidad", ("cat_clientes_tiendas", "tienda", "cliente")),
+                               ("ruta", "referencia", None), ("direccion", "referencia", None)],
     "cat_cds_por_cliente":    [("cliente", "entidad", ("cat_clientes", "nombre")),
                                ("cd", "entidad", ("cat_cds_por_cliente", "cd", "cliente"))],
     "cat_motivos_sin_pedido": [("nombre", "entidad", ("cat_motivos_sin_pedido", "nombre"))],
@@ -1058,6 +1313,15 @@ def _mapa_existentes(cur, fuente):
 
 
 def _formatear_un_valor(valor, modo, mapa, alcance=None, siglas=None):
+    if modo == "referencia":
+        # Dato de referencia opcional (ruta, dirección): se guarda tal cual, sin cambiar mayúsculas. Vacío -> NULL,
+        # y un número de Excel como 1011.0 vuelve a ser "1011".
+        if valor is None or valor != valor:
+            return None
+        txt = str(valor).strip()
+        if re.fullmatch(r"-?\d+\.0+", txt):
+            txt = txt.split(".")[0]
+        return txt or None
     if valor is None or valor != valor:          # None o NaN
         return valor
     s = str(valor).strip()
@@ -1134,6 +1398,32 @@ def preparar_auxiliar_libre(cur, texto):
     return nombre
 
 
+def _es_dummy_de_transporte(cur, id_veh):
+    """True si ese vehículo de SR es el dummy de un cliente de Transporte (Plan de Transporte): es el provisional,
+    así que no se prellena ni se avisa. Si la tabla no existe todavía o algo falla, devuelve False (todo sigue igual)."""
+    try:
+        cur.execute("SELECT to_regclass('cat_transporte_cliente') IS NOT NULL")
+        if not cur.fetchone()[0]:
+            return False
+        cur.execute("SELECT 1 FROM cat_transporte_cliente WHERE vehiculo_dummy_sr = %s LIMIT 1", (id_veh,))
+        if cur.fetchone() is not None:
+            return True
+        # Grupo de dummies (DC01, DC02...): el vehículo es dummy si su nombre es el prefijo de un cliente + número.
+        cur.execute("""SELECT 1 FROM cat_camiones c JOIN cat_transporte_cliente t ON t.dummy_prefijo IS NOT NULL
+                       WHERE c.id_sr = %s AND UPPER(REGEXP_REPLACE(c.placa, '[^A-Za-z0-9]', '', 'g')) ~ ('^' || UPPER(t.dummy_prefijo) || '[0-9]+$')
+                       LIMIT 1""", (id_veh,))
+        if cur.fetchone() is not None:
+            return True
+        # Genéricos ADICIONALES… (los que usan los clientes sin dummies propios)
+        cur.execute("""SELECT 1 FROM cat_camiones WHERE id_sr = %s AND (
+                           UPPER(REGEXP_REPLACE(placa, '[^A-Za-z0-9]', '', 'g')) LIKE 'ADICIONALES%%'
+                           OR (COALESCE(activo, FALSE) = FALSE
+                               AND UPPER(REGEXP_REPLACE(placa, '[^A-Za-z0-9]', '', 'g')) ~ '^[A-Z]{2,}[0-9]+[A-Z]*$')) LIMIT 1""", (id_veh,))
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 def resolver_ruta_para_formulario(get_conn_fn, ruta):
     """Al usar una Ruta importada de SR: decide qué camión y piloto prellenar en el formulario.
     Devuelve {"placa": str|None, "piloto": str|None, "sin_piloto": bool, "avisos": [str]}.
@@ -1151,7 +1441,8 @@ def resolver_ruta_para_formulario(get_conn_fn, ruta):
         with closing(get_conn_fn()) as conn, conn.cursor() as cur:
             # ---- Camión ----
             id_veh, placa_sr = ruta.get("vehicle_sr_id"), ruta.get("vehicle_placa_sr")
-            if id_veh is not None and not (placa_sr is not None and es_placa_dummy_sr(placa_sr)):
+            if (id_veh is not None and not (placa_sr is not None and es_placa_dummy_sr(placa_sr))
+                    and not _es_dummy_de_transporte(cur, id_veh)):
                 cur.execute("SELECT placa, activo FROM cat_camiones WHERE id_sr = %s", (id_veh,))
                 fila = cur.fetchone()
                 if not fila and placa_sr:
@@ -1417,6 +1708,95 @@ def escanear_visit_types_sr(get_conn_fn, token=None, dias=7):
         return True, resumen
     except Exception as e:
         return False, f"Error inesperado al revisar SimpliRoute: {e}"
+
+
+# ---------------------------------------------------------------------------
+# TIENDAS — coordenadas y visit_type tomados de las visitas de SR (no se digitan)
+# ---------------------------------------------------------------------------
+# Confirmado con exploración real: el título de la visita viene como "<código> <NOMBRE TIENDA>" (ej. "129 LA TORRE
+# ZONA 13 AMERICAS"), con latitud/longitud completas. SR NO filtra las visitas por título ni por referencia, y traer
+# el día completo tarda ~15 s (5,500 visitas): por eso se leen pocos días de una vez y las coordenadas se guardan.
+_PATRON_CODIGO_TITULO = re.compile(r"^\s*0*(\d+)\s")
+
+
+def codigo_de_titulo(titulo):
+    """'129 LA TORRE ZONA 13' -> 129. None si el título no empieza con un código numérico."""
+    m = _PATRON_CODIGO_TITULO.match(str(titulo or ""))
+    return int(m.group(1)) if m else None
+
+
+def sincronizar_coordenadas_tiendas_desde_sr(get_conn_fn, dias=3, token=None):
+    """Lee las visitas de SR de los últimos `dias` días (incluido hoy) y, para cada tienda cuyo visit_type está
+    mapeado a un cliente, copia latitud/longitud/visit_type a cat_clientes_tiendas (cliente + código de tienda).
+    Solo ESCRIBE en esas columnas; nunca toca nombre, km ni lo demás. Devuelve (ok, resumen, detalle). Nunca lanza.
+    La tienda se reconoce por cliente + código; si el código no existe en el catálogo, o está repetido, no se toca."""
+    from contextlib import closing
+    from datetime import timedelta
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr WHERE cliente IS NOT NULL")
+            mapa = {r[0]: r[1] for r in cur.fetchall() if r[1]}
+        if not mapa:
+            return False, "Primero hay que mapear los visit_type a clientes (Mapeo Cliente ↔ visit_type de SR).", ""
+
+        hoy = _hoy_guatemala()
+        vistas = {}   # (visit_type, codigo) -> (lat, lon); gana la visita más reciente porque se recorre de hoy hacia atrás
+        dias_ok, dias_fallo, leidas, sin_coord = 0, 0, 0, 0
+        for d in range(int(dias)):
+            ok, raw = _sr_request("GET", "routes/visits/", token=token, timeout=90, params={"planned_date": str(hoy - timedelta(days=d))})
+            if not ok:
+                dias_fallo += 1
+                continue
+            dias_ok += 1
+            for v in (raw.get("results", raw) if isinstance(raw, dict) else raw):
+                vt = v.get("visit_type")
+                if vt not in mapa:
+                    continue
+                leidas += 1
+                codigo = codigo_de_titulo(v.get("title"))
+                try:
+                    lat, lon = round(float(v.get("latitude")), 6), round(float(v.get("longitude")), 6)
+                except (TypeError, ValueError):
+                    sin_coord += 1
+                    continue
+                if codigo is None or (lat == 0 and lon == 0):
+                    sin_coord += 1
+                    continue
+                vistas.setdefault((vt, codigo), (lat, lon))
+        if dias_ok == 0:
+            return False, "No se pudo consultar SimpliRoute en ninguno de los días.", ""
+
+        actualizadas, sin_catalogo, repetidas = 0, [], []
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            for (vt, codigo), (lat, lon) in vistas.items():
+                cliente = mapa[vt]
+                cur.execute("SELECT COUNT(*) FROM cat_clientes_tiendas WHERE cliente = %s AND codigo_tienda = %s", (cliente, codigo))
+                n = cur.fetchone()[0]
+                if n == 0:
+                    sin_catalogo.append(f"{cliente} #{codigo}")
+                elif n > 1:
+                    repetidas.append(f"{cliente} #{codigo}")
+                else:
+                    cur.execute(
+                        "UPDATE cat_clientes_tiendas SET latitud = %s, longitud = %s, visit_type_sr = %s, coord_sr_fecha = %s "
+                        "WHERE cliente = %s AND codigo_tienda = %s", (lat, lon, vt, datetime.now(), cliente, codigo))
+                    actualizadas += 1
+            conn.commit()
+        resumen = (f"{actualizadas} tienda(s) con coordenadas actualizadas desde SR ({dias_ok} día(s) revisados); "
+                   f"{len(sin_catalogo)} código(s) de SR que no están en el catálogo de tiendas"
+                   + (f"; {len(repetidas)} con código repetido en el catálogo" if repetidas else "") + ".")
+        if dias_fallo:
+            resumen += f" {dias_fallo} día(s) no respondieron."
+        detalle = []
+        if sin_catalogo:
+            detalle.append("En SR pero sin coincidencia en el catálogo (cliente #código): " + ", ".join(sin_catalogo[:40]) + ("…" if len(sin_catalogo) > 40 else ""))
+        if repetidas:
+            detalle.append("Código repetido en el catálogo, no se tocó: " + ", ".join(repetidas[:40]))
+        if sin_coord:
+            detalle.append(f"{sin_coord} visita(s) sin código en el título o sin coordenadas, ignoradas.")
+        return True, resumen, "\n".join(detalle)
+    except Exception as e:
+        return False, f"Error inesperado al leer las coordenadas de SR: {e}", ""
 
 
 def visit_types_vistos(get_conn_fn):
@@ -1983,104 +2363,3 @@ def _render_control_sr(st, get_conn_fn, token):
                     ok, msg = reenviar_viaje(get_conn_fn, r["id_viaje"], token=token)
                     st.session_state.pop("ctl_sr_resultado", None)
                     (st.success if ok else st.error)(f"{r['id_viaje']}: {msg}")
-
-
-# ---------------------------------------------------------------------------
-# Tiendas nuevas: se crean solas al importar una Ruta de SR, con km por Gemini
-# ---------------------------------------------------------------------------
-# Regla acordada: si una tienda de la Ruta no existe en el catálogo, se crea con lo que
-# trae la Visita de SR (código al inicio del título, dirección, lat/lon, visit_type) y el
-# km desde el CD lo calcula Gemini. Si Gemini falla o da un número raro, la tienda se crea
-# IGUAL con km = 0 (queda "por revisar" en Catálogos → Clientes y Tiendas) — nunca se bloquea
-# la importación. La clasificación Local/Departamental queda en 'Local' hasta que se complete.
-
-CD_ORIGEN_LAT, CD_ORIGEN_LON = 14.53501, -90.60756   # mismo punto de salida/retorno que usan los vehículos en SR
-KM_MAXIMO_RAZONABLE = 600                            # Guatemala: más que esto es una respuesta errónea
-MODELO_GEMINI_DEFECTO = "gemini-2.5-flash"           # se puede cambiar en secrets: [gemini] model = "..."
-
-
-def codigo_desde_titulo(titulo):
-    """'129 LA TORRE ZONA 13 AMERICAS' -> 129. Si no empieza con número, None."""
-    import re
-    m = re.match(r"^\s*(\d+)\b", str(titulo or ""))
-    return int(m.group(1)) if m else None
-
-
-def km_con_gemini(nombre, direccion=None, lat=None, lon=None):
-    """Pide a Gemini la distancia por carretera (km, solo ida) desde el CD hasta la tienda.
-    Devuelve (True, km_float) o (False, motivo). Nunca lanza."""
-    try:
-        import streamlit as st
-        cfg = st.secrets["gemini"]
-        api_key = cfg["api_key"]
-        modelo = cfg.get("model", MODELO_GEMINI_DEFECTO) if hasattr(cfg, "get") else MODELO_GEMINI_DEFECTO
-    except Exception:
-        return False, "Falta configurar la llave de Gemini en los secretos ([gemini] api_key)."
-
-    destino = f"{lat}, {lon}" if (lat and lon) else ""
-    prompt = (
-        "Eres un asistente de logística en Guatemala. Calcula la distancia aproximada POR CARRETERA, "
-        "solo de ida, en kilómetros, para un camión de carga desde el origen hasta el destino.\n"
-        f"Origen (centro de distribución): {CD_ORIGEN_LAT}, {CD_ORIGEN_LON} (Ciudad de Guatemala).\n"
-        f"Destino: tienda \"{nombre}\"; dirección: {direccion or 'no disponible'}; "
-        f"coordenadas: {destino or 'no disponibles'}.\n"
-        'Responde SOLO con JSON: {"km": <número con un decimal>}. Si no puedes estimarlo con '
-        'confianza, responde {"km": null}.'
-    )
-    try:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent",
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}},
-            timeout=(CONNECT_TIMEOUT_SEGUNDOS, 25),
-        )
-        if not resp.ok:
-            return False, f"Gemini respondió HTTP {resp.status_code}."
-        texto = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        km = json.loads(texto).get("km")
-        km = float(km)
-    except Exception as e:
-        return False, f"No se pudo calcular el km con Gemini ({type(e).__name__})."
-    if not (0 < km <= KM_MAXIMO_RAZONABLE):
-        return False, f"Gemini devolvió un km fuera de rango ({km})."
-    return True, round(km, 1)
-
-
-def crear_tiendas_nuevas_desde_ruta(get_conn_fn, cliente, destinos, usuario=None):
-    """Crea en cat_clientes_tiendas las tiendas de `destinos` (dicts de importar_rutas_sr) que
-    no existen todavía. Devuelve lista de {"tienda", "km", "km_ok", "mensaje"}. Nunca lanza:
-    una tienda que falle simplemente no se incluye en el resultado (queda para elegir a mano)."""
-    from contextlib import closing
-    resultado = []
-    for d in destinos:
-        try:
-            titulo = str(d.get("tienda") or "").strip()
-            if not titulo or titulo == "(sin nombre)":
-                continue
-            ok_km, km = km_con_gemini(titulo, d.get("direccion"), d.get("lat"), d.get("lon"))
-            km_guardar = km if ok_km else 0
-            with closing(get_conn_fn()) as conn, conn.cursor() as cur:
-                cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS latitud DOUBLE PRECISION")
-                cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS longitud DOUBLE PRECISION")
-                cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS direccion_sr TEXT")
-                cur.execute("ALTER TABLE cat_clientes_tiendas ADD COLUMN IF NOT EXISTS visit_type_sr TEXT")
-                nombre = formatear_valores_catalogo(cur, "cat_clientes_tiendas",
-                                                    {"cliente": cliente, "tienda": titulo})["tienda"]
-                lat, lon = d.get("lat"), d.get("lon")
-                cur.execute(
-                    "INSERT INTO cat_clientes_tiendas (cliente, tienda, codigo_tienda, km, clasificacion, "
-                    "latitud, longitud, direccion_sr, visit_type_sr) VALUES (%s,%s,%s,%s,'Local',%s,%s,%s,%s) "
-                    "ON CONFLICT (cliente, tienda) DO NOTHING",
-                    (cliente, nombre, codigo_desde_titulo(titulo), km_guardar,
-                     round(float(lat), 6) if lat else None, round(float(lon), 6) if lon else None,
-                     d.get("direccion"), d.get("visit_type")))
-                if cur.rowcount:
-                    cur.execute("INSERT INTO auditoria (fecha_hora, usuario, accion, detalle) VALUES (%s,%s,%s,%s)",
-                                (datetime.now(), usuario or "(sistema)", "Crear tienda desde ruta SR",
-                                 f"{cliente} · {nombre} · km {km_guardar}" + ("" if ok_km else f" (sin km: {km})")))
-                conn.commit()
-            resultado.append({"tienda": nombre, "km": km_guardar, "km_ok": ok_km, "mensaje": None if ok_km else km})
-        except Exception:
-            continue
-    return resultado
