@@ -1263,10 +1263,11 @@ def cargar_catalogos_desde_db():
                                   "piloto": r["piloto"], "auxiliar": r["auxiliar"],
                                   "capacidad_cajas": r["capacidad_cajas"]} for r in cur.fetchall()}
 
-        cur.execute("SELECT cliente, tienda, km, clasificacion FROM cat_clientes_tiendas ORDER BY cliente, tienda")
+        cur.execute("SELECT cliente, tienda, km, clasificacion, codigo_tienda FROM cat_clientes_tiendas ORDER BY cliente, tienda")
         clientes = {}
         for r in cur.fetchall():
-            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "clasificacion": r["clasificacion"] or "Local"}
+            clientes.setdefault(r["cliente"], {})[r["tienda"]] = {"km": r["km"], "clasificacion": r["clasificacion"] or "Local",
+                                                                   "codigo": r["codigo_tienda"]}
 
         cur.execute("SELECT tipo, km_por_galon, capacidad_cajas_default FROM cat_rendimiento_camion ORDER BY tipo")
         _filas_rendimiento = cur.fetchall()
@@ -3351,11 +3352,9 @@ def pagina_despacho():
                                     # coincidencia que ya usamos hoy a mano con los datos reales
                                     # de SR. Si no encuentra nada, el campo queda vacío para que
                                     # el digitador lo elija — nunca se inventa una tienda.
-                                    _tienda_sr_norm = _d["tienda"].strip().upper()
-                                    _match = next((t for t in _tiendas_cliente_import if t.strip().upper() == _tienda_sr_norm), None)
-                                    if not _match:
-                                        _match = next((t for t in _tiendas_cliente_import
-                                                        if t.strip().upper() in _tienda_sr_norm or _tienda_sr_norm in t.strip().upper()), None)
+                                    # El título de SR trae el código ("258 LA TORRE JALAPA 3"): se empareja primero
+                                    # por código y luego por nombre exacto; nunca por "contiene" ambiguo.
+                                    _match = sr_int.emparejar_tienda_sr(_d["tienda"], _tiendas_cliente_import)
                                     if _match:
                                         st.session_state[f"t_{_run_destino}_{_i_dest}"] = _match
                                     else:

@@ -1725,6 +1725,42 @@ def codigo_de_titulo(titulo):
     return int(m.group(1)) if m else None
 
 
+def _norm_nombre_tienda(txt):
+    """Mayúsculas, sin acentos ni espacios repetidos, para comparar nombres de tienda."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(txt or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", t).strip().upper()
+
+
+def emparejar_tienda_sr(titulo, tiendas):
+    """Encuentra la tienda del catálogo que corresponde al título de una visita de SR.
+    `tiendas` = {nombre_catalogo: {..., "codigo": int|None}}. Devuelve el nombre del catálogo o None.
+    Orden de prioridad (nunca adivina entre dos candidatos):
+      1) CÓDIGO: el título empieza con el código ("258 LA TORRE JALAPA 3") y solo una tienda lo tiene.
+      2) NOMBRE exacto, sin el código del título y sin importar mayúsculas/acentos.
+      3) NOMBRE contenido, pero solo si hay UN candidato único (el más largo); con empate -> None.
+    Antes se usaba "contiene" a secas y 'La Torre Jalapa' absorbía a 'Jalapa 2' y 'Jalapa 3'."""
+    codigo = codigo_de_titulo(titulo)
+    if codigo is not None:
+        por_codigo = [n for n, d in tiendas.items()
+                      if isinstance(d, dict) and d.get("codigo") is not None and int(d["codigo"]) == codigo]
+        if len(por_codigo) == 1:
+            return por_codigo[0]
+    sin_codigo = _norm_nombre_tienda(re.sub(r"^\s*0*\d+\s+", "", str(titulo or "")))
+    norm = {n: _norm_nombre_tienda(n) for n in tiendas}
+    exactos = [n for n, nn in norm.items() if nn == sin_codigo or nn == _norm_nombre_tienda(titulo)]
+    if len(exactos) == 1:
+        return exactos[0]
+    if exactos:
+        return None
+    cont = [(len(nn), n) for n, nn in norm.items() if nn and (nn in sin_codigo or sin_codigo in nn)]
+    if not cont:
+        return None
+    mayor = max(c[0] for c in cont)
+    top = [n for l, n in cont if l == mayor]
+    return top[0] if len(top) == 1 else None
+
+
 def sincronizar_coordenadas_tiendas_desde_sr(get_conn_fn, dias=3, token=None):
     """Lee las visitas de SR de los últimos `dias` días (incluido hoy) y, para cada tienda cuyo visit_type está
     mapeado a un cliente, copia latitud/longitud/visit_type a cat_clientes_tiendas (cliente + código de tienda).
