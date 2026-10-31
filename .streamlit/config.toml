@@ -1,10 +1,27 @@
-[client]
-# Con esto, un error ya no muestra el traceback completo (rutas de archivo,
-# tipo de excepción, detalles de la consulta) a quien esté usando la app —
-# solo un mensaje genérico. El detalle completo se sigue escribiendo en la
-# consola del servidor (Render → Logs), donde solo tú lo puedes ver.
-showErrorDetails = false
+# Configuración de Streamlit para Control de Ruta (va en la carpeta .streamlit/ del repositorio, junto a app.py).
+# Si el repositorio YA tiene un .streamlit/config.toml, solo agrega las secciones que falten.
 
-# Oculta del menú "..." las opciones de desarrollador (limpiar caché, ver
-# el código fuente, etc.) para cualquiera que no sea tú corriendo en local.
-toolbarMode = "viewer"
+[theme]
+# El diseño de Control de Ruta es de superficies blancas y letras oscuras (paleta RANSA). Con base = "light" la app se ve
+# igual aunque la computadora esté en modo oscuro: el menú lateral deja de verse blanco con letras blancas.
+base = "light"
+primaryColor = "#0B4A32"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F6F7"
+textColor = "#1F2328"
+
+[server]
+headless = true
+# No vigilar los archivos del código en producción: ahorra CPU y memoria (el código no cambia con la app corriendo).
+fileWatcherType = "none"
+runOnSave = false
+# Tope de lo que un solo mensaje (una tabla grande) puede enviar al navegador, en MB. El valor por defecto es 200.
+maxMessageSize = 100
+# Tope de archivos que se suben (catálogos en Excel), en MB. El valor por defecto es 200.
+maxUploadSize = 25
+
+[browser]
+gatherUsageStats = false
+
+[logger]
+level = "warning"
