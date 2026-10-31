@@ -290,6 +290,27 @@ def hay_clientes_transporte(get_conn_fn):
         return cur.fetchone() is not None
 
 
+# El menú pregunta "¿ve este usuario el Plan de Transporte?" en CADA recarga de pantalla. Eso era 1 o 2 consultas a Supabase por
+# clic, de cada usuario, solo para mostrar u ocultar un botón. Ahora se recuerda 60 s la lista de clientes de Transporte
+# activos (un solo juego para todo el servidor) y se refresca al instante cuando se guarda la configuración.
+TTL_ACCESO_SEGUNDOS = 60
+_CACHE_ACCESO = {"t": 0.0, "clientes": None}
+
+
+def invalidar_cache_acceso():
+    _CACHE_ACCESO["t"] = 0.0
+
+
+def _clientes_transporte_activos(get_conn_fn):
+    if _CACHE_ACCESO["clientes"] is not None and _time.time() - _CACHE_ACCESO["t"] < TTL_ACCESO_SEGUNDOS:
+        return _CACHE_ACCESO["clientes"]
+    with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT cliente FROM cat_transporte_cliente WHERE activo")
+        nombres = frozenset(r[0] for r in cur.fetchall())
+    _CACHE_ACCESO.update(t=_time.time(), clientes=nombres)
+    return nombres
+
+
 def tiene_acceso(get_conn_fn, perfil, clientes_permitidos):
     """¿Este usuario puede entrar al Plan de Transporte? Solo si su perfil lo permite Y tiene acceso a al menos un cliente de Transporte
     configurado. Única excepción: un Administrador, mientras NO exista ningún cliente de Transporte configurado en todo el sistema
@@ -297,14 +318,23 @@ def tiene_acceso(get_conn_fn, perfil, clientes_permitidos):
     if not PLAN_TRANSPORTE_ACTIVO or perfil not in PERFILES_PLAN:
         return False
     try:
-        if clientes_transporte(get_conn_fn, clientes_permitidos):
+        activos = _clientes_transporte_activos(get_conn_fn)
+        if activos and (clientes_permitidos is None or activos & set(clientes_permitidos)):
             return True
-        return perfil in PERFILES_CONFIG and not hay_clientes_transporte(get_conn_fn)
+        return perfil in PERFILES_CONFIG and not activos
     except Exception:
         return False
 
 
 def guardar_config(get_conn_fn, datos, usuario):
+    """Guarda la configuración de un cliente de Transporte y refresca al instante quién ve el Plan de Transporte."""
+    try:
+        return _guardar_config_impl(get_conn_fn, datos, usuario)
+    finally:
+        invalidar_cache_acceso()
+
+
+def _guardar_config_impl(get_conn_fn, datos, usuario):
     """Crea o actualiza la configuración de un Cliente Orden. Devuelve (ok, mensaje)."""
     co = _txt(datos.get("cliente_orden"))
     cli = _txt(datos.get("cliente"))
@@ -1384,12 +1414,15 @@ def _resolver_inciertas(get_conn_fn, plan, viajes, token):
     inciertas = [(v, p) for v in viajes for p in v["paradas"] if p["estado"] == "enviando" and v.get("route_id_sr")]
     if not inciertas:
         return 0, ""
-    ok, data = sr_int._sr_request("GET", "routes/visits/", token=token, params={"planned_date": plan["fecha"].isoformat()},
-                                  timeout=sr_int.TIMEOUT_LISTA_DRIVERS_SEGUNDOS)
-    if not ok:
-        return 0, f"No pude revisar en SR las paradas que quedaron a medias: {_err_sr(data)}"
-    lista = data.get("results", data) if isinstance(data, dict) else data
-    por_ref = {(str(x.get("route")), str(x.get("reference"))): x.get("id") for x in (lista or [])}
+    # Solo las rutas de las paradas dudosas (SR filtra por ruta) y solo 3 campos por visita: antes se bajaba el día completo
+    # de TODOS los clientes (miles de visitas) para encontrar unas cuantas.
+    rutas = sorted({str(v["route_id_sr"]) for v, _p in inciertas})
+    por_ref = {}
+    try:
+        for x in sr_int.iterar_visitas_sr(plan["fecha"], token=token, route=rutas, campos=("id", "route", "reference")):
+            por_ref[(str(x.get("route")), str(x.get("reference")))] = x.get("id")
+    except sr_int.ErrorSR as e:
+        return 0, f"No pude revisar en SR las paradas que quedaron a medias: {e}"
     arregladas = 0
     for v, p in inciertas:
         vid = por_ref.get((str(v["route_id_sr"]), p["codigo_pedido"]))

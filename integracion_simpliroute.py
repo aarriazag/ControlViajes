@@ -37,8 +37,11 @@ en app.py):
 """
 
 import requests
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
@@ -1049,112 +1052,253 @@ def cajas_de_visita(v):
     return int(n) if n == int(n) else n
 
 
-def importar_rutas_sr(fecha, token=None):
-    """Trae todas las Rutas de SR de una fecha, y por cada una agrupa sus
-    Visitas por tienda (título), sumando `load_3` como cajas — el mismo
-    proceso que ya validamos a mano con datos reales. NO toca la base de
-    datos ni decide nada de negocio — solo arma la estructura cruda para
-    que app.py la muestre en la cola de 'Rutas pendientes de importar'.
+# ---------------------------------------------------------------------------
+# LECTURA DE VISITAS DE SR — paginada, en flujo y solo con los campos que se necesitan
+# ---------------------------------------------------------------------------
+# Antes cada consulta traía el día COMPLETO en una sola respuesta (~5,500 visitas con todos sus campos e items):
+# el JSON de ese tamaño ocupa decenas de MB de memoria de golpe, y el escaneo de visit_types lo repetía 9 veces.
+# Ahora se usa el endpoint paginado que SR recomienda (hasta 500 visitas por página, con filtro por ruta y rangos de
+# hasta 30 días): se procesa página por página y de cada visita solo se conservan los campos pedidos, así que la
+# memoria máxima es la de UNA página. Si el endpoint paginado no existiera en la cuenta, se usa el anterior (el de
+# siempre) sin que quien llama note la diferencia.
+class ErrorSR(Exception):
+    """SR no contestó bien al leer visitas. El mensaje ya está listo para mostrarse."""
+
+
+class _PaginadoNoDisponible(Exception):
+    pass
+
+
+CAMPOS_VISITA_MIN = ("id", "title", "route", "visit_type", "reference", "notes", "order", "planned_date",
+                     "latitude", "longitude", "geocode_alert", "load_3", "load_4")
+TAMANO_PAGINA_SR = 500                       # máximo que acepta SR
+MAX_PAGINAS_SR = 400                         # tope de seguridad (200 mil visitas): nunca un ciclo sin fin
+ESPERA_REINTENTO_PAGINADO_SEGUNDOS = 1800    # si SR rechaza el endpoint paginado, no se vuelve a probar en 30 min
+_PAGINADO_SR = {"no_disponible_hasta": 0.0}
+_RE_PAGINADO_NO_DISPONIBLE = re.compile(r"HTTP (400|404|405|501)\b")
+
+
+def _a_fecha(valor):
+    if isinstance(valor, datetime):
+        return valor.date()
+    if hasattr(valor, "isoformat") and not isinstance(valor, str):
+        return valor
+    return datetime.strptime(str(valor)[:10], "%Y-%m-%d").date()
+
+
+def _reducir_visita(v, campos):
+    return {c: v.get(c) for c in campos}
+
+
+def _iterar_paginado(params_base, token, ruta, campos, timeout):
+    pagina, primera_previa = 1, object()
+    while pagina <= MAX_PAGINAS_SR:
+        params = dict(params_base, page=pagina, page_size=TAMANO_PAGINA_SR)
+        if ruta:
+            params["route"] = ruta
+        ok, raw = _sr_request("GET", "routes/visits/paginated/", token=token, timeout=timeout, params=params)
+        if not ok:
+            if pagina == 1 and _RE_PAGINADO_NO_DISPONIBLE.search(str(raw)):
+                raise _PaginadoNoDisponible(str(raw))
+            raise ErrorSR(str(raw))
+        if isinstance(raw, dict):
+            resultados, siguiente = raw.get("results") or [], raw.get("next")
+        else:
+            resultados, siguiente = raw or [], None
+        if not resultados:
+            return
+        primera = resultados[0].get("id")
+        if primera is not None and primera == primera_previa:
+            raise ErrorSR("SimpliRoute repitió la misma página de visitas; se detuvo la lectura para no duplicar datos.")
+        primera_previa = primera
+        for v in resultados:
+            yield _reducir_visita(v, campos)
+        if not siguiente:
+            return
+        pagina += 1
+        del resultados, raw
+    raise ErrorSR(f"Se alcanzó el tope de {MAX_PAGINAS_SR} páginas de visitas; acota el rango de fechas.")
+
+
+def _iterar_legado(fechas, token, rutas, campos, timeout):
+    """Respaldo: el endpoint de siempre (un día completo por respuesta). Se filtra por ruta aquí, no en SR."""
+    for f in fechas:
+        ok, raw = _sr_request("GET", "routes/visits/", token=token, timeout=timeout, params={"planned_date": str(f)})
+        if not ok:
+            raise ErrorSR(str(raw))
+        lista = raw.get("results", raw) if isinstance(raw, dict) else raw
+        for v in lista or []:
+            if rutas and v.get("route") not in rutas:
+                continue
+            yield _reducir_visita(v, campos)
+        del lista, raw
+
+
+def iterar_visitas_sr(fecha_ini, fecha_fin=None, token=None, route=None, campos=CAMPOS_VISITA_MIN, timeout=60):
+    """Generador: va entregando las visitas de SR (solo `campos`) entre dos fechas, de una página a la vez.
+    `route` puede ser un id de ruta o varios (filtra del lado de SR). Lanza ErrorSR si SR falla (quien llama decide
+    qué hacer con lo ya leído). Nunca guarda todo el resultado en memoria: eso lo decide quien lo consume."""
+    ini = _a_fecha(fecha_ini)
+    fin = _a_fecha(fecha_fin) if fecha_fin else ini
+    if fin < ini:
+        ini, fin = fin, ini
+    rutas = [route] if isinstance(route, str) else [r for r in (route or []) if r]
+    bloques, d = [], ini
+    while d <= fin:                                    # SR acepta rangos de máximo 30 días
+        h = min(d + timedelta(days=29), fin)
+        bloques.append((d, h))
+        d = h + timedelta(days=1)
+    for d_ini, d_fin in bloques:
+        if time.time() >= _PAGINADO_SR["no_disponible_hasta"]:
+            base = {"planned_date": str(d_ini)} if d_ini == d_fin else {"start_date": str(d_ini), "end_date": str(d_fin)}
+            try:
+                for r in (rutas or [None]):
+                    yield from _iterar_paginado(base, token, r, campos, timeout)
+                continue
+            except _PaginadoNoDisponible:
+                _PAGINADO_SR["no_disponible_hasta"] = time.time() + ESPERA_REINTENTO_PAGINADO_SEGUNDOS
+        fechas = [d_ini + timedelta(days=i) for i in range((d_fin - d_ini).days + 1)]
+        yield from _iterar_legado(fechas, token, set(rutas), campos, timeout)
+
+
+def leer_visitas_sr(*args, **kwargs):
+    """Versión cómoda para consultas CHICAS (una ruta, un puñado de campos): (True, lista) o (False, mensaje)."""
+    try:
+        return True, list(iterar_visitas_sr(*args, **kwargs))
+    except ErrorSR as e:
+        return False, str(e)
+
+
+def mapa_visit_type_a_cliente(get_conn_fn):
+    """{visit_type de SR: cliente de Control de Ruta}. Vacío si no hay mapeo o la tabla aún no existe. Nunca lanza."""
+    from contextlib import closing
+    try:
+        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr WHERE cliente IS NOT NULL")
+            return {r[0]: r[1] for r in cur.fetchall() if r[1]}
+    except Exception:
+        return {}
+
+
+# Placas y nombres legibles (solo para MOSTRAR): listas de 1,064 vehículos y 432 conductores que tardaban ~7 s en
+# cada importación. Cambian poco, así que se recuerdan 10 minutos en el servidor (un solo juego para todos).
+TTL_LEGIBLES_SEGUNDOS = 600
+_CACHE_LEGIBLES = {"t": 0.0, "placas": {}, "nombres": {}}
+_CANDADO_LEGIBLES = threading.Lock()
+
+
+def _mapas_legibles(token=None, forzar=False):
+    with _CANDADO_LEGIBLES:
+        if not forzar and time.time() - _CACHE_LEGIBLES["t"] < TTL_LEGIBLES_SEGUNDOS:
+            return _CACHE_LEGIBLES["placas"], _CACHE_LEGIBLES["nombres"]
+    placas, nombres, completo = {}, {}, True
+    try:
+        ok_v, vehs = obtener_vehiculos_sr(token=token)
+        if ok_v:
+            placas = {v.get("id"): (v.get("license_plate") or v.get("name")) for v in vehs}
+        else:
+            completo = False
+        ok_d, drvs = obtener_drivers_sr(token=token)
+        if ok_d:
+            nombres = {d.get("id"): (d.get("name") or d.get("username")) for d in drvs}
+        else:
+            completo = False
+    except Exception:
+        completo = False
+    if completo:
+        with _CANDADO_LEGIBLES:
+            _CACHE_LEGIBLES.update(t=time.time(), placas=placas, nombres=nombres)
+    return placas, nombres
+
+
+def importar_rutas_sr(fecha, token=None, mapa_cliente=None):
+    """Trae todas las Rutas de SR de una fecha y, por cada una, agrupa sus Visitas por TIENDA sumando las cajas
+    (`load_4`, o `load_3` si no viene). NO toca la base de datos ni decide nada de negocio: solo arma la estructura cruda
+    para la cola de 'Rutas pendientes de importar'.
+
+    La tienda se agrupa por CÓDIGO (el que trae el título: "129 LA TORRE ZONA 13") y no por el texto del título, así que la
+    misma tienda escrita con dos títulos distintos ya no aparece como dos paradas. `mapa_cliente` ({visit_type: cliente},
+    ver mapa_visit_type_a_cliente) evita mezclar dos clientes que usen el mismo código dentro de una ruta mixta; sin él,
+    el comportamiento es el de antes (se agrupa por código sin distinguir cliente).
 
     Devuelve (True, [ruta_dict, ...]) o (False, mensaje). Cada ruta_dict:
-      {
-        "route_id": uuid de la Ruta en SR,
-        "vehicle_sr_id": id del vehículo en SR (puede ser el dummy),
-        "driver_sr_id": id del piloto en SR,
-        "total_visitas": int,
-        "visit_types": {tipo: conteo},  # para más adelante cruzar con cat_mapeo_cliente_sr
-        "destinos": [
-            {"tienda": str, "cajas": int, "orden_sugerido": int, "pedidos": [{"pedido": reference, "cajas": n, "visit_id": id}]}
-        ],  # "destinos" ya viene ORDENADO según el optimizador de SR (campo
-            # `order` de sus Visitas) — es un punto de partida sugerido, no
-            # definitivo; en Control de Ruta se puede reordenar con las
-            # flechitas antes de guardar el viaje.
-      }
-    """
+      route_id, vehicle_sr_id, driver_sr_id, vehicle_placa_sr, driver_nombre_sr, total_visitas, visit_types {tipo: n},
+      oleadas [..], destinos [{"tienda": título, "codigo": int|None, "cliente_sr": str|None, "visit_types": {..},
+      "cajas", "orden_sugerido", "pedidos": [...], "despachos": [...], "oleadas": {..}, "visitas_sin_oleada": n}]
+    "destinos" ya viene ORDENADO según el optimizador de SR (campo `order`); en Control de Ruta se puede reordenar."""
+    mapa_cliente = mapa_cliente or {}
     ok, rutas_raw = _sr_request("GET", "routes/routes/", token=token, timeout=45, params={"planned_date": fecha})
     if not ok:
         return False, f"No se pudieron traer las Rutas de SimpliRoute: {rutas_raw}"
     lista_rutas = rutas_raw.get("results", rutas_raw) if isinstance(rutas_raw, dict) else rutas_raw
+    rutas_por_id = {r.get("id"): r for r in (lista_rutas or [])}
+    del rutas_raw, lista_rutas
 
-    ok, visitas_raw = _sr_request("GET", "routes/visits/", token=token, timeout=45, params={"planned_date": fecha})
-    if not ok:
-        return False, f"No se pudieron traer las Visitas de SimpliRoute: {visitas_raw}"
-    lista_visitas = visitas_raw.get("results", visitas_raw) if isinstance(visitas_raw, dict) else visitas_raw
-
-    # Placas y nombres legibles (solo para MOSTRAR en pantalla). Si estas dos consultas fallan, la
-    # importación sigue igual, solo que se muestran los ids en vez de placa y nombre.
-    placas_sr, nombres_sr = {}, {}
+    acumulado = {}      # route_id -> {"visit_types": {}, "total": 0, "tiendas": {clave: destino}}
     try:
-        ok_v, vehs = obtener_vehiculos_sr(token=token)
-        if ok_v:
-            placas_sr = {v.get("id"): (v.get("license_plate") or v.get("name")) for v in vehs}
-        ok_d, drvs = obtener_drivers_sr(token=token)
-        if ok_d:
-            nombres_sr = {d.get("id"): (d.get("name") or d.get("username")) for d in drvs}
-    except Exception:
-        pass
-
-    resultado = []
-    for ruta in lista_rutas:
-        route_id = ruta.get("id")
-        visitas_de_ruta = [v for v in lista_visitas if v.get("route") == route_id]
-        if not visitas_de_ruta:
-            continue  # ruta sin visitas ese día — nada que importar
-
-        visit_types = {}
-        por_tienda = {}
-        for v in visitas_de_ruta:
+        for v in iterar_visitas_sr(fecha, token=token):
+            rid = v.get("route")
+            if rid not in rutas_por_id:
+                continue
+            ac = acumulado.setdefault(rid, {"visit_types": {}, "total": 0, "tiendas": {}})
+            ac["total"] += 1
             tipo = v.get("visit_type") or "(sin tipo)"
-            visit_types[tipo] = visit_types.get(tipo, 0) + 1
-
-            tienda = v.get("title") or "(sin nombre)"
-            if tienda not in por_tienda:
-                por_tienda[tienda] = {"tienda": tienda, "cajas": 0, "pedidos": [], "orden_sugerido": None,
-                                      "oleadas": {}, "visitas_sin_oleada": 0}
+            ac["visit_types"][tipo] = ac["visit_types"].get(tipo, 0) + 1
+            titulo = v.get("title") or "(sin nombre)"
+            codigo = codigo_de_titulo(titulo)
+            cliente = mapa_cliente.get(tipo)
+            clave = ("c", cliente, codigo) if codigo is not None else ("t", cliente, _norm_nombre_tienda(titulo))
+            d_ = ac["tiendas"].get(clave)
+            if d_ is None:
+                d_ = ac["tiendas"][clave] = {"tienda": titulo, "codigo": codigo, "cliente_sr": cliente, "visit_types": {},
+                                             "cajas": 0, "pedidos": [], "orden_sugerido": None,
+                                             "oleadas": {}, "visitas_sin_oleada": 0}
+            d_["visit_types"][tipo] = d_["visit_types"].get(tipo, 0) + 1
             cajas_visita = cajas_de_visita(v)
             oleada = oleada_de_notes(v.get("notes"))
-            por_tienda[tienda]["cajas"] += cajas_visita
+            d_["cajas"] += cajas_visita
             if oleada:    # la oleada ES el No. de Despacho: se suman las cajas de todas sus visitas
-                por_tienda[tienda]["oleadas"][oleada] = por_tienda[tienda]["oleadas"].get(oleada, 0) + cajas_visita
+                d_["oleadas"][oleada] = d_["oleadas"].get(oleada, 0) + cajas_visita
             else:
-                por_tienda[tienda]["visitas_sin_oleada"] += 1
-            por_tienda[tienda]["pedidos"].append({
-                "pedido": v.get("reference"),
-                "oleada": oleada,
-                "cajas": cajas_visita,
-                "visit_id": v.get("id"),
-                "origen": "SR",
-            })
-            # El orden más bajo entre todas las visitas de esta tienda —
-            # SR numera cada parada según su optimizador; una tienda con
-            # varias visitas (varios pedidos) se ubica donde llegaría la
-            # primera de ellas.
+                d_["visitas_sin_oleada"] += 1
+            d_["pedidos"].append({"pedido": v.get("reference"), "oleada": oleada, "cajas": cajas_visita,
+                                  "visit_id": v.get("id"), "origen": "SR"})
+            # El orden más bajo entre todas las visitas de la tienda: SR numera cada parada con su optimizador y una tienda
+            # con varias visitas (varios pedidos) se ubica donde llegaría la primera de ellas.
             orden_visita = v.get("order")
-            if orden_visita is not None:
-                actual = por_tienda[tienda]["orden_sugerido"]
-                if actual is None or orden_visita < actual:
-                    por_tienda[tienda]["orden_sugerido"] = orden_visita
+            if orden_visita is not None and (d_["orden_sugerido"] is None or orden_visita < d_["orden_sugerido"]):
+                d_["orden_sugerido"] = orden_visita
+    except ErrorSR as e:
+        return False, f"No se pudieron traer las Visitas de SimpliRoute: {e}"
 
-        for d_ in por_tienda.values():
+    # Placas y nombres legibles (solo para MOSTRAR). Si fallan, la importación sigue con los ids.
+    placas_sr, nombres_sr = _mapas_legibles(token=token)
+    faltan_ids = any(rutas_por_id[rid].get("vehicle") not in placas_sr or
+                     (rutas_por_id[rid].get("driver") is not None and rutas_por_id[rid].get("driver") not in nombres_sr)
+                     for rid in acumulado)
+    if faltan_ids and time.time() - _CACHE_LEGIBLES["t"] > 60:      # un vehículo/piloto recién creado: se actualiza la lista
+        placas_sr, nombres_sr = _mapas_legibles(token=token, forzar=True)
+
+    resultado = []
+    for rid, ruta in rutas_por_id.items():
+        ac = acumulado.get(rid)
+        if not ac:
+            continue  # ruta sin visitas ese día — nada que importar
+        destinos = list(ac["tiendas"].values())
+        for d_ in destinos:
             d_["despachos"] = [{"pedido": o, "cajas": c, "origen": "SR"} for o, c in d_["oleadas"].items()]
-
-        destinos_ordenados = sorted(
-            por_tienda.values(),
-            key=lambda d: d["orden_sugerido"] if d["orden_sugerido"] is not None else float("inf")
-        )
-
+        destinos.sort(key=lambda d: d["orden_sugerido"] if d["orden_sugerido"] is not None else float("inf"))
         resultado.append({
-            "route_id": route_id,
+            "route_id": rid,
             "vehicle_sr_id": ruta.get("vehicle"),
             "driver_sr_id": ruta.get("driver"),
             "vehicle_placa_sr": placas_sr.get(ruta.get("vehicle")),
             "driver_nombre_sr": nombres_sr.get(ruta.get("driver")),
-            "total_visitas": len(visitas_de_ruta),
-            "visit_types": visit_types,
-            "oleadas": sorted({o for d_ in por_tienda.values() for o in d_["oleadas"]}),
-            "destinos": destinos_ordenados,
+            "total_visitas": ac["total"],
+            "visit_types": ac["visit_types"],
+            "oleadas": sorted({o for d_ in destinos for o in d_["oleadas"]}),
+            "destinos": destinos,
         })
-
     return True, resultado
 
 
@@ -1673,58 +1817,84 @@ def registrar_visit_types_vistos(get_conn_fn, tipos):
         pass
 
 
+_ESQUEMA_VISIT_TYPES_LISTO = False
+
+
 def _asegurar_esquema_visit_types(conn):
+    """Crea las tablas de visit_type la primera vez en este proceso (antes se mandaba el CREATE a Supabase en cada llamada)."""
+    global _ESQUEMA_VISIT_TYPES_LISTO
+    if _ESQUEMA_VISIT_TYPES_LISTO:
+        return
     with conn.cursor() as cur:
         cur.execute("CREATE TABLE IF NOT EXISTS sr_visit_types_vistos (visit_type TEXT PRIMARY KEY, "
                     "primera_vez TIMESTAMP DEFAULT NOW(), ultima_vez TIMESTAMP DEFAULT NOW())")
         cur.execute("CREATE TABLE IF NOT EXISTS cat_mapeo_cliente_sr (visit_type TEXT PRIMARY KEY, cliente TEXT)")
     conn.commit()
+    _ESQUEMA_VISIT_TYPES_LISTO = True
 
 
 def escanear_visit_types_sr(get_conn_fn, token=None, dias=7):
-    """Recorre las Visitas de SR de los últimos `dias` días (y de mañana) y anota los visit_type que
-    encuentra. Devuelve (ok, resumen). Nunca lanza."""
-    from datetime import timedelta
+    """Recorre las Visitas de SR de los últimos `dias` días (y de mañana) y anota los visit_type que encuentra.
+    Devuelve (ok, resumen). Nunca lanza. Lee en flujo y solo el campo visit_type: la memoria no depende de cuántas
+    visitas haya (antes se bajaba cada día completo, con todos sus campos, uno tras otro)."""
     try:
         hoy = _hoy_guatemala()
-        fechas = [hoy + timedelta(days=d) for d in range(-int(dias), 2)]
-        encontrados, dias_ok, dias_fallo = set(), 0, 0
-        for f in fechas:
-            ok, raw = _sr_request("GET", "routes/visits/", token=token, timeout=45, params={"planned_date": str(f)})
-            if not ok:
-                dias_fallo += 1
-                continue
-            dias_ok += 1
-            visitas = raw.get("results", raw) if isinstance(raw, dict) else raw
-            encontrados |= {v.get("visit_type") for v in visitas if v.get("visit_type")}
-        if dias_ok == 0:
-            return False, "No se pudo consultar SimpliRoute en ninguno de los días."
+        ini, fin = hoy - timedelta(days=min(int(dias), 28)), hoy + timedelta(days=1)
+        encontrados, aviso = set(), ""
+        try:
+            for v in iterar_visitas_sr(ini, fin, token=token, campos=("visit_type",), timeout=60):
+                if v.get("visit_type"):
+                    encontrados.add(v["visit_type"])
+        except ErrorSR as e:
+            if not encontrados:
+                return False, f"No se pudo consultar SimpliRoute: {e}"
+            aviso = f" La lectura quedó incompleta ({e})."
         antes = {x for x, _ in visit_types_vistos(get_conn_fn)}
         registrar_visit_types_vistos(get_conn_fn, encontrados)
-        nuevos = len({x for x in encontrados if x and x not in antes})
-        resumen = f"Se revisaron {dias_ok} día(s) de SimpliRoute: {len(encontrados)} visit_type encontrado(s), {nuevos} nuevo(s) en la lista."
-        if dias_fallo:
-            resumen += f" {dias_fallo} día(s) no respondieron."
-        return True, resumen
+        nuevos = len({x for x in encontrados if x not in antes})
+        return True, (f"Se revisó SimpliRoute del {ini} al {fin}: {len(encontrados)} visit_type encontrado(s), "
+                      f"{nuevos} nuevo(s) en la lista." + aviso)
     except Exception as e:
         return False, f"Error inesperado al revisar SimpliRoute: {e}"
 
 
 # ---------------------------------------------------------------------------
-# TIENDAS — coordenadas y visit_type tomados de las visitas de SR (no se digitan)
+# TIENDAS — una SOLA forma de identificarlas (importar rutas y sincronizar coordenadas usan la misma)
 # ---------------------------------------------------------------------------
-# Confirmado con exploración real: el título de la visita viene como "<código> <NOMBRE TIENDA>" (ej. "129 LA TORRE
-# ZONA 13 AMERICAS"), con latitud/longitud completas. SR NO filtra las visitas por título ni por referencia, y traer
-# el día completo tarda ~15 s (5,500 visitas): por eso se leen pocos días de una vez y las coordenadas se guardan.
-_PATRON_CODIGO_TITULO = re.compile(r"^\s*0*(\d+)\s")
+# El título de la visita viene como "<código> <NOMBRE TIENDA>" (ej. "129 LA TORRE ZONA 13 AMERICAS"). La identidad de una
+# tienda es CLIENTE + CÓDIGO (el nombre puede variar). Regla de oro: lo que se parece pero no es igual NUNCA se asigna
+# solo; se sugiere y alguien lo confirma. Equivocarse de tienda manda cajas, hoja de control y liquidación al lugar
+# equivocado, y es mucho más caro que pedir un clic.
+#
+#   exacta        -> se asigna sola:  (a) el código existe en el catálogo Y el nombre es compatible, o
+#                                      (b) el nombre es el mismo (sin código en el título) y no choca con otro código.
+#   por_confirmar -> hay candidata pero falta certeza (el código apunta a una tienda con OTRO nombre, o el nombre se parece
+#                    pero no es igual): se muestra como sugerencia.
+#   ambigua       -> el catálogo tiene dos tiendas que calzan: no se adivina.
+#   nueva         -> no hay nada parecido: es una tienda que el catálogo aún no tiene.
+_PATRON_CODIGO_TITULO = re.compile(r"^\s*0*(\d+)(?=[\s\-–—:.)]|$)")
+_RE_QUITAR_CODIGO = re.compile(r"^\s*0*\d+[\s\-–—:.)]*")
+_PALABRAS_VACIAS = frozenset({"LA", "LAS", "EL", "LOS", "DE", "DEL", "Y", "EN"})
+UMBRAL_NOMBRE_CON_CODIGO = 0.60    # con el código coincidiendo basta un parecido razonable
+UMBRAL_NOMBRE_SIN_CODIGO = 0.80    # sin código, solo se SUGIERE si el parecido es alto Y los números coinciden
+
+# Rango dentro del cual una coordenada es creíble (Centroamérica: Ransa también hace Transporte regional). Atrapa lo
+# típico: 0/0, latitud y longitud invertidas, signos perdidos, un dígito de más. El aviso "fuera de Guatemala" sigue
+# viviendo en el catálogo (plan_transporte.validar_coordenadas_catalogo).
+LIMITES_COORD_REGION = {"lat": (7.0, 18.6), "lon": (-93.0, -77.0)}
+# Si el catálogo ya trae coordenadas puestas a mano (Excel) y SR trae otras, gana el catálogo. SR solo llena las que faltan
+# o actualiza las que ÉL mismo había puesto antes. Cámbialo a False para el comportamiento anterior (SR siempre pisa).
+PROTEGER_COORDENADAS_MANUALES = True
 
 
 def codigo_de_titulo(titulo):
-    """'129 LA TORRE ZONA 13' -> 129. None si el título no empieza con un código numérico."""
+    """'129 LA TORRE ZONA 13' -> 129; '011-LA TORRE' -> 11; '129' -> 129. None si no empieza con un código numérico
+    (un nombre como '3D PLAZA' no se confunde con un código)."""
     m = _PATRON_CODIGO_TITULO.match(str(titulo or ""))
     return int(m.group(1)) if m else None
 
 
+@lru_cache(maxsize=20000)
 def _norm_nombre_tienda(txt):
     """Mayúsculas, sin acentos ni espacios repetidos, para comparar nombres de tienda."""
     import unicodedata
@@ -1732,104 +1902,268 @@ def _norm_nombre_tienda(txt):
     return re.sub(r"\s+", " ", t).strip().upper()
 
 
-def emparejar_tienda_sr(titulo, tiendas):
-    """Encuentra la tienda del catálogo que corresponde al título de una visita de SR.
-    `tiendas` = {nombre_catalogo: {..., "codigo": int|None}}. Devuelve el nombre del catálogo o None.
-    Orden de prioridad (nunca adivina entre dos candidatos):
-      1) CÓDIGO: el título empieza con el código ("258 LA TORRE JALAPA 3") y solo una tienda lo tiene.
-      2) NOMBRE exacto, sin el código del título y sin importar mayúsculas/acentos.
-      3) NOMBRE contenido, pero solo si hay UN candidato único (el más largo); con empate -> None.
-    Antes se usaba "contiene" a secas y 'La Torre Jalapa' absorbía a 'Jalapa 2' y 'Jalapa 3'."""
+@lru_cache(maxsize=20000)
+def _tokens_nombre(txt):
+    """Palabras significativas del nombre; los números se igualan sin ceros a la izquierda ('013' = '13')."""
+    toks = re.findall(r"[A-Z0-9]+", _norm_nombre_tienda(txt))
+    return tuple((t.lstrip("0") or "0") if t.isdigit() else t for t in toks if t not in _PALABRAS_VACIAS)
+
+
+def _parecido(a, b, minimo):
+    """Parecido 0-1 entre dos textos, descartando rápido (filtros baratos de difflib) los que no llegan al mínimo."""
+    if not a or not b:
+        return 0.0
+    sm = SequenceMatcher(None, a, b)
+    if sm.real_quick_ratio() < minimo or sm.quick_ratio() < minimo:
+        return 0.0
+    return sm.ratio()
+
+
+def _comparar_nombres(a, b, minimo=0.0):
+    """(igual, subconjunto, numeros_iguales, parecido 0-1). Los NÚMEROS pesan más que las letras: 'ZONA 10' y 'ZONA 1' son
+    tiendas distintas aunque el texto sea casi idéntico."""
+    ta, tb = _tokens_nombre(a), _tokens_nombre(b)
+    sa, sb = set(ta), set(tb)
+    na, nb = _norm_nombre_tienda(a), _norm_nombre_tienda(b)
+    igual = bool(na) and (na == nb or (bool(sa) and sa == sb))
+    subconjunto = bool(sa) and bool(sb) and (sa <= sb or sb <= sa)
+    numeros_iguales = {t for t in sa if t.isdigit()} == {t for t in sb if t.isdigit()}
+    return igual, subconjunto, numeros_iguales, _parecido(" ".join(ta), " ".join(tb), minimo)
+
+
+def _codigo_int(d):
+    try:
+        c = d.get("codigo") if isinstance(d, dict) else None
+        return int(c) if c is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def construir_indice_tiendas(tiendas):
+    """Índice de las tiendas de UN cliente para identificar muchas paradas rápido (por código, por nombre y por palabra).
+    Se arma una vez y se pasa a identificar_tienda(..., indice=...): sin él, cada parada recorría TODO el catálogo con un
+    comparador lento (150 paradas contra 4,200 tiendas tardaban ~26 s; con el índice, décimas de segundo)."""
+    por_codigo, por_norm, por_conjunto, por_token, info = {}, {}, {}, {}, {}
+    for n, d in tiendas.items():
+        c = _codigo_int(d)
+        if c is not None:
+            por_codigo.setdefault(c, []).append(n)
+        norm, toks = _norm_nombre_tienda(n), _tokens_nombre(n)
+        conj = frozenset(toks)
+        info[n] = (conj, frozenset(t for t in conj if t.isdigit()), " ".join(toks))
+        if norm:
+            por_norm.setdefault(norm, []).append(n)
+        if conj:
+            por_conjunto.setdefault(conj, []).append(n)
+        for t in conj:
+            por_token.setdefault(t, []).append(n)
+    return {"por_codigo": por_codigo, "por_norm": por_norm, "por_conjunto": por_conjunto, "por_token": por_token, "info": info}
+
+
+def _nombre_compatible_con_codigo(nombre_sr, nombre_catalogo):
+    """El código ya coincide: ¿el nombre es creíble para esa tienda? Sin nombre en el título, se confía en el código."""
+    if not _tokens_nombre(nombre_sr):
+        return True
+    igual, sub, nums, parecido = _comparar_nombres(nombre_sr, nombre_catalogo, minimo=UMBRAL_NOMBRE_CON_CODIGO)
+    return igual or sub or (nums and parecido >= UMBRAL_NOMBRE_CON_CODIGO)
+
+
+def identificar_tienda(titulo, tiendas, indice=None):
+    """Identifica la tienda del catálogo que corresponde al título de una visita de SR.
+    `tiendas` = {nombre_catalogo: {..., "codigo": int|None}} (las de UN cliente). `indice` es opcional: el resultado de
+    construir_indice_tiendas(tiendas), para identificar muchas paradas seguidas sin rehacerlo cada vez.
+    Devuelve {"estado": exacta|por_confirmar|ambigua|nueva, "tienda": nombre|None, "sugerencia": nombre|None,
+              "codigo": int|None, "motivo": texto, "adopta_codigo": int|None}."""
+    ix = indice if indice is not None else construir_indice_tiendas(tiendas)
+    titulo = str(titulo or "")
     codigo = codigo_de_titulo(titulo)
+    nombre_sr = _RE_QUITAR_CODIGO.sub("", titulo, count=1).strip() if codigo is not None else titulo.strip()
+    variantes = [nombre_sr] + ([titulo.strip()] if codigo is not None else [])
+    res = {"estado": "nueva", "tienda": None, "sugerencia": None, "codigo": codigo, "motivo": "", "adopta_codigo": None}
+
     if codigo is not None:
-        por_codigo = [n for n, d in tiendas.items()
-                      if isinstance(d, dict) and d.get("codigo") is not None and int(d["codigo"]) == codigo]
-        if len(por_codigo) == 1:
-            return por_codigo[0]
-    sin_codigo = _norm_nombre_tienda(re.sub(r"^\s*0*\d+\s+", "", str(titulo or "")))
-    norm = {n: _norm_nombre_tienda(n) for n in tiendas}
-    exactos = [n for n, nn in norm.items() if nn == sin_codigo or nn == _norm_nombre_tienda(titulo)]
+        coinciden = ix["por_codigo"].get(codigo, [])
+        if len(coinciden) > 1:
+            return dict(res, estado="ambigua", sugerencia=coinciden[0],
+                        motivo=f"El código {codigo} está repetido en el catálogo ({', '.join(coinciden[:3])}).")
+        if len(coinciden) == 1:
+            n = coinciden[0]
+            if _nombre_compatible_con_codigo(nombre_sr, n):
+                return dict(res, estado="exacta", tienda=n)
+            return dict(res, estado="por_confirmar", sugerencia=n,
+                        motivo=f"El código {codigo} es «{n}» en el catálogo, pero SimpliRoute dice «{nombre_sr}».")
+
+    exactos = []
+    for v in variantes:
+        for n in ix["por_norm"].get(_norm_nombre_tienda(v), []) + ix["por_conjunto"].get(frozenset(_tokens_nombre(v)), []):
+            if n not in exactos:
+                exactos.append(n)
     if len(exactos) == 1:
-        return exactos[0]
-    if exactos:
+        n = exactos[0]
+        cod_cat = _codigo_int(tiendas[n])
+        if codigo is not None and cod_cat is not None and cod_cat != codigo:
+            return dict(res, estado="por_confirmar", sugerencia=n,
+                        motivo=f"«{n}» ya tiene el código {cod_cat} y SimpliRoute trae el {codigo}.")
+        return dict(res, estado="exacta", tienda=n, adopta_codigo=(codigo if (codigo is not None and cod_cat is None) else None))
+    if len(exactos) > 1:
+        return dict(res, estado="ambigua", sugerencia=exactos[0],
+                    motivo=f"Hay {len(exactos)} tiendas con ese mismo nombre en el catálogo.")
+
+    # Parecidas (nunca se asignan solas). Solo se miran las que comparten al menos una palabra, y de esas solo las que
+    # tienen LOS MISMOS números: son pocas, así que el comparador fino casi nunca corre.
+    sr_conj = frozenset(_tokens_nombre(nombre_sr))
+    sr_nums = frozenset(t for t in sr_conj if t.isdigit())
+    sr_join = " ".join(_tokens_nombre(nombre_sr))
+    vistas, candidatas = set(), []
+    for t in sr_conj:
+        for n in ix["por_token"].get(t, []):
+            if n in vistas:
+                continue
+            vistas.add(n)
+            conj, nums, joined = ix["info"][n]
+            if nums != sr_nums:
+                continue
+            sub = bool(conj) and (conj <= sr_conj or sr_conj <= conj)
+            parecido = 1.0 if sub else _parecido(sr_join, joined, UMBRAL_NOMBRE_SIN_CODIGO)
+            if sub or parecido >= UMBRAL_NOMBRE_SIN_CODIGO:
+                candidatas.append((parecido, n))
+    if candidatas:
+        candidatas.sort(reverse=True)
+        return dict(res, estado="por_confirmar", sugerencia=candidatas[0][1],
+                    motivo=f"«{nombre_sr}» se parece a «{candidatas[0][1]}», pero no es igual.")
+    return dict(res, estado="nueva", motivo="No hay ninguna tienda parecida en el catálogo.")
+
+
+def emparejar_tienda_sr(titulo, tiendas, indice=None):
+    """Compatibilidad: el nombre de la tienda SOLO si la identificación es segura (estado 'exacta'); si no, None.
+    Para saber por qué no (sugerencia, ambigua, nueva) usa identificar_tienda()."""
+    r = identificar_tienda(titulo, tiendas, indice=indice)
+    return r["tienda"] if r["estado"] == "exacta" else None
+
+
+def coordenadas_validas(lat, lon):
+    """(lat, lon) redondeadas a 6 decimales (el máximo que acepta SR), o None si no son creíbles."""
+    try:
+        la, lo = float(lat), float(lon)
+    except (TypeError, ValueError):
         return None
-    cont = [(len(nn), n) for n, nn in norm.items() if nn and (nn in sin_codigo or sin_codigo in nn)]
-    if not cont:
+    if la != la or lo != lo or (la == 0 and lo == 0):
         return None
-    mayor = max(c[0] for c in cont)
-    top = [n for l, n in cont if l == mayor]
-    return top[0] if len(top) == 1 else None
+    (la_min, la_max), (lo_min, lo_max) = LIMITES_COORD_REGION["lat"], LIMITES_COORD_REGION["lon"]
+    if not (la_min <= la <= la_max and lo_min <= lo <= lo_max):
+        return None
+    return round(la, 6), round(lo, 6)
 
 
 def sincronizar_coordenadas_tiendas_desde_sr(get_conn_fn, dias=3, token=None):
-    """Lee las visitas de SR de los últimos `dias` días (incluido hoy) y, para cada tienda cuyo visit_type está
-    mapeado a un cliente, copia latitud/longitud/visit_type a cat_clientes_tiendas (cliente + código de tienda).
-    Solo ESCRIBE en esas columnas; nunca toca nombre, km ni lo demás. Devuelve (ok, resumen, detalle). Nunca lanza.
-    La tienda se reconoce por cliente + código; si el código no existe en el catálogo, o está repetido, no se toca."""
+    """Lee las visitas de SR de los últimos `dias` días (incluido hoy) y, para cada tienda cuyo visit_type está mapeado a un
+    cliente, copia latitud/longitud/visit_type a cat_clientes_tiendas. Solo ESCRIBE en esas columnas; nunca toca nombre, km
+    ni lo demás. Devuelve (ok, resumen, detalle). Nunca lanza.
+    - La tienda se reconoce con identificar_tienda() (cliente + código + nombre compatible), la misma regla que la importación.
+      Lo dudoso NO se toca y queda en el detalle.
+    - Una tienda con varios visit_type (ej. frío y seco) es UNA fila: se actualiza una sola vez, con su visita más reciente.
+    - Se ignoran visitas con alerta de geocodificación de SR y coordenadas no creíbles (ver coordenadas_validas).
+    - Con PROTEGER_COORDENADAS_MANUALES, las coordenadas cargadas por Excel no se pisan.
+    - Solo se escribe lo que CAMBIÓ, y en un solo lote: antes eran 2 consultas por tienda aunque nada hubiera cambiado."""
     from contextlib import closing
     from datetime import timedelta
     try:
-        with closing(get_conn_fn()) as conn, conn.cursor() as cur:
-            cur.execute("SELECT visit_type, cliente FROM cat_mapeo_cliente_sr WHERE cliente IS NOT NULL")
-            mapa = {r[0]: r[1] for r in cur.fetchall() if r[1]}
+        mapa = mapa_visit_type_a_cliente(get_conn_fn)
         if not mapa:
             return False, "Primero hay que mapear los visit_type a clientes (Mapeo Cliente ↔ visit_type de SR).", ""
 
         hoy = _hoy_guatemala()
-        vistas = {}   # (visit_type, codigo) -> (lat, lon); gana la visita más reciente porque se recorre de hoy hacia atrás
-        dias_ok, dias_fallo, leidas, sin_coord = 0, 0, 0, 0
-        for d in range(int(dias)):
-            ok, raw = _sr_request("GET", "routes/visits/", token=token, timeout=90, params={"planned_date": str(hoy - timedelta(days=d))})
-            if not ok:
-                dias_fallo += 1
-                continue
-            dias_ok += 1
-            for v in (raw.get("results", raw) if isinstance(raw, dict) else raw):
-                vt = v.get("visit_type")
-                if vt not in mapa:
+        ini = hoy - timedelta(days=max(int(dias), 1) - 1)
+        vistas, vistas_alerta = {}, {}   # (cliente, codigo) -> {"titulo","lat","lon","vt","fecha"}; gana la visita más reciente
+        leidas = sin_coord = 0
+        aviso_lectura = ""
+        try:
+            for v in iterar_visitas_sr(ini, hoy, token=token, timeout=90,
+                                       campos=("title", "visit_type", "latitude", "longitude", "geocode_alert", "planned_date")):
+                cliente = mapa.get(v.get("visit_type"))
+                if not cliente:
                     continue
                 leidas += 1
                 codigo = codigo_de_titulo(v.get("title"))
-                try:
-                    lat, lon = round(float(v.get("latitude")), 6), round(float(v.get("longitude")), 6)
-                except (TypeError, ValueError):
+                coords = coordenadas_validas(v.get("latitude"), v.get("longitude"))
+                if codigo is None or coords is None:
                     sin_coord += 1
                     continue
-                if codigo is None or (lat == 0 and lon == 0):
-                    sin_coord += 1
-                    continue
-                vistas.setdefault((vt, codigo), (lat, lon))
-        if dias_ok == 0:
-            return False, "No se pudo consultar SimpliRoute en ninguno de los días.", ""
+                fecha_v = str(v.get("planned_date") or "")
+                destino = vistas_alerta if v.get("geocode_alert") else vistas      # las que SR marca con alerta, aparte
+                previa = destino.get((cliente, codigo))
+                if previa is None or fecha_v > previa["fecha"]:
+                    destino[(cliente, codigo)] = {"titulo": v.get("title"), "lat": coords[0], "lon": coords[1],
+                                                  "vt": v.get("visit_type"), "fecha": fecha_v}
+        except ErrorSR as e:
+            if not vistas and not vistas_alerta:
+                return False, f"No se pudo consultar SimpliRoute: {e}", ""
+            aviso_lectura = f" La lectura quedó incompleta ({e})."
 
-        actualizadas, sin_catalogo, repetidas = 0, [], []
+        # Una tienda cuya ÚNICA información viene con alerta de geocodificación de SR se ignora (la ubicación no es de fiar).
+        # Salvaguarda: si SR marca con alerta a más de la mitad, ese campo no distingue nada en esta cuenta: no se aplica.
+        solo_alerta = [k for k in vistas_alerta if k not in vistas]
+        nota_alerta = ""
+        if solo_alerta and len(solo_alerta) > 0.5 * (len(vistas) + len(solo_alerta)):
+            for k in solo_alerta:
+                vistas[k] = vistas_alerta[k]
+            nota_alerta = ("SimpliRoute marcó con alerta de geocodificación a más de la mitad de las tiendas, así que ese criterio "
+                           "no se aplicó en esta corrida.")
+            solo_alerta = []
+        con_alerta = len(solo_alerta)
+
+        actualizar, iguales, protegidas = [], 0, 0
+        por_confirmar, nuevas = [], []
         with closing(get_conn_fn()) as conn, conn.cursor() as cur:
-            for (vt, codigo), (lat, lon) in vistas.items():
-                cliente = mapa[vt]
-                cur.execute("SELECT COUNT(*) FROM cat_clientes_tiendas WHERE cliente = %s AND codigo_tienda = %s", (cliente, codigo))
-                n = cur.fetchone()[0]
-                if n == 0:
-                    sin_catalogo.append(f"{cliente} #{codigo}")
-                elif n > 1:
-                    repetidas.append(f"{cliente} #{codigo}")
-                else:
-                    cur.execute(
-                        "UPDATE cat_clientes_tiendas SET latitud = %s, longitud = %s, visit_type_sr = %s, coord_sr_fecha = %s "
-                        "WHERE cliente = %s AND codigo_tienda = %s", (lat, lon, vt, datetime.now(), cliente, codigo))
-                    actualizadas += 1
+            catalogo = {}   # cliente -> {tienda: {"codigo","lat","lon","fecha","vt"}}
+            cur.execute("SELECT cliente, tienda, codigo_tienda, latitud, longitud, coord_sr_fecha, visit_type_sr "
+                        "FROM cat_clientes_tiendas WHERE cliente = ANY(%s)", (sorted({k[0] for k in vistas}),))
+            for cli, tienda, cod, la, lo, f_sr, vt_sr in cur.fetchall():
+                catalogo.setdefault(cli, {})[tienda] = {"codigo": cod, "lat": la, "lon": lo, "fecha": f_sr, "vt": vt_sr}
+            indices = {cli: construir_indice_tiendas(t) for cli, t in catalogo.items()}
+            ahora_ = datetime.now()
+            for (cliente, codigo), d in vistas.items():
+                tiendas = catalogo.get(cliente, {})
+                r = identificar_tienda(d["titulo"], tiendas, indice=indices.get(cliente))
+                etiqueta = f"{cliente} · {d['titulo']}"
+                if r["estado"] != "exacta":
+                    (nuevas if r["estado"] == "nueva" else por_confirmar).append(
+                        etiqueta + (f" (¿{r['sugerencia']}?)" if r.get("sugerencia") else ""))
+                    continue
+                actual = tiendas[r["tienda"]]
+                tiene = actual["lat"] is not None and actual["lon"] is not None
+                if tiene and actual["fecha"] is None and PROTEGER_COORDENADAS_MANUALES:
+                    protegidas += 1          # las puso una persona (Excel): no se pisan
+                    continue
+                if (tiene and abs(actual["lat"] - d["lat"]) < 1e-6 and abs(actual["lon"] - d["lon"]) < 1e-6
+                        and actual["vt"] == d["vt"]):
+                    iguales += 1
+                    continue
+                actualizar.append((cliente, r["tienda"], d["lat"], d["lon"], d["vt"], ahora_))
+            if actualizar:
+                from psycopg2.extras import execute_values
+                execute_values(cur,
+                               "UPDATE cat_clientes_tiendas t SET latitud = v.lat, longitud = v.lon, visit_type_sr = v.vt, "
+                               "coord_sr_fecha = v.f FROM (VALUES %s) AS v(cliente, tienda, lat, lon, vt, f) "
+                               "WHERE t.cliente = v.cliente AND t.tienda = v.tienda",
+                               actualizar, template="(%s, %s, %s::double precision, %s::double precision, %s, %s::timestamp)")
             conn.commit()
-        resumen = (f"{actualizadas} tienda(s) con coordenadas actualizadas desde SR ({dias_ok} día(s) revisados); "
-                   f"{len(sin_catalogo)} código(s) de SR que no están en el catálogo de tiendas"
-                   + (f"; {len(repetidas)} con código repetido en el catálogo" if repetidas else "") + ".")
-        if dias_fallo:
-            resumen += f" {dias_fallo} día(s) no respondieron."
+
+        resumen = (f"{len(actualizar)} tienda(s) con coordenadas actualizadas desde SR ({iguales} ya estaban al día"
+                   + (f", {protegidas} con coordenadas propias que no se tocaron" if protegidas else "")
+                   + f"); {len(por_confirmar)} por confirmar y {len(nuevas)} que no están en el catálogo.")
+        resumen += aviso_lectura
         detalle = []
-        if sin_catalogo:
-            detalle.append("En SR pero sin coincidencia en el catálogo (cliente #código): " + ", ".join(sin_catalogo[:40]) + ("…" if len(sin_catalogo) > 40 else ""))
-        if repetidas:
-            detalle.append("Código repetido en el catálogo, no se tocó: " + ", ".join(repetidas[:40]))
-        if sin_coord:
-            detalle.append(f"{sin_coord} visita(s) sin código en el título o sin coordenadas, ignoradas.")
+        if por_confirmar:
+            detalle.append("Dudosas (no se tocaron; revisa código y nombre en el catálogo): " + "; ".join(por_confirmar[:30])
+                           + ("…" if len(por_confirmar) > 30 else ""))
+        if nuevas:
+            detalle.append("En SR pero sin tienda parecida en el catálogo: " + "; ".join(nuevas[:30]) + ("…" if len(nuevas) > 30 else ""))
+        if sin_coord or con_alerta:
+            detalle.append(f"{sin_coord} visita(s) sin código o con coordenadas no creíbles y {con_alerta} tienda(s) con alerta "
+                           "de geocodificación de SR, ignoradas.")
+        if nota_alerta:
+            detalle.append(nota_alerta)
         return True, resumen, "\n".join(detalle)
     except Exception as e:
         return False, f"Error inesperado al leer las coordenadas de SR: {e}", ""

@@ -6,6 +6,7 @@ import psycopg2.extras
 import psycopg2.pool
 from psycopg2 import sql as psql
 import json
+import functools
 import re
 import io
 import os
@@ -30,7 +31,7 @@ import plan_transporte as plan_tr
 #   Menor   (el de en medio)   = funciones o reportes nuevos, sin romper nada existente (ej. 1.4.9 → 1.5.0)
 #   Mayor   (el primero)       = cambio de fondo en cómo funciona la herramienta (ej. 1.9.4 → 2.0.0)
 # Se actualiza a mano en cada entrega — no se calcula solo.
-VERSION_APP = "1.0.0"
+VERSION_APP = "1.1.0"
 
 # Tonelaje que va con cabezal + furgón como una sola unidad (placa_furgon).
 # Una sola constante en vez de repetir "20 Ton" en 5 lugares del código —
@@ -302,13 +303,39 @@ st.markdown("""
         div[data-testid="stMetricValue"] { color: var(--ransa-verde) !important; }
 
         /* Sidebar — fondo blanco, se separa del resto por profundidad
-           (borde + sombra), no por color. Como es blanco igual que las
-           tarjetas del contenido, hereda el mismo texto oscuro de siempre —
-           no hace falta ninguna regla especial de color aquí. */
+           (borde + sombra), no por color. */
         section[data-testid="stSidebar"] {
             background-color: #FFFFFF;
             border-right: 1px solid var(--gris-borde);
             box-shadow: 2px 0 8px rgba(16, 24, 40, 0.05);
+        }
+        /* MODO OSCURO. El diseño usa superficies BLANCAS (menú lateral, tarjetas, métricas). Con el tema oscuro de
+           Streamlit el texto por defecto es BLANCO, y sobre esas superficies no se leía (letras blancas en fondo blanco).
+           Solo cuando el sistema está en modo oscuro, el texto de esas superficies pasa a oscuro. El modo claro NO
+           cambia. (Además .streamlit/config.toml fija el tema claro; esto queda como segunda defensa.) Se excluyen los
+           botones, las alertas y los campos de entrada, que ya traen sus propios colores. */
+        @media (prefers-color-scheme: dark) {
+            section[data-testid="stSidebar"],
+            div[data-testid="stVerticalBlockBorderWrapper"],
+            div[data-testid="stMetric"] {
+                color: var(--gris-texto) !important;
+                color-scheme: light;
+            }
+            :is(section[data-testid="stSidebar"], div[data-testid="stVerticalBlockBorderWrapper"])
+            :is(p, span, label, li, small, strong, em, h1, h2, h3, h4, h5, h6, summary):not(:is(
+                button *, [data-testid="stAlert"] *, [data-baseweb="select"] *, [data-baseweb="input"] *,
+                [data-baseweb="textarea"] *, [data-baseweb="base-input"] *, [data-baseweb="popover"] *,
+                [data-testid^="stMetric"] *, [data-testid="stCaptionContainer"] *, [data-testid="stSidebarNav"] *)) {
+                color: var(--gris-texto) !important;
+            }
+            :is(section[data-testid="stSidebar"], div[data-testid="stVerticalBlockBorderWrapper"])
+            div[data-testid="stCaptionContainer"] * {
+                color: var(--gris-medio) !important;
+            }
+            section[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] :is(button, svg, span) {
+                color: var(--gris-texto) !important;
+                fill: var(--gris-texto) !important;
+            }
         }
         /* Menos espacio vertical entre elementos del sidebar, para minimizar el
            scroll — sobre todo en pantallas anchas donde el sidebar es angosto
@@ -684,7 +711,12 @@ class _ConexionDelPool:
                     pass
                 if raw.autocommit:
                     raw.autocommit = False
-            _ULTIMO_USO_CONEXION[id(raw)] = time.time()
+            if raw.closed:
+                _ULTIMO_USO_CONEXION.pop(id(raw), None)      # una conexión cerrada ya no se rastrea (su id podría reutilizarse)
+            else:
+                _ULTIMO_USO_CONEXION[id(raw)] = time.time()
+            if len(_ULTIMO_USO_CONEXION) > 64:               # tope de seguridad: este diccionario no debe crecer sin límite
+                _ULTIMO_USO_CONEXION.clear()
         finally:
             try:
                 self._pool.putconn(raw, close=bool(raw.closed))
@@ -726,6 +758,56 @@ def get_conn():
 # Errores de "no hay conexión con la base" (red caída, base reiniciando, tiempo agotado,
 # conexión cortada). Los demás errores NO se esconden: siguen mostrándose como siempre.
 ERRORES_DE_CONEXION = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+
+# --- Cuidado de recursos (Render y Supabase) -------------------------------------------------------------------------
+def _version_streamlit_minima(minima):
+    try:
+        from packaging.version import Version
+        return Version(st.__version__) >= Version(minima)
+    except Exception:
+        return False
+
+
+# Streamlit >= 1.52 permite pasarle a download_button una FUNCIÓN: el archivo se genera solo cuando alguien hace clic. Antes
+# cada recarga de pantalla armaba el Excel y el CSV completos de cada reporte (con miles de filas) aunque nadie los bajara,
+# y Streamlit guardaba cada copia en memoria. Con una versión anterior todo sigue funcionando como antes (se genera al
+# mostrar el botón): conviene fijar streamlit>=1.52 en requirements.txt para aprovecharlo.
+_DESCARGA_DIFERIDA = _version_streamlit_minima("1.52.0")
+_KW_DESCARGA = {"on_click": "ignore"} if _DESCARGA_DIFERIDA else {}   # "ignore": descargar no vuelve a recargar la pantalla
+
+
+def _diferida(fn, *args):
+    return functools.partial(fn, *args) if _DESCARGA_DIFERIDA else fn(*args)
+
+
+def _html_de_version(version):
+    return hoja_html_de_version(version) or ""
+
+
+MAX_FILAS_PANTALLA = 3000
+
+
+def _mostrar_df(df, **kw):
+    """st.dataframe con tope de filas: la tabla completa viaja al navegador y vive en memoria del servidor y del navegador.
+    La descarga (Excel/CSV) siempre trae TODO."""
+    if len(df) > MAX_FILAS_PANTALLA:
+        st.caption(f"Se muestran las primeras {MAX_FILAS_PANTALLA:,} de {len(df):,} filas para no saturar la pantalla; "
+                   "la descarga trae todas.")
+        df = df.head(MAX_FILAS_PANTALLA)
+    st.dataframe(df, **kw)
+
+
+def _rss_mb():
+    """Memoria que usa este proceso (MB), leída de Linux. None si no se puede."""
+    try:
+        with open("/proc/self/status") as f:
+            for linea in f:
+                if linea.startswith("VmRSS:"):
+                    return int(linea.split()[1]) / 1024
+    except Exception:
+        pass
+    return None
 
 
 def _pantalla_sin_conexion(e, contexto=""):
@@ -1837,6 +1919,13 @@ def sincronizar_catalogo(tabla, columnas, clave, df_nuevo, usuario, clientes_per
                 # Coordenadas: una celda vacía NO borra la que ya existe (vienen de SimpliRoute o de cargas anteriores).
                 set_sql = ", ".join((f"{c} = COALESCE(EXCLUDED.{c}, {tabla}.{c})" if c in ("latitud", "longitud") else f"{c} = EXCLUDED.{c}")
                                     for c in no_clave)
+                if tabla == "cat_clientes_tiendas" and "latitud" in no_clave and "longitud" in no_clave:
+                    # Si el archivo CAMBIA las coordenadas de una tienda, pasan a ser «propias»: SimpliRoute ya no las pisa
+                    # (ver PROTEGER_COORDENADAS_MANUALES). Si trae las mismas que ya tenía, no cambia nada.
+                    set_sql += (", coord_sr_fecha = CASE WHEN EXCLUDED.latitud IS NOT NULL AND "
+                                "(cat_clientes_tiendas.latitud IS DISTINCT FROM EXCLUDED.latitud OR "
+                                "cat_clientes_tiendas.longitud IS DISTINCT FROM EXCLUDED.longitud) "
+                                "THEN NULL ELSE cat_clientes_tiendas.coord_sr_fecha END")
                 query = f"INSERT INTO {tabla} ({cols_sql}) VALUES ({placeholders})"
                 query += f" ON CONFLICT ({', '.join(clave)}) DO UPDATE SET {set_sql}" if set_sql \
                     else f" ON CONFLICT ({', '.join(clave)}) DO NOTHING"
@@ -1972,6 +2061,29 @@ def peek_siguiente_correlativo(cliente):
         numero = (row[0] if row else 0) + 1
     prefijo = "".join([w[0] for w in cliente.split()]).upper()[:4]
     return f"{prefijo}-{numero:04d}"
+
+
+def peek_siguiente_correlativo_en_sesion(cliente, run):
+    """La vista previa del No. de Viaje se consulta a la base una vez cada 30 s (o cuando el formulario se limpia tras guardar),
+    no en cada clic del formulario. Es solo informativa: el número real se asigna de forma atómica al guardar."""
+    clave = (cliente, run)
+    c = st.session_state.get("_cache_correlativo")
+    if c and c[0] == clave and time.time() - c[1] < 30:
+        return c[2]
+    valor = peek_siguiente_correlativo(cliente)
+    st.session_state["_cache_correlativo"] = (clave, time.time(), valor)
+    return valor
+
+
+def _viajes_recientes_en_sesion():
+    """Los últimos 10 viajes: se consultan cada 30 s o cuando se guarda un viaje (el formulario se limpia), no en cada clic."""
+    clave = st.session_state.get("form_run", 0)
+    c = st.session_state.get("_cache_viajes_recientes")
+    if c and c[0] == clave and time.time() - c[1] < 30:
+        return c[2]
+    df = obtener_viajes_recientes()
+    st.session_state["_cache_viajes_recientes"] = (clave, time.time(), df)
+    return df
 
 
 def siguiente_correlativo(cliente, cur):
@@ -2607,7 +2719,7 @@ def render_editor_hoja_impresa():
             if hoja_activar_version(v_sel, usuario_activo):
                 st.session_state["hoja_flash"] = ("success", f"Versión {v_sel} activada.")
                 st.rerun()
-        c3.download_button(":material/download: Descargar esa versión", data=hoja_html_de_version(v_sel) or "",
+        c3.download_button(":material/download: Descargar esa versión", data=_diferida(_html_de_version, v_sel), **_KW_DESCARGA,
                            file_name=f"hoja_control_v{v_sel}.html", mime="text/html", key="hoja_descargar_version", use_container_width=True)
     if st.button(":material/history: Volver a la hoja ORIGINAL del sistema", key="hoja_volver_original"):
         nueva = hoja_guardar_version(HOJA_PLANTILLA_DEFECTO, "Hoja original del sistema", usuario_activo)
@@ -3195,16 +3307,16 @@ def mostrar_reporte_supabase(fila):
                 if valores:
                     df = df[df[col_f].astype(str).isin(valores)]
     st.caption(f"{len(df)} renglón(es)" + (f" en {df['No. de Viaje'].nunique()} viaje(s)." if "No. de Viaje" in df else "."))
-    st.dataframe(df, use_container_width=True, height=420)
+    _mostrar_df(df, use_container_width=True, height=420)
     base = archivo or vista
     e1, e2 = st.columns(2)
     with e1:
-        st.download_button(":material/download: Exportar a Excel", data=exportar_excel(df),
+        st.download_button(":material/download: Exportar a Excel", data=_diferida(exportar_excel, df), **_KW_DESCARGA,
                            file_name=f"{base}_{fecha_ini}_a_{fecha_fin}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True, key=f"rep_{clave}_xlsx")
     with e2:
-        st.download_button(":material/download: Exportar a CSV", data=exportar_csv(df),
+        st.download_button(":material/download: Exportar a CSV", data=_diferida(exportar_csv, df), **_KW_DESCARGA,
                            file_name=f"{base}_{fecha_ini}_a_{fecha_fin}.csv", mime="text/csv",
                            use_container_width=True, key=f"rep_{clave}_csv")
 
@@ -3261,7 +3373,8 @@ def pagina_despacho():
             if _token_sr_import:
                 _fecha_import = st.date_input("Fecha de las rutas", value=ahora().date(), key="fecha_import_sr")
                 if st.button(":material/refresh: Consultar Rutas", key="btn_consultar_rutas_sr"):
-                    ok_imp, rutas_o_error = sr_int.importar_rutas_sr(str(_fecha_import), token=_token_sr_import)
+                    ok_imp, rutas_o_error = sr_int.importar_rutas_sr(str(_fecha_import), token=_token_sr_import,
+                                                                    mapa_cliente=sr_int.mapa_visit_type_a_cliente(get_conn))
                     st.session_state["rutas_sr_encontradas"] = rutas_o_error if ok_imp else []
                     if ok_imp:
                         # Cada visit_type que SR manda queda anotado: solo esos se pueden mapear a un cliente
@@ -3327,26 +3440,32 @@ def pagina_despacho():
                                     st.switch_page(_PAGINA_GESTION_VIAJES)
                             elif _info_uso["anulados"]:
                                 st.info(f"El viaje {', '.join(_info_uso['anulados'])} de esta ruta fue anulado: puedes usarla de nuevo.")
-                            st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {len(_ruta_sr['destinos'])} parada(s)/tienda(s) "
+                            # En una ruta MIXTA (varios clientes en el mismo camión) solo se trabajan las paradas del cliente activo.
+                            _destinos_ruta = [_dd for _dd in _ruta_sr["destinos"] if _dd.get("cliente_sr") in (None, cliente_activo)]
+                            _n_otros_clientes = len(_ruta_sr["destinos"]) - len(_destinos_ruta)
+                            st.markdown(f"**Ruta:** `{_ruta_sr['route_id']}` · {len(_destinos_ruta)} parada(s)/tienda(s) "
                                         f"({_ruta_sr['total_visitas']} registro(s) de pedido/transferencia en SR) · "
                                         f"Vehículo SR: {_ruta_sr.get('vehicle_placa_sr') or _ruta_sr['vehicle_sr_id']} · "
                                         f"Piloto SR: {_ruta_sr.get('driver_nombre_sr') or ('sin asignar' if _ruta_sr['driver_sr_id'] is None else _ruta_sr['driver_sr_id'])}")
                             st.caption("Tipos de visita: " + ", ".join(f"{k} ({v})" for k, v in _ruta_sr["visit_types"].items()))
+                            if _n_otros_clientes:
+                                st.caption(f"ℹ️ Esta ruta lleva además {_n_otros_clientes} parada(s) de otro cliente; no se importan aquí.")
                             st.caption("⚠️ La columna 'Unidades' es la suma de `load_3` de SR — confirmado antes con datos reales "
                                        "que para Zona Sur eso cuenta UNIDADES sueltas de producto, no bultos físicos "
                                        "(un bulto trae varias unidades). No es el número de bultos que despachas — "
                                        "ese sigue viniendo de Infor. Se muestra solo como referencia.")
                             _df_destinos_sr = pd.DataFrame([
                                 {"Tienda": d["tienda"], "Cajas (SR)": d["cajas"], "Oleada = No. de Despacho": ", ".join(d.get("oleadas", {})) or "—", "Visitas": len(d["pedidos"])}
-                                for d in _ruta_sr["destinos"]
+                                for d in _destinos_ruta
                             ])
                             st.dataframe(_df_destinos_sr, use_container_width=True, hide_index=True)
                             if st.button(":material/check: Usar esta ruta" if not _ruta_usada else ":material/block: Ruta ya utilizada",
                                          key=f"usar_ruta_sr_{_idx_ruta}", use_container_width=True, disabled=_ruta_usada):
                                 _run_destino = st.session_state.form_run
                                 _sin_match = []
-                                st.session_state.num_destinos = len(_ruta_sr["destinos"])
-                                for _i_dest, _d in enumerate(_ruta_sr["destinos"]):
+                                st.session_state.num_destinos = len(_destinos_ruta)
+                                _indice_tiendas_import = sr_int.construir_indice_tiendas(_tiendas_cliente_import)   # una vez por ruta, no por parada
+                                for _i_dest, _d in enumerate(_destinos_ruta):
                                     # Match por nombre: exacto (sin importar mayúsculas) primero,
                                     # si no, "contiene" en cualquier dirección — mismo tipo de
                                     # coincidencia que ya usamos hoy a mano con los datos reales
@@ -3354,11 +3473,13 @@ def pagina_despacho():
                                     # el digitador lo elija — nunca se inventa una tienda.
                                     # El título de SR trae el código ("258 LA TORRE JALAPA 3"): se empareja primero
                                     # por código y luego por nombre exacto; nunca por "contiene" ambiguo.
-                                    _match = sr_int.emparejar_tienda_sr(_d["tienda"], _tiendas_cliente_import)
-                                    if _match:
-                                        st.session_state[f"t_{_run_destino}_{_i_dest}"] = _match
+                                    # Solo se asigna sola la tienda que se identifica con SEGURIDAD (código + nombre
+                                    # compatible). Lo parecido se sugiere entre paréntesis y se elige a mano.
+                                    _res_t = sr_int.identificar_tienda(_d["tienda"], _tiendas_cliente_import, indice=_indice_tiendas_import)
+                                    if _res_t["estado"] == "exacta":
+                                        st.session_state[f"t_{_run_destino}_{_i_dest}"] = _res_t["tienda"]
                                     else:
-                                        _sin_match.append(_d["tienda"])
+                                        _sin_match.append(_d["tienda"] + (f" (¿{_res_t['sugerencia']}?)" if _res_t.get("sugerencia") else ""))
                                     # No se importa el detalle de pedidos/transferencias — probado
                                     # en campo con un Supervisor y resultó más trabajo que ayuda
                                     # (decenas de líneas en 0, una por una). En vez de eso, un
@@ -3387,10 +3508,11 @@ def pagina_despacho():
 
                                 st.session_state[f"route_id_sr_{_run_destino}"] = _ruta_sr["route_id"]
                                 st.session_state.modo_importar_sr = False
+                                st.session_state.pop("rutas_sr_encontradas", None)   # libera la memoria de la consulta
                                 _avisos_import = []
                                 if _sin_match:
-                                    _avisos_import.append(f"⚠️ {len(_sin_match)} tienda(s) de SR no se pudieron emparejar automáticamente, "
-                                                          f"elígelas a mano: {', '.join(_sin_match)}")
+                                    _avisos_import.append(f"⚠️ {len(_sin_match)} tienda(s) de SR no se pudieron identificar con seguridad (entre paréntesis, la que "
+                                                          f"SR sugiere): elígelas a mano: {'; '.join(_sin_match)}")
                                 _avisos_import += [f"⚠️ {a}" for a in _sel_sr["avisos"]]
                                 if _avisos_import:
                                     st.session_state["flash_importar_sr"] = ("warning", "\n\n".join(_avisos_import))
@@ -3419,7 +3541,7 @@ def pagina_despacho():
                     st.markdown("##### :material/badge: INFORMACIÓN DEL VIAJE")
                     ic1, ic2, ic3 = st.columns(3)
                     ic1.text_input("Cliente Operativo", value=cliente_activo, disabled=True, key=f"info_cli_{run}")
-                    ic2.text_input("Correlativo de Viaje (automático)", value=peek_siguiente_correlativo(cliente_activo), disabled=True, key=f"info_corr_{run}")
+                    ic2.text_input("Correlativo de Viaje (automático)", value=peek_siguiente_correlativo_en_sesion(cliente_activo, run), disabled=True, key=f"info_corr_{run}")
                     ic3.text_input("CD Origen", value=cd_origen_fijo, disabled=True, key=f"info_cd_{run}")
 
                     col_p, col_pil, col_aux = st.columns(3)
@@ -3877,7 +3999,7 @@ def pagina_despacho():
                     components.html(generar_hoja_control_html(v, d), height=900, scrolling=True)
 
             st.markdown("### 🕒 Últimos viajes registrados")
-            st.dataframe(obtener_viajes_recientes(), use_container_width=True, height=280)
+            st.dataframe(_viajes_recientes_en_sesion(), use_container_width=True, height=280)
     else:
         st.info("Tu perfil no tiene permisos para despachar viajes.")
 
@@ -4358,13 +4480,13 @@ def pagina_reportes():
                 st.markdown("---")
                 filtro_estado = st.selectbox("Filtrar por estado", ["Todos", "Pendiente de Liquidar", "Liquidado", "Anulado"], key="filtro_estado_liq_rep")
                 df_mostrar = df_liq if filtro_estado == "Todos" else df_liq[df_liq["Estado"] == filtro_estado]
-                st.dataframe(df_mostrar, use_container_width=True, height=380)
+                _mostrar_df(df_mostrar, use_container_width=True, height=380)
 
                 ecol1, ecol2 = st.columns(2)
                 with ecol1:
                     st.download_button(
                         ":material/download: Exportar a Excel",
-                        data=exportar_excel(df_mostrar),
+                        data=_diferida(exportar_excel, df_mostrar), **_KW_DESCARGA,
                         file_name=f"liquidaciones_{fecha_ini_l}_a_{fecha_fin_l}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True, key="excel_liq_rep"
@@ -4372,7 +4494,7 @@ def pagina_reportes():
                 with ecol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
-                        data=exportar_csv(df_mostrar),
+                        data=_diferida(exportar_csv, df_mostrar), **_KW_DESCARGA,
                         file_name=f"liquidaciones_{fecha_ini_l}_a_{fecha_fin_l}.csv",
                         mime="text/csv",
                         use_container_width=True, key="csv_liq_rep"
@@ -4429,13 +4551,13 @@ def pagina_reportes():
                     "Pacas de Cartón (Lbs)": ["Fecha", "Cliente", "Tienda", "Pacas de Cartón Retornadas", "Lbs de Cartón"],
                 }
                 df_fecha_mostrar = df_fecha[columnas_fecha_por_material[material_sel]]
-                st.dataframe(df_fecha_mostrar, use_container_width=True, height=420)
+                _mostrar_df(df_fecha_mostrar, use_container_width=True, height=420)
 
                 fcol1, fcol2 = st.columns(2)
                 with fcol1:
                     st.download_button(
                         ":material/download: Exportar a Excel",
-                        data=exportar_excel(df_fecha_mostrar),
+                        data=_diferida(exportar_excel, df_fecha_mostrar), **_KW_DESCARGA,
                         file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True, key="excel_ret_rep_fecha"
@@ -4443,7 +4565,7 @@ def pagina_reportes():
                 with fcol2:
                     st.download_button(
                         ":material/download: Exportar a CSV",
-                        data=exportar_csv(df_fecha_mostrar),
+                        data=_diferida(exportar_csv, df_fecha_mostrar), **_KW_DESCARGA,
                         file_name=f"retornable_detalle_{fecha_ini_r}_a_{fecha_fin_r}.csv",
                         mime="text/csv",
                         use_container_width=True, key="csv_ret_rep_fecha"
@@ -4481,7 +4603,7 @@ def pagina_reportes():
 # MÓDULO 4: CATÁLOGOS — descargar plantilla, llenar en Excel, subir para
 # reemplazar el catálogo completo. Solo Administrador.
 # ==========================================
-@st.cache_data(ttl=900, show_spinner="Revisando visit_type de hoy en SimpliRoute...")
+@st.cache_data(ttl=900, max_entries=4, show_spinner="Revisando visit_type de hoy en SimpliRoute...")
 def _tipos_sin_mapear_de_hoy(token_cache_key):
     """Trae las Rutas de hoy de SimpliRoute y devuelve los visit_type que
     todavía no están en cat_mapeo_cliente_sr — cacheado 15 min porque la
@@ -4681,7 +4803,7 @@ def pagina_catalogos():
             st.caption(f"{len(df_actual)} registro(s) actualmente.")
             st.download_button(
                 ":material/download: Descargar datos actuales (Excel)",
-                data=exportar_excel(df_actual_completo),
+                data=_diferida(exportar_excel, df_actual_completo), **_KW_DESCARGA,
                 file_name=f"{config['tabla']}_actual.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"descargar_actual_{catalogo_sel}"
@@ -4896,7 +5018,7 @@ def pagina_catalogos():
                 st.markdown("#### 1. Descargar plantilla")
                 st.download_button(
                     ":material/download: Descargar plantilla Excel",
-                    data=generar_plantilla_excel(config["columnas"] + config.get("opcionales", [])),
+                    data=_diferida(generar_plantilla_excel, config["columnas"] + config.get("opcionales", [])), **_KW_DESCARGA,
                     file_name=f"plantilla_{config['tabla']}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
@@ -5382,12 +5504,12 @@ def pagina_usuarios():
                 if df_aud.empty:
                     st.info("No hay actividad registrada en ese rango de fechas.")
                 else:
-                    st.dataframe(df_aud, use_container_width=True, height=380)
+                    _mostrar_df(df_aud, use_container_width=True, height=380)
                     acol_e1, acol_e2 = st.columns(2)
                     with acol_e1:
                         st.download_button(
                             ":material/download: Exportar a Excel",
-                            data=exportar_excel(df_aud),
+                            data=_diferida(exportar_excel, df_aud), **_KW_DESCARGA,
                             file_name=f"auditoria_{fecha_ini_aud}_a_{fecha_fin_aud}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True, key="excel_aud"
@@ -5395,7 +5517,7 @@ def pagina_usuarios():
                     with acol_e2:
                         st.download_button(
                             ":material/download: Exportar a CSV",
-                            data=exportar_csv(df_aud),
+                            data=_diferida(exportar_csv, df_aud), **_KW_DESCARGA,
                             file_name=f"auditoria_{fecha_ini_aud}_a_{fecha_fin_aud}.csv",
                             mime="text/csv",
                             use_container_width=True, key="csv_aud"
@@ -5481,6 +5603,31 @@ def _autosync_sr_si_toca():
 
 
 _autosync_sr_si_toca()
+
+INTERVALO_LOG_MEMORIA_SEGUNDOS = 300
+
+
+def _log_memoria_si_toca():
+    """Cada 5 minutos deja en los Logs de Render cuánta memoria usa el servidor y cuántas sesiones tiene abiertas. Sirve para
+    MEDIR (no adivinar) si hay una fuga: si el valor sube sin parar aunque no haya más gente, hay algo que sigue acumulando."""
+    try:
+        estado = _estado_autosync_sr()
+        if time.time() < estado.get("proximo_log_memoria", 0.0):
+            return
+        estado["proximo_log_memoria"] = time.time() + INTERVALO_LOG_MEMORIA_SEGUNDOS
+        rss = _rss_mb()
+        try:
+            from streamlit.runtime import get_instance
+            sesiones = len(list(get_instance()._session_mgr.list_active_sessions()))
+        except Exception:
+            sesiones = "?"
+        if rss is not None:
+            print(f"[MEMORIA] {rss:.0f} MB en uso · sesiones activas: {sesiones}")
+    except Exception:
+        pass
+
+
+_log_memoria_si_toca()
 
 if st.session_state.get("_modo_base_vacia"):
     st.info("🚀 **Base nueva:** todavía no hay clientes. Empieza cargando los catálogos en este orden: "
