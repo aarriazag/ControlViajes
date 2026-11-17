@@ -1107,6 +1107,10 @@ def _iterar_paginado(params_base, token, ruta, campos, timeout):
             resultados, siguiente = raw or [], None
         if not resultados:
             return
+        if pagina == 1 and "notes" in campos and "notes" not in resultados[0]:
+            # Si el endpoint paginado no devuelve `notes`, la OLEADA (No. de Despacho) nunca llegaría: se usa el
+            # endpoint de siempre, que sí lo trae. Pasa antes de entregar ninguna visita, así que no se duplica nada.
+            raise _PaginadoNoDisponible("el endpoint paginado de SR no devuelve el campo 'notes'")
         primera = resultados[0].get("id")
         if primera is not None and primera == primera_previa:
             raise ErrorSR("SimpliRoute repitió la misma página de visitas; se detuvo la lectura para no duplicar datos.")
